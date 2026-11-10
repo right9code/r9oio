@@ -162,4 +162,4 @@ OIO gets better the more you use it. After a substantial task, or on demand via 
 
 ## License
 
-MIT
+Free for personal, non-commercial use only. See [LICENSE](LICENSE) for full terms. Commercial use requires prior written permission.

@@ -67,7 +67,7 @@
     "bigmodel",
     "coding-assistant"
   ],
-  "license": "MIT",
+  "license": "UNLICENSED",
   "engines": {
     "node": ">=20.19.0 <21.0.0 || >=22.12.0"
   },
