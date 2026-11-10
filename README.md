@@ -181,6 +181,10 @@ OIO gets better the more you use it. After a substantial task, or on demand via 
 
 ---
 
+## Credits
+
+OIO is a fork of [tau](https://github.com/AbdoKnbGit/tau) by [AbdoKnbGit](https://github.com/AbdoKnbGit). Thanks to the original author for the foundation this project builds on.
+
 ## License
 
 Free for personal, non-commercial use only. See [LICENSE](LICENSE) for full terms. Commercial use requires prior written permission.
