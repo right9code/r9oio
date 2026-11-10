@@ -20,7 +20,7 @@ From GitHub (no npm registry). Requires Node.js 20.19+ or 22.12+:
 git clone https://github.com/right9code/r9oio.git
 cd r9oio
 npm install --ignore-scripts   # devDeps + skips native sharp build
-npm run build                  # builds dist/cli.mjs + dist/tau.mjs
+npm run build                  # builds dist/cli.mjs + dist/tau.mjs (executable)
 # link the binary:
 ln -s "$(pwd)/dist/cli.mjs" ~/.local/bin/oio
 ```

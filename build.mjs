@@ -10,7 +10,7 @@
 
 import { build } from 'esbuild'
 import { spawnSync } from 'child_process'
-import { existsSync, lstatSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'fs'
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'fs'
 import { isAbsolute, join, resolve } from 'path'
 
 const pkg = JSON.parse(readFileSync('./package.json', 'utf8'))
@@ -517,6 +517,7 @@ try {
 }
 `
 writeFileSync('./dist/cli.mjs', launcher)
+try { chmodSync('./dist/cli.mjs', 0o755) } catch { /* ignore */ }
 // Stale artifact from builds that bundled directly to cli.mjs.
 try { rmSync('./dist/cli.mjs.map', { force: true }) } catch { /* ignore */ }
 
