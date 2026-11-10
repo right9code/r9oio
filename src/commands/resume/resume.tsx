@@ -124,7 +124,7 @@ function ResumeCommand({
     async function init() {
       const paths_0 = await getWorktreePaths(getOriginalCwd());
       setWorktreePaths(paths_0);
-      void loadLogs(false, paths_0);
+      void loadLogs(true, paths_0);
     }
     void init();
   }, [loadLogs]);
