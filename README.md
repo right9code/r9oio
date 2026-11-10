@@ -14,9 +14,24 @@ OIO is an adaptive coding harness that is simple to use. It costs less to run, g
 
 ## Install
 
+From GitHub (no npm registry):
+
 ```bash
-npx -y @right9/oio-installer@latest
+git clone https://github.com/right9code/r9oio.git
+cd r9oio
+npm install
+npm run build
+# then link the binary:
+ln -s "$(pwd)/dist/cli.mjs" ~/.local/bin/oio
 ```
+
+Or install directly with npm from GitHub:
+
+```bash
+npm install -g github:right9code/r9oio
+```
+
+**Requirements:** Node.js 20.19+ or 22.12+ (require(esm) support), Git, Bash, `gh` for GitHub automation, and Go 1.25.8+ to build the optional native OIO helpers from source.
 
 **Requirements:** Node.js 20.19+ or 22.12+ (require(esm) support), Git, Bash, `gh` for GitHub automation, and Go 1.25.8+ to build the optional native OIO helpers from source.
 

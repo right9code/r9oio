@@ -1,4 +1,7 @@
 import chalk from 'chalk'
+import { execSync } from 'node:child_process'
+import { existsSync } from 'node:fs'
+import { join } from 'node:path'
 import { logEvent } from 'src/services/analytics/index.js'
 import {
   getLatestVersion,
@@ -46,6 +49,23 @@ async function verifyCurrentNpmInstallation(
 export async function update() {
   logEvent('tengu_update_check', {})
   writeToStdout(`Current version: ${MACRO.VERSION}\n`)
+
+  // GitHub-based (no npm) install: if running from a git checkout, pull from
+  // GitHub and rebuild instead of going through the npm registry.
+  const pkgRoot = getRunningPackageRoot()
+  if (pkgRoot && existsSync(join(pkgRoot, '.git'))) {
+    writeToStdout('Detected git-based install; updating from GitHub...\n')
+    try {
+      execSync('git pull --ff-only origin main', { cwd: pkgRoot, stdio: 'inherit' })
+      execSync('node build.mjs', { cwd: pkgRoot, stdio: 'inherit' })
+      writeToStdout(chalk.green('Updated from GitHub and rebuilt. Restart oio.\n'))
+    } catch (err) {
+      process.stderr.write(chalk.red(`GitHub update failed: ${err}\n`))
+      process.stderr.write('Try manually: cd ' + pkgRoot + ' && git pull && node build.mjs\n')
+    }
+    await gracefulShutdown(0)
+    return
+  }
 
   // Settings written before the stable option was removed can still say
   // 'stable'. Normalised here so the line printed below, and the tag derived

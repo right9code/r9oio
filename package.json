@@ -35,6 +35,7 @@
   "scripts": {
     "graphics-doctor": "node scripts/graphics-doctor.mjs",
     "build": "node build.mjs",
+    "prepare": "node build.mjs",
     "build:bun": "bun run build.ts",
     "build:native-shell": "node scripts/build-native-shell-parser.mjs",
     "build:native-tools": "node scripts/build-native-tools.mjs",
