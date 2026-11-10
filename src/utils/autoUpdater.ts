@@ -277,33 +277,27 @@ export async function checkGlobalInstallPermissions(): Promise<{
 export async function getLatestVersion(
   channel: ReleaseChannel,
 ): Promise<string | null> {
-  // Always 'latest'. No `stable` dist-tag is published, and asking npm for a tag
-  // that does not exist exits non-zero, which getLatestVersion reports as null --
-  // a value every caller reads as "already up to date". The channel parameter
-  // stays so restoring a real stable track is a change here, not a signature
-  // change across its call sites.
-  const npmTag = 'latest'
-
-  // Run from home directory to avoid reading project-level .npmrc
-  // which could be maliciously crafted to redirect to an attacker's registry
-  const result = await execFileNoThrowWithCwd(
-    'npm',
-    ['view', `${MACRO.PACKAGE_URL}@${npmTag}`, 'version', '--prefer-online'],
-    { abortSignal: AbortSignal.timeout(5000), cwd: homedir() },
-  )
-  if (result.code !== 0) {
-    logForDebugging(`npm view failed with code ${result.code}`)
-    if (result.stderr) {
-      logForDebugging(`npm stderr: ${result.stderr.trim()}`)
-    } else {
-      logForDebugging('npm stderr: (empty)')
+  // GitHub-based: query the latest release of right9code/r9oio instead of npm.
+  try {
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), 5000)
+    const res = await fetch(
+      'https://api.github.com/repos/right9code/r9oio/releases/latest',
+      { signal: controller.signal, headers: { Accept: 'application/vnd.github+json' } },
+    )
+    clearTimeout(timer)
+    if (!res.ok) {
+      logForDebugging(`GitHub release check failed: ${res.status}`)
+      return null
     }
-    if (result.stdout) {
-      logForDebugging(`npm stdout: ${result.stdout.trim()}`)
-    }
+    const data = (await res.json()) as { tag_name?: string }
+    const tag = data.tag_name?.trim()
+    if (!tag) return null
+    return tag.replace(/^v/, '')
+  } catch (err) {
+    logForDebugging(`GitHub release check failed: ${err}`)
     return null
   }
-  return result.stdout.trim()
 }
 
 export type NpmDistTags = {

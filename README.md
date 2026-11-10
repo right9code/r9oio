@@ -31,6 +31,12 @@ Or install directly with npm from GitHub:
 npm install -g github:right9code/r9oio
 ```
 
+With bun (faster, e.g. on Omarchy):
+
+```bash
+bun add -g github:right9code/r9oio
+```
+
 **Requirements:** Node.js 20.19+ or 22.12+ (require(esm) support), Git, Bash, `gh` for GitHub automation, and Go 1.25.8+ to build the optional native OIO helpers from source.
 
 **Requirements:** Node.js 20.19+ or 22.12+ (require(esm) support), Git, Bash, `gh` for GitHub automation, and Go 1.25.8+ to build the optional native OIO helpers from source.

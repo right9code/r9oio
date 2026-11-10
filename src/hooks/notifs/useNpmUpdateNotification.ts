@@ -49,7 +49,7 @@ async function checkForNpmUpdate(): Promise<Notification | null> {
 
     return {
       key: 'npm-update-available',
-      text: `Tau update available: ${currentVersion} -> ${latestVersion}. Run: tau update`,
+      text: `OIO update available: ${currentVersion} -> ${latestVersion}. Run: oio update`,
       color: 'warning',
       priority: 'low',
       timeoutMs: 5000,
