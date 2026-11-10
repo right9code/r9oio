@@ -1,0 +1,499 @@
+import { getAgentContext, runWithAgentContext } from '../../utils/agentContext.js'
+import { AsyncLocalStorage } from 'node:async_hooks'
+import { randomUUID } from 'crypto'
+import { createServer, type Server } from 'http'
+
+import type { CanUseToolFn } from '../../hooks/useCanUseTool.js'
+
+import { findToolByName, type Tool, type Tools, type ToolUseContext } from '../../Tool.js'
+import { logForDebugging } from '../../utils/debug.js'
+import type { APIProvider } from '../../utils/model/providerRegistry.js'
+import { resolveEffectiveAPIProvider } from '../../services/api/providerRouting.js'
+import { getCodexRegistrationForTool } from '../../lanes/codex/tools.js'
+import type { LaneToolRegistration } from '../../lanes/types.js'
+import { FILE_READ_TOOL_NAME } from '../FileReadTool/constants.js'
+import { EVAL_BRIDGE_BLOCKED_TOOLS } from './constants.js'
+import type { BridgeCallRecord } from './format.js'
+
+/**
+ * The assistant message a tool call is attributed to. Derived from
+ * `CanUseToolFn` rather than imported from `types/message.js`: that module does
+ * not resolve in this tree (it is one of the pre-existing baseline breaks), and
+ * the bridge only ever passes the value straight through.
+ */
+type ParentMessage = Parameters<CanUseToolFn>[3]
+
+/**
+ * Loopback HTTP bridge: `tool.<name>(args)` inside the kernel becomes a real
+ * Tau tool call here.
+ *
+ * Permission model, stated plainly because it differs from the main loop:
+ *
+ *   - The cell as a whole goes through the full PreToolUse/PostToolUse hook
+ *     stack and the auto-mode classifier as ONE `Eval` call. That is already
+ *     how `permissions.ts` reasons about kernel code ("the classifier must see
+ *     the glue", not just the inner calls).
+ *   - Each individual bridged call additionally goes through `canUseTool`, so
+ *     settings.json deny/ask rules and the interactive prompt still apply.
+ *   - Per-call PreToolUse hooks do NOT run. Reimplementing `runToolUseInner`'s
+ *     generator here would duplicate ~700 lines of permission semantics with
+ *     its own drift. `canUseTool` is the compensating control: it carries the
+ *     deny/ask rules, which is the part that actually gates access.
+ *
+ * Everything is bound to 127.0.0.1 and gated on a per-process bearer token
+ * that never leaves this machine.
+ */
+
+export type { BridgeCallRecord } from './format.js'
+
+export type BridgeRegistration = {
+  tools: Tools
+  /** Resolved in the cell owner's scope, including a pinned agent provider. */
+  provider?: APIProvider
+  toolUseContext: ToolUseContext
+  canUseTool: CanUseToolFn
+  parentMessage: ParentMessage
+  signal: AbortSignal
+  onCall: (record: BridgeCallRecord) => void
+  /** Suspends the cell deadline while a call is in flight. */
+  budget: DeadlineBudget
+  /**
+   * Called before a plain Python write (open "w", os.replace, os.remove...)
+   * first changes an absolute path in this cell, so the host can back the file
+   * up for /rewind the way Edit does. A path that did not exist yet comes in a
+   * later batch with `created`: there was nothing to save, only the fact that
+   * the cell made it. Not a tool call: never shown as one.
+   */
+  trackWrite?: (absolutePath: string, options: { created: boolean }) => Promise<void>
+  /**
+   * Records the backups `trackWrite` took. Called before any bridged tool
+   * runs: a tool.Edit on a file the cell already wrote must find it tracked,
+   * or it would back the file up again with the changed content.
+   */
+  commitWrites?: () => Promise<void> | void
+}
+
+/**
+ * Wall-clock the cell should not be charged for.
+ *
+ * A bridged call can block on an interactive permission prompt, a slow Bash
+ * command, or a network fetch. None of that is the cell "hanging", so the
+ * deadline is suspended while at least one call is outstanding and resumes
+ * when the last one returns.
+ */
+export class DeadlineBudget {
+  #accumulated = 0
+  #depth = 0
+  #since = 0
+
+  enter(): void {
+    if (this.#depth === 0) this.#since = Date.now()
+    this.#depth += 1
+  }
+
+  exit(): void {
+    this.#depth -= 1
+    if (this.#depth <= 0) {
+      this.#depth = 0
+      this.#accumulated += Date.now() - this.#since
+    }
+  }
+
+  /** Milliseconds elapsed inside bridge calls, including one in flight. */
+  pausedMs(): number {
+    return this.#accumulated + (this.#depth > 0 ? Date.now() - this.#since : 0)
+  }
+}
+
+export type BridgeInfo = { url: string; token: string }
+
+type RegisteredBridgeSession = BridgeRegistration & {
+  nativeAliases: Map<string, LaneToolRegistration>
+  runInContext: ReturnType<typeof AsyncLocalStorage.snapshot>
+}
+
+const registrations = new Map<string, RegisteredBridgeSession>()
+let serverPromise: Promise<{ server: Server; info: BridgeInfo }> | null = null
+const bridgeToken = randomUUID()
+
+/**
+ * Everything the session offers, minus what cannot work through the bridge.
+ *
+ * Deny-based on purpose. The previous allowlist refused `ArtifactCanvas`,
+ * every MCP tool, and anything added after it was written — not because those
+ * are unsafe, but because they were not on a list I typed by hand. Permission
+ * is enforced per call by `canUseTool` either way.
+ */
+function bridgeableTools(tools: Tools): Tool[] {
+  return tools.filter(tool => !isBlockedFromBridge(tool))
+}
+
+function isBlockedFromBridge(tool: Tool): boolean {
+  // Generic: a tool that needs the user to answer something cannot be driven
+  // from inside a cell. Asking each tool beats maintaining a list of names.
+  if (tool.requiresUserInteraction?.()) return true
+  return EVAL_BRIDGE_BLOCKED_TOOLS.has(tool.name)
+}
+
+function resolveBridgeTool(entry: RegisteredBridgeSession, name: string): {
+  tool: Tool
+  alias?: LaneToolRegistration
+} | undefined {
+  // Exact Tau names always win, including a custom tool whose name happens
+  // to match a lane-native name. Preserve existing Tau aliases as well.
+  const known = entry.tools.find(tool => tool.name === name) ?? findToolByName(entry.tools, name)
+  if (known) return { tool: known }
+  const alias = entry.nativeAliases.get(name)
+  const tool = alias && entry.tools.find(tool => tool.name === alias.implId)
+  return tool ? { tool, alias } : undefined
+}
+
+function textFromContent(content: unknown): { text: string; images: Array<{ mime: string; data: string }> } {
+  const images: Array<{ mime: string; data: string }> = []
+  if (typeof content === 'string') return { text: content, images }
+  if (!Array.isArray(content)) return { text: '', images }
+  const parts: string[] = []
+  for (const block of content) {
+    if (!block || typeof block !== 'object') continue
+    const typed = block as Record<string, unknown>
+    if (typed.type === 'text' && typeof typed.text === 'string') {
+      parts.push(typed.text)
+    } else if (typed.type === 'image' && typed.source && typeof typed.source === 'object') {
+      const source = typed.source as Record<string, unknown>
+      if (typeof source.data === 'string') {
+        images.push({
+          mime: typeof source.media_type === 'string' ? source.media_type : 'image/png',
+          data: source.data,
+        })
+      }
+    }
+  }
+  return { text: parts.join(''), images }
+}
+
+function describeCall(name: string, args: Record<string, unknown>): string {
+  const first =
+    args.file_path ?? args.path ?? args.pattern ?? args.command ?? args.url ?? args.prompt
+  const text = typeof first === 'string' ? first : ''
+  return text.length > 120 ? `${text.slice(0, 117)}...` : text
+}
+
+async function invoke(
+  entry: RegisteredBridgeSession,
+  name: string,
+  rawArgs: unknown,
+): Promise<unknown> {
+  // Errors here are short on purpose. The old message pasted the whole
+  // available-tool list, which then appeared twice in the transcript — once in
+  // the Python traceback and again in the bridge summary — for one typo.
+  // `tool.list()` is one call away if the model needs the inventory.
+  const resolved = resolveBridgeTool(entry, name)
+  const tool = resolved?.tool
+  if (tool && isBlockedFromBridge(tool)) {
+    throw new Error(
+      `${name} cannot run from inside a cell: it acts on the session (or needs an answer from the user), not the workspace. Call it directly as a tool instead.`,
+    )
+  }
+  if (!tool) {
+    throw new Error(
+      `${name} is not a tool in this session. Call tool.list() to see what is available.`,
+    )
+  }
+  if (entry.signal.aborted) {
+    throw new Error(`tool.${name}(...) aborted: the cell was interrupted.`)
+  }
+
+  const nativeArgs = (rawArgs && typeof rawArgs === 'object' ? rawArgs : {}) as Record<string, unknown>
+  const args = resolved?.alias ? resolved.alias.adaptInput(nativeArgs) : nativeArgs
+  const parsed = tool.inputSchema.safeParse(args)
+  if (!parsed.success) {
+    const issues = parsed.error.issues
+      .slice(0, 6)
+      .map(issue => `${issue.path.join('.') || '(root)'}: ${issue.message}`)
+      .join('; ')
+    throw new Error(`tool.${name}(...) got invalid arguments — ${issues}`)
+  }
+
+  const toolUseId = `eval-${tool.name}-${randomUUID()}`
+  const decision = await entry.canUseTool(
+    tool,
+    parsed.data as Record<string, unknown>,
+    entry.toolUseContext,
+    entry.parentMessage,
+    toolUseId,
+  )
+  if (decision.behavior !== 'allow') {
+    const message =
+      'message' in decision && typeof decision.message === 'string'
+        ? decision.message
+        : 'permission denied'
+    throw new Error(`tool.${name}(...) was not permitted: ${message}`)
+  }
+
+  const input = ('updatedInput' in decision && decision.updatedInput
+    ? decision.updatedInput
+    : parsed.data) as Record<string, unknown>
+
+  // Run under the agent that owns THIS cell, not whoever happened to create the
+  // bridge. The server is memoized process-wide (`serverPromise ??=`), so its
+  // request handlers inherit the AsyncLocalStorage scope of the first caller
+  // forever — every later cell would otherwise report that agent's identity.
+  // Anything keyed on the running agent reads this: subagent file-write
+  // ownership, and per-agent analytics attribution.
+  await entry.commitWrites?.()
+  const cellAgentId = entry.toolUseContext.agentId
+  const ambient = getAgentContext()
+  // A bridged Read returns its text to the cell, not to the model: it must
+  // never come back as a dedup note, nor be pointed back to by one.
+  const callContext =
+    tool.name === FILE_READ_TOOL_NAME
+      ? { ...entry.toolUseContext, readResultHidden: true }
+      : entry.toolUseContext
+  const invoke = () =>
+    tool.call(input, callContext, entry.canUseTool, entry.parentMessage)
+  const result =
+    cellAgentId !== undefined && ambient?.agentId !== cellAgentId
+      ? await runWithAgentContext(
+          { agentId: cellAgentId, agentType: 'subagent', invocationEmitted: false },
+          invoke,
+        )
+      : await invoke()
+  const block = tool.mapToolResultToToolResultBlockParam(result.data, toolUseId)
+  const { text, images } = textFromContent(block.content)
+  // A tool can report failure by RETURNING an error result instead of throwing
+  // — an interrupted Bash/PowerShell, a failed PtyTool/SnapshotTool/FileDiff,
+  // and several others set `is_error` on the block they map. Those used to come
+  // back through the bridge as an ordinary string, so a cell saw a failure as a
+  // successful return value and carried on with it.
+  //
+  // Raise instead, on the one error channel the kernel already has: the cell
+  // gets a catchable ToolBridgeError exactly as it does for a thrown failure,
+  // and `handle` records the call as failed. The server's own diagnostic is the
+  // message, so the evidence survives rather than being replaced by a generic
+  // one. MCP failures do not arrive here — they throw McpToolCallError from
+  // callMCPTool — so this is not a second path for them.
+  if (block.is_error) {
+    throw new Error(
+      text.trim() ||
+        `tool.${name}(...) reported an error but returned no diagnostic content.`,
+    )
+  }
+  if (images.length > 0) return { text, images }
+  return text
+}
+
+async function handle(
+  body: Record<string, unknown>,
+  pathname: string,
+): Promise<unknown> {
+  const sessionKey = typeof body.session === 'string' ? body.session : ''
+  const entry = registrations.get(sessionKey)
+  if (!entry) {
+    throw new Error(
+      'This kernel is not attached to a running Eval call. Its bridge session has ended.',
+    )
+  }
+
+  // The listener belongs to its first caller. Restore THIS cell's complete
+  // async scope, including a subagent's forced provider, before permissions,
+  // aliases, file tracking, or execution read contextual state.
+  return entry.runInContext(() => handleRegistered(entry, body, pathname))
+}
+
+async function handleRegistered(
+  entry: RegisteredBridgeSession,
+  body: Record<string, unknown>,
+  pathname: string,
+): Promise<unknown> {
+
+  if (pathname === '/v1/tools') {
+    const names = bridgeableTools(entry.tools).map(tool => tool.name)
+    for (const [name, alias] of entry.nativeAliases) {
+      const resolved = resolveBridgeTool(entry, name)
+      if (resolved?.alias && !isBlockedFromBridge(resolved.tool)) {
+        names.push(`${name} (${alias.implId})`)
+      }
+    }
+    return names.sort()
+  }
+
+  if (pathname === '/v1/track') {
+    const paths = Array.isArray(body.paths)
+      ? body.paths.filter((path): path is string => typeof path === 'string')
+      : []
+    const track = entry.trackWrite
+    if (!track || paths.length === 0) return 0
+    const created = body.created === true
+    // The kernel waits on this before letting the write through, so a slow
+    // backup is not the cell hanging.
+    entry.budget.enter()
+    try {
+      for (const path of paths) {
+        await track(path, { created }).catch(error =>
+          logForDebugging(`Eval write backup failed for ${path}: ${String(error)}`, { level: 'warn' }),
+        )
+      }
+    } finally {
+      entry.budget.exit()
+    }
+    return paths.length
+  }
+
+  const name = typeof body.name === 'string' ? body.name : ''
+  if (!name) throw new Error('Missing tool name.')
+  const args = (body.args && typeof body.args === 'object' ? body.args : {}) as Record<string, unknown>
+  const displayName = resolveBridgeTool(entry, name)?.tool.name ?? name
+
+  const started = Date.now()
+  entry.budget.enter()
+  try {
+    const value = await invoke(entry, name, args)
+    entry.onCall({
+      name: displayName,
+      detail: describeCall(name, args),
+      ms: Date.now() - started,
+    })
+    return value
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    entry.onCall({
+      name: displayName,
+      detail: describeCall(name, args),
+      ms: Date.now() - started,
+      error: message,
+    })
+    throw error
+  } finally {
+    entry.budget.exit()
+  }
+}
+
+async function startServer(): Promise<{ server: Server; info: BridgeInfo }> {
+  const server = createServer((req, res) => {
+    const reply = (status: number, payload: unknown) => {
+      const encoded = JSON.stringify(payload)
+      res.writeHead(status, {
+        'content-type': 'application/json',
+        'content-length': Buffer.byteLength(encoded),
+      })
+      res.end(encoded)
+    }
+
+    const pathname = (req.url ?? '').split('?')[0] ?? ''
+    if (req.method !== 'POST' || !['/v1/tool', '/v1/tools', '/v1/track'].includes(pathname)) {
+      reply(404, { ok: false, error: 'not found' })
+      return
+    }
+    if (req.headers.authorization !== `Bearer ${bridgeToken}`) {
+      reply(403, { ok: false, error: 'forbidden' })
+      return
+    }
+
+    const chunks: Buffer[] = []
+    let size = 0
+    req.on('data', (chunk: Buffer) => {
+      size += chunk.length
+      // A cell can legitimately hand a tool a large payload (a rewritten
+      // file), but not an unbounded one.
+      if (size > 32 * 1024 * 1024) {
+        reply(413, { ok: false, error: 'request too large' })
+        req.destroy()
+        return
+      }
+      chunks.push(chunk)
+    })
+    req.on('end', () => {
+      let body: Record<string, unknown>
+      try {
+        body = JSON.parse(Buffer.concat(chunks).toString('utf8')) as Record<string, unknown>
+      } catch {
+        reply(400, { ok: false, error: 'invalid JSON body' })
+        return
+      }
+      handle(body, pathname).then(
+        value => reply(200, { ok: true, value }),
+        error =>
+          // 200 with ok:false — the kernel turns this into a ToolBridgeError
+          // the cell can catch. An HTTP error status would be indistinguishable
+          // from the bridge itself being down.
+          reply(200, {
+            ok: false,
+            error: error instanceof Error ? error.message : String(error),
+          }),
+      )
+    })
+  })
+
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject)
+    server.listen(0, '127.0.0.1', () => {
+      server.removeListener('error', reject)
+      resolve()
+    })
+  })
+  server.on('error', error => {
+    logForDebugging(`Eval tool bridge error: ${String(error)}`, { level: 'error' })
+  })
+  // The bridge must never hold the event loop open at shutdown.
+  server.unref()
+
+  const address = server.address()
+  const port = typeof address === 'object' && address ? address.port : 0
+  const info: BridgeInfo = { url: `http://127.0.0.1:${port}`, token: bridgeToken }
+  logForDebugging(`Eval tool bridge listening on ${info.url}`)
+  return { server, info }
+}
+
+export async function ensureToolBridge(): Promise<BridgeInfo> {
+  serverPromise ??= startServer()
+  try {
+    return (await serverPromise).info
+  } catch (error) {
+    serverPromise = null
+    throw error
+  }
+}
+
+export function registerBridgeSession(
+  sessionKey: string,
+  entry: BridgeRegistration,
+): () => void {
+  // Capture while still in the owning agent's call tree. Agent context and
+  // forced-provider context use separate AsyncLocalStorage instances.
+  const provider = entry.provider && resolveEffectiveAPIProvider(
+    entry.provider,
+    entry.toolUseContext.options?.mainLoopModel,
+  )
+  const nativeAliases = new Map<string, LaneToolRegistration>()
+  if (provider === 'openai') {
+    for (const tool of entry.tools) {
+      const reg = getCodexRegistrationForTool(tool.name)
+      if (reg && reg.nativeName !== tool.name && entry.tools.some(tool => tool.name === reg.implId)) {
+        nativeAliases.set(reg.nativeName, reg)
+      }
+    }
+  }
+  const registered: RegisteredBridgeSession = {
+    ...entry,
+    nativeAliases,
+    runInContext: AsyncLocalStorage.snapshot(),
+  }
+  registrations.set(sessionKey, registered)
+  return () => {
+    if (registrations.get(sessionKey) === registered) registrations.delete(sessionKey)
+  }
+}
+
+/** Test/shutdown helper. Closes the listener and drops every registration. */
+export async function disposeToolBridge(): Promise<void> {
+  registrations.clear()
+  const pending = serverPromise
+  serverPromise = null
+  if (!pending) return
+  try {
+    const { server } = await pending
+    await new Promise<void>(resolve => server.close(() => resolve()))
+  } catch {
+    /* never fail a shutdown over a listener that is already gone */
+  }
+}

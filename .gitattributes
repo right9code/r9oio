@@ -1,0 +1,4 @@
+# Production shrinkwrap generation and staging always emit LF. Keep the
+# canonical graph snapshot stable across autocrlf checkouts (Windows CI
+# runners and fresh Windows clones).
+release/npm-shrinkwrap.production.json text eol=lf

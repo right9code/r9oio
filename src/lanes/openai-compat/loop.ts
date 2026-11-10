@@ -1,0 +1,4318 @@
+/**
+ * OpenAI-Compatible Lane — Agent Loop + Provider-Shim Entry
+ *
+ * Handles every provider that speaks OpenAI Chat Completions:
+ *   - DeepSeek     (reasoner → `reasoning_content` → thinking; max_tokens 8192 cap)
+ *   - Groq         (strip cache_control / $schema / null function_call; `reasoning` → thinking; fake_stream when JSON mode)
+ *   - NVIDIA NIM   (strip stream_options; per-model param filtering)
+ *   - Ollama       (no API key; Ollama-specific params; strip stream_options)
+ *   - OpenRouter   (session_id + rolling message/tool cache_control breakpoints; single quantized anchor for Gemini; volatile context kept out of cacheable prefix)
+ *   - Mistral      (strip $id / $schema / additionalProperties / strict; tool_choice "required" → "any")
+ *   - Generic long-tail (Fireworks, Together, Deepinfra, xAI, etc.)
+ *
+ * Per-provider quirks are consolidated in the transform helpers at the
+ * bottom — adding a new provider is ~20 lines. The reference transformer
+ * files this mirrors: claude-code-router/packages/core/src/transformer,
+ * litellm/llms/<provider>/chat/transformation.py.
+ */
+
+import { APIConnectionError } from '@anthropic-ai/sdk'
+import { decodeToolArguments, toolDecodeFields } from '../../services/mcp/decodeStatus.js'
+import type {
+  AnthropicStreamEvent,
+  ModelInfo,
+  ProviderMessage,
+  ProviderTool,
+} from '../../services/api/providers/base_provider.js'
+import type {
+  Lane,
+  LaneRunContext,
+  LaneRunResult,
+  LaneProviderCallParams,
+  NormalizedUsage,
+} from '../types.js'
+import { OPENAI_COMPAT_TOOL_REGISTRY, selectEditToolSet } from './tools.js'
+import { getCompatShellDescription } from './shell_descriptions.js'
+import { filterToSingleShell } from './single_shell.js'
+import { recordProviderRateLimits } from '../../services/api/providerRateLimits.js'
+import { selectOpenAICompatToolsForRequest } from './lazy_tools.js'
+import {
+  OPENCODE_ANTHROPIC_ROUTE_MODELS,
+  openCodeRouteFor,
+} from './opencode_anthropic_route.js'
+import { buildOpenCodeGeminiBody, OpenCodeGeminiStream } from './opencode_google.js'
+import { isOpencodeAnonymousModelId, streamOpenCodeZen } from './opencode_zen.js'
+import {
+  buildOpenCodeResponsesBody,
+  OPENCODE_MAX_OUTPUT_TOKENS,
+  OpenCodeResponsesStream,
+} from './opencode_responses.js'
+import { readSseDataPayloads } from './sse_payloads.js'
+import { listXaiModels, streamXaiResponses } from './xai_responses.js'
+import { listMetaModels, streamMetaResponses } from './meta_responses.js'
+import { recordCompatCacheDebug } from './cache_debug.js'
+import { beginMistralCacheDebug } from './mistral_cache_debug.js'
+import {
+  freezeOpenRouterSystem,
+  freezeOpenRouterTools,
+  openRouterContextKey,
+} from './openrouter_context.js'
+import { OpenRouterToolCallError, OpenRouterToolStream, OpenRouterUpstreamError, openRouterHttpError } from './openrouter_tools.js'
+import { openRouterInputUsage } from './openrouter_usage.js'
+import { retryOpenRouterStream } from './openrouter_retry.js'
+import { openRouterReasoningForBlocks, type OpenRouterReasoning } from './openrouter_reasoning.js'
+import { openRouterToolIdMap } from './openrouter_tool_ids.js'
+import { OpenRouterSSEDecoder, openRouterCompletionAsSSE } from './openrouter_sse.js'
+import {
+  freezeSessionVolatileText,
+  volatileFreezeKey,
+} from '../shared/volatile_freeze.js'
+import { isMediaBlock } from '../shared/media_blocks.js'
+import {
+  InFlightToolCall,
+  isOutputCapTruncation,
+  laneStopReason,
+} from '../shared/truncation.js'
+import { renderMediaForTextLane, substituteUnsendableMedia } from '../shared/media_extract.js'
+import { walkSchemaByPosition } from '../shared/schema_positions.js'
+import { decideImageSupport, recordModelVision } from '../shared/vision_capability.js'
+import { forgetOpenRouterServedProvider, recordOpenRouterServedProvider } from './transformers/openrouter.js'
+import {
+  OPENROUTER_VOLATILE_CONTEXT,
+  applyGeminiOpenRouterCacheAnchor,
+  isGeminiOnOpenRouter,
+} from './or_gemini_cache.js'
+import { getPlatform } from '../../utils/platform.js'
+import { getPowerShellEdition } from '../../utils/shell/powershellDetection.js'
+import {
+  appendStrictParamsHint,
+  buildOpenAICompatToolUsageRules,
+} from '../shared/mcp_bridge.js'
+import { TOOL_SEARCH_TOOL_NAME } from '../../tools/ToolSearchTool/constants.js'
+import { getTransformer, type ProviderId } from './transformers/index.js'
+import { resolveEditFormat } from './capabilities.js'
+import {
+  formatCopilotModelUnsupportedMessage,
+  formatCopilotQuotaExceededMessage,
+  isCopilotModelUnsupportedError,
+  isCopilotQuotaExceededError,
+} from '../../utils/model/copilotAccount.js'
+import {
+  toOpenRouterModelInfo,
+  openRouterModelAcceptsImages,
+  type OpenRouterCatalogModel,
+} from '../../utils/model/openrouterCatalog.js'
+import { resolveOpenRouterVirtualModelId } from '../../utils/model/openrouterAliases.js'
+import {
+  isOpenRouterStrictToolSchemaError,
+  recordOpenRouterStrictToolSchemaModel,
+} from '../../utils/model/openrouterStrictSchema.js'
+import { buildDirectHistory, convertDirectHistory } from './direct_history.js'
+import { isDirectProvider, isDirectThinkingProvider, listDirectProviderModels } from '../../utils/model/directProviderCatalog.js'
+import { mistralModelInfo } from '../../utils/model/mistralCatalog.js'
+import {
+  getOpencodeEffort,
+  isOpencodeThinkingModel,
+  opencodeReplaysReasoningContent,
+  resolveOpencodeRouteEffort,
+  supportsOpencodeThinkingSelection,
+  usesOpencodeCatalogEfforts,
+} from '../../utils/model/opencodeThinking.js'
+import { getOpencodeModelMeta } from '../../utils/model/opencodeModelsDevCatalog.js'
+import { cloudflareReasoningContentReplayRequired } from '../../utils/model/cloudflareThinking.js'
+import { lxdReasoningContentReplayRequired } from '../../utils/model/lxdThinking.js'
+import { mimoReasoningContentReplayRequired } from '../../utils/model/mimoThinking.js'
+import { alibabaReasoningContentReplayRequired } from '../../utils/model/alibabaThinking.js'
+import { recordProviderModelContextWindows } from '../../utils/model/contextWindows.js'
+import type { APIProvider } from '../../utils/model/providers.js'
+import { providerUsesStableRequestSession } from '../../services/api/cacheAffinity.js'
+import {
+  createRetryableConnectionError,
+  isAbortError,
+  throwRetryableProviderHttpError,
+} from '../../services/api/transport_error.js'
+
+// ─── Provider Detection ──────────────────────────────────────────
+
+type ProviderType =
+  | 'deepseek'
+  | 'groq'
+  | 'glm'
+  | 'moonshot'
+  | 'minimax'
+  | 'alibaba'
+  | 'mistral'
+  | 'nim'
+  | 'ollama'
+  | 'lmstudio'
+  | 'openrouter'
+  | 'agentrouter'
+  | 'modelrouter'
+  | 'vercel'
+  | 'requesty'
+  | 'opencode'
+  | 'opencodego'
+  | 'lxd'
+  | 'mimo'
+  | 'fireworks'
+  | 'cloudflare'
+  | 'cline'
+  | 'iflow'
+  | 'kilocode'
+  | 'copilot'
+  | 'xai'
+  | 'meta'
+  | 'generic'
+
+function detectProvider(model: string, baseUrl: string): ProviderType {
+  const b = baseUrl.toLowerCase()
+  const m = model.toLowerCase()
+  // Model Studio hosts DeepSeek, GLM and Kimi rows alongside Qwen, so the
+  // endpoint has to be matched before any model-name heuristic below.
+  if (b.includes('dashscope') || b.includes('maas.aliyuncs.com')) return 'alibaba'
+  if (b.includes('deepseek')) return 'deepseek'
+  if (b.includes('bigmodel') || b.includes('zhipu')) return 'glm'
+  if (b.includes('moonshot') || b.includes('kimi')) return 'moonshot'
+  if (b.includes('minimax')) return 'minimax'
+  if (b.includes('groq')) return 'groq'
+  if (b.includes('mistral')) return 'mistral'
+  if (b.includes('integrate.api.nvidia')) return 'nim'
+  if (b.includes('lmstudio') || b.includes('lm-studio')) return 'lmstudio'
+  if (b.includes('localhost') || b.includes('127.0.0.1') || b.includes('0.0.0.0') || b.includes(':11434')) return 'ollama'
+  if (b.includes('agentrouter.org')) return 'agentrouter'
+  if (b.includes('lxg2it') || b.includes('modelrouter')) return 'modelrouter'
+  if (b.includes('ai-gateway.vercel') || b.includes('vercel')) return 'vercel'
+  if (b.includes('requesty')) return 'requesty'
+  if (b.includes('lxds.org')) return 'lxd'
+  if (b.includes('xiaomimimo.com')) return 'mimo'
+  if (b.includes('fireworks.ai')) return 'fireworks'
+  if (b.includes('cloudflare.com/client/v4/accounts') || b.includes('cloudflare')) return 'cloudflare'
+  // Go shares the opencode.ai host — match the `/zen/go` path first so it
+  // doesn't fall through to the Zen branch below.
+  if (b.includes('opencode.ai/zen/go')) return 'opencodego'
+  if (b.includes('opencode.ai/zen') || b.includes('opencode.ai')) return 'opencode'
+  if (b.includes('openrouter')) return 'openrouter'
+  if (b.includes('cline.bot')) return 'cline'
+  if (b.includes('iflow.cn') || b.includes('apis.iflow')) return 'iflow'
+  if (b.includes('kilocode.ai') || b.includes('kilo.ai')) return 'kilocode'
+  if (b.includes('githubcopilot.com')) return 'copilot'
+  if (b.includes('api.x.ai')) return 'xai'
+  if (b.includes('api.meta.ai')) return 'meta'
+  if (m.startsWith('@cf/')) return 'cloudflare'
+  if (m.includes('deepseek')) return 'deepseek'
+  if (m.startsWith('glm-')) return 'glm'
+  if (m.startsWith('kimi-') || m.includes('moonshot')) return 'moonshot'
+  if (m.startsWith('minimax-') || m.includes('minimax')) return 'minimax'
+  if (m.startsWith('llama') || m.startsWith('mixtral') || m.startsWith('gemma')) return 'groq'
+  if (m.startsWith('mistral-') || m.startsWith('magistral-') || m.startsWith('codestral-') || m.startsWith('zai-glm-')) return 'mistral'
+  // qwen removed — handled by the dedicated Qwen lane (src/lanes/qwen/).
+  return 'generic'
+}
+
+function isLocalBaseUrl(baseUrl: string): boolean {
+  const b = baseUrl.toLowerCase()
+  return b.includes('localhost') || b.includes('127.0.0.1') || b.includes('0.0.0.0') || b.includes(':11434')
+}
+
+// ─── OpenAI Chat Completions Message Shape ───────────────────────
+
+interface OpenAIChatMessage {
+  role: 'system' | 'user' | 'assistant' | 'tool'
+  content?: string | null | Array<{ type: string; text?: string; image_url?: unknown; cache_control?: { type: string } }>
+  reasoning_content?: string
+  tool_calls?: Array<{
+    id: string
+    type: 'function'
+    function: { name: string; arguments: string }
+  }>
+  tool_call_id?: string
+  name?: string
+  [OPENROUTER_VOLATILE_CONTEXT]?: true
+  // OpenRouter / DeepSeek reasoning fields come back on the delta; no input field.
+}
+
+interface OpenAIChatRequest {
+  model: string
+  messages: OpenAIChatMessage[]
+  stream?: boolean
+  stream_options?: { include_usage?: boolean }
+  usage?: { include?: boolean; [key: string]: unknown }
+  tools?: Array<{
+    type: 'function'
+    cache_control?: { type: string }
+    function: {
+      name: string
+      description: string
+      parameters: Record<string, unknown>
+      strict?: boolean
+    }
+  }>
+  tool_choice?: 'auto' | 'required' | 'none' | { type: 'function'; function: { name: string } }
+  max_tokens?: number
+  temperature?: number
+  top_p?: number
+  stop?: string[]
+  // Reasoning knobs — provider-specific. Passed through when supported.
+  reasoning_effort?: 'low' | 'medium' | 'high'
+  reasoning?: { effort?: string }
+  thinking?: { type: 'enabled' } | { type: 'disabled' }
+  extra_body?: Record<string, unknown>
+  // OpenRouter extensions:
+  transforms?: string[]
+  plugins?: Array<{ id: string; enabled?: boolean; [key: string]: unknown }>
+  models?: string[]
+  route?: string
+  session_id?: string
+  prompt_cache_key?: string
+  prompt_cache_retention?: '24h'
+  // Fireworks: include perf_metrics (incl. cached-prompt-tokens) in the body.
+  perf_metrics_in_response?: boolean
+  providerOptions?: {
+    gateway?: {
+      caching?: 'auto'
+      [key: string]: unknown
+    }
+    [key: string]: unknown
+  }
+  requesty?: {
+    auto_cache?: boolean
+    [key: string]: unknown
+  }
+}
+
+interface CompatCatalogModel extends OpenRouterCatalogModel {
+  owned_by?: string
+  max_context_length?: number
+  context_window?: number
+  max_tokens?: number
+  api?: string
+  type?: string
+  tags?: string[]
+  supports_caching?: boolean
+  supports_reasoning?: boolean
+  supports_tool_calling?: boolean
+  supports_vision?: boolean
+  task?: string | { name?: string; type?: string; id?: string }
+  capabilities?: {
+    completion_chat?: boolean
+    function_calling?: boolean
+    vision?: boolean
+    /** GitHub Copilot states its token limits here, not at the top level. */
+    limits?: {
+      max_prompt_tokens?: number
+      max_context_window_tokens?: number
+      max_output_tokens?: number
+    }
+  }
+}
+
+interface LmStudioNativeModel {
+  type?: string
+  key?: string
+  display_name?: string
+  context_length?: number
+  max_context_length?: number
+  selected_variant?: string
+  variants?: string[]
+  loaded_instances?: Array<{
+    id?: string
+    config?: {
+      context_length?: number
+    }
+  }>
+  capabilities?: {
+    trained_for_tool_use?: boolean
+    vision?: boolean
+  }
+}
+
+type LmStudioModelInfo = ModelInfo & {
+  lmStudioAliases?: string[]
+  lmStudioLoadedContextWindow?: number
+  lmStudioMaxContextWindow?: number
+}
+
+// ─── Lane Implementation ─────────────────────────────────────────
+
+export class OpenAICompatLane implements Lane {
+  readonly name = 'openai-compat'
+  readonly displayName = 'OpenAI-Compatible (Cloudflare Workers AI, DeepSeek, GLM, Moonshot, MiniMax, Groq, Mistral, NIM, Ollama, LM Studio, OpenRouter, ...)'
+
+  private configs = new Map<string, { apiKey: string; baseUrl: string }>()
+  private _healthy = true
+
+  registerProvider(name: string, apiKey: string, baseUrl: string): void {
+    this.configs.set(name, { apiKey, baseUrl })
+    this.invalidateModelCache(name)
+  }
+
+  unregisterProvider(name: string): void {
+    this.configs.delete(name)
+    this.invalidateModelCache(name)
+  }
+
+  invalidateModelCache(providerFilter?: string): void {
+    if (providerFilter) {
+      _modelsCacheByProvider.delete(providerFilter)
+      _modelsCacheByProvider.delete('__all__')
+      return
+    }
+    _modelsCacheByProvider.clear()
+  }
+
+  private getConfigForModel(
+    model: string,
+    providerHint?: string,
+  ): { apiKey: string; baseUrl: string; provider: ProviderType } | null {
+    // Provider-selection wins. The shim was built for a specific
+    // sub-provider (the user picked it from /models), and the same model
+    // ID can live on multiple hosts (`openai/gpt-oss-120b` is on both
+    // Groq and OpenRouter). When the hint names a registered config, use
+    // it directly — don't fall through to the model-name heuristics.
+    if (providerHint) {
+      if (!this.configs.has(providerHint)) return null
+      const c = this.configs.get(providerHint)!
+      return { ...c, provider: providerHint as ProviderType }
+    }
+
+    const m = model.toLowerCase()
+
+    // Explicit routing: model prefix → provider config
+    if (m.includes('deepseek') && this.configs.has('deepseek')) {
+      const c = this.configs.get('deepseek')!
+      return { ...c, provider: 'deepseek' }
+    }
+    if (m.startsWith('glm-') && this.configs.has('glm')) {
+      const c = this.configs.get('glm')!
+      return { ...c, provider: 'glm' }
+    }
+    if ((m.startsWith('kimi-') || m.includes('moonshot')) && this.configs.has('moonshot')) {
+      const c = this.configs.get('moonshot')!
+      return { ...c, provider: 'moonshot' }
+    }
+    if ((m.startsWith('minimax-') || m.includes('minimax')) && this.configs.has('minimax')) {
+      const c = this.configs.get('minimax')!
+      return { ...c, provider: 'minimax' }
+    }
+    if ((m.startsWith('llama') || m.startsWith('mixtral') || m.startsWith('gemma')) && this.configs.has('groq')) {
+      const c = this.configs.get('groq')!
+      return { ...c, provider: 'groq' }
+    }
+    if ((m.startsWith('mistral-') || m.startsWith('magistral-') || m.startsWith('codestral-') || m.startsWith('zai-glm-')) && this.configs.has('mistral')) {
+      const c = this.configs.get('mistral')!
+      return { ...c, provider: 'mistral' }
+    }
+    if (m.startsWith('@cf/') && this.configs.has('cloudflare')) {
+      const c = this.configs.get('cloudflare')!
+      return { ...c, provider: 'cloudflare' }
+    }
+    // Qwen routing moved to the dedicated Qwen lane. Compat never sees qwen-*.
+    // `openai/gpt-oss-*` is intentionally NOT pinned to Groq here —
+    // the same ID is hosted on both Groq and OpenRouter; the provider
+    // hint above is the authoritative signal for picking one. This
+    // slash-qualified fallback only fires when the hint didn't match
+    // any registered config (e.g. a direct call without a shim).
+    if (this.configs.has('openrouter') && m.includes('/')) {
+      const c = this.configs.get('openrouter')!
+      return { ...c, provider: 'openrouter' }
+    }
+    if (this.configs.has('nim') && this.configs.has('nim')) {
+      const c = this.configs.get('nim')!
+      return { ...c, provider: 'nim' }
+    }
+    if (this.configs.has('ollama')) {
+      const c = this.configs.get('ollama')!
+      return { ...c, provider: 'ollama' }
+    }
+    if (this.configs.has('lmstudio')) {
+      const c = this.configs.get('lmstudio')!
+      return { ...c, provider: 'lmstudio' }
+    }
+    // Fallback: first registered config.
+    const first = this.configs.values().next().value
+    if (!first) return null
+    return { ...first, provider: detectProvider(model, first.baseUrl) }
+  }
+
+  supportsModel(model: string): boolean {
+    const m = model.toLowerCase()
+    // Everything that isn't Claude, Gemini, Qwen, or native OpenAI
+    // (each handled by its own dedicated lane).
+    return !(
+      m.startsWith('claude-') || m.includes('anthropic') ||
+      m.startsWith('gemini-') || m.startsWith('gemma-') ||
+      m.startsWith('qwen') || m === 'coder-model' ||
+      m.startsWith('gpt-') || m.startsWith('o1') || m.startsWith('o3') ||
+      m.startsWith('o4') || m.startsWith('o5') || m.startsWith('codex-') ||
+      m.startsWith('gpt-5-codex')
+    )
+  }
+
+  // ── Provider-shim-compatible single-turn entry ──────────────────
+
+  async *streamAsProvider(
+    params: LaneProviderCallParams,
+  ): AsyncGenerator<AnthropicStreamEvent, NormalizedUsage> {
+    const model = !params.providerHint || params.providerHint === 'openrouter'
+      ? resolveOpenRouterVirtualModelId(params.model) : params.model
+    const provider = this.getConfigForModel(model, params.providerHint)?.provider
+    if (provider === 'openrouter') {
+      return yield* retryOpenRouterStream(({ recovery, note }) => this.streamAsProviderOnce(params, recovery, note),
+        params.signal, { bufferText: params.tools.length > 0 })
+    }
+    if (provider === 'opencode' && isOpencodeAnonymousModelId(model)) {
+      return yield* streamOpenCodeZen(params, request => this.streamAsProviderOnce(request))
+    }
+    return yield* this.streamAsProviderOnce(params)
+  }
+
+  private async *streamAsProviderOnce(
+    params: LaneProviderCallParams,
+    openRouterRecovery = false,
+    openRouterNote?: string,
+  ): AsyncGenerator<AnthropicStreamEvent, NormalizedUsage> {
+    const { model: requestedModel, messages, system, tools, max_tokens, thinking, temperature, stop_sequences, signal, sessionId, providerHint, querySource } = params
+    const model = !providerHint || providerHint === 'openrouter'
+      ? resolveOpenRouterVirtualModelId(requestedModel)
+      : requestedModel
+
+    const cfg = this.getConfigForModel(model, providerHint)
+    if (!cfg) {
+      throw new Error(`No provider configured for model "${model}". Run /provider to connect a provider, or /models to pick a different model.`)
+    }
+
+    const provider = cfg.provider
+    const isLocal = isLocalBaseUrl(cfg.baseUrl)
+    // A loopback base URL means one of two very different things:
+    //   • a bare/unknown local OpenAI server (provider 'generic') that may
+    //     not implement function-calling — keep the protective gate; or
+    //   • a first-class provider (deepseek, glm, …) pointed at a local dev
+    //     proxy via *_BASE_URL. That proxy forwards to the real upstream,
+    //     which fully supports tools + standard params, so it must NOT be
+    //     degraded. ollama/lmstudio are first-class local model servers too.
+    const isBareLocalServer = isLocal && provider === 'generic'
+    const isLocalModelServer =
+      isLocal && (provider === 'ollama' || provider === 'lmstudio' || provider === 'generic')
+    const cacheSessionId = providerUsesStableRequestSession(provider)
+      ? sessionId
+      : undefined
+
+    // xAI runs on its Responses API (xai_responses.ts): its Chat Completions
+    // route is deprecated and cannot carry the encrypted reasoning that the
+    // xAI prompt cache needs replayed.
+    if (provider === 'xai') {
+      return yield* streamXaiResponses(cfg, { ...params, model }, cacheSessionId)
+    }
+
+    // Meta (Muse) runs on its Responses API (meta_responses.ts), the one Meta
+    // recommends for agents: its Chat Completions route does not carry
+    // reasoning across turns for external keys.
+    if (provider === 'meta') {
+      return yield* streamMetaResponses(cfg, { ...params, model }, cacheSessionId)
+    }
+
+    // OpenCode Zen/Go: each row goes to the gateway route the official client
+    // uses for it (opencode_anthropic_route.ts). The gateway forwards bodies
+    // untouched and 500s on a route that does not match the row's upstream,
+    // so Claude, GPT, Grok, Muse Spark and Gemini never work over
+    // `/chat/completions`. The qwen rows are pinned to `/messages` for a
+    // second reason: their alibaba upstream caches ONLY via Anthropic
+    // cache_control breakpoints (live-verified 2026-07-11: /messages +
+    // breakpoints → 6306-token cache write cold / 6306-token cache read warm;
+    // oa-compat → zero).
+    if (provider === 'opencode' || provider === 'opencodego') {
+      const route = openCodeRouteFor(provider, model)
+      const routeParams = {
+        model,
+        messages,
+        system,
+        // Apply the same eager policy on /messages, /responses and Google
+        // routes as on chat, including tools restored from older sessions.
+        tools: selectOpenAICompatToolsForRequest(tools, messages, cacheSessionId, provider),
+        max_tokens,
+        temperature,
+        stop_sequences,
+        signal,
+        thinking,
+        effortValue: params.effortValue,
+      }
+      if (route === 'messages') {
+        return yield* streamOpenCodeAnthropicRoute(provider, cfg, routeParams, cacheSessionId)
+      }
+      if (route === 'responses') {
+        return yield* streamOpenCodeResponsesRoute(provider, cfg, routeParams, cacheSessionId)
+      }
+      if (route === 'google') {
+        return yield* streamOpenCodeGoogleRoute(provider, cfg, routeParams, cacheSessionId)
+      }
+      if (route === 'systemone') {
+        return yield* emitOpenCodeRouteNotice(
+          model,
+          `${model} is a TypeSafe System One model. OpenCode serves it only on /systemone, `
+            + 'a typed-decision API rather than a chat one, so it cannot run as the model here. '
+            + 'Pick another model with /models.',
+        )
+      }
+    }
+
+    // Assemble system text. We keep it simple for Phase-1 (caller's text).
+    const rawSystemText = typeof system === 'string'
+      ? system
+      : (system ?? []).map(b => b.text).join('\n\n')
+    const freezePrompt = provider === 'openrouter' || provider === 'mistral'
+    const openRouterSnapshotKey = freezePrompt
+      ? openRouterContextKey(provider === 'mistral' ? `mistral:${cfg.baseUrl}` : 'native', model, cacheSessionId, querySource, messages, rawSystemText)
+      : ''
+
+    // Per-model tool filter: small-tier models (e.g. Groq Llama on free
+    // TPM) get a curated subset so the request fits the budget.
+    const transformerForTools = getTransformer(provider as ProviderId)
+    const perModelFilteredTools = transformerForTools.filterTools?.(model, tools) ?? tools
+
+    // Drop the non-preferred shell when BOTH Bash and PowerShell are
+    // exposed (Windows + ant-default or CLAUDE_CODE_USE_POWERSHELL_TOOL=1
+    // + git-bash). Frontier lanes handle two shells fine; weak compat
+    // models routinely pick the wrong one and emit cross-shell syntax,
+    // so the lane picks for them. See single_shell.ts for selection.
+    const filteredTools = selectOpenAICompatToolsForRequest(
+      filterToSingleShell(perModelFilteredTools),
+      messages,
+      sessionId,
+      provider,
+    )
+
+    // Resolve the PowerShell edition once per request (memoized in
+    // powershellDetection.ts; subsequent requests hit the cache). We
+    // need it sync for shell-description rendering — `await` here, NOT
+    // inside buildOpenAITools.
+    const psEdition = await getPowerShellEdition()
+
+    // Tool conversion → OpenAI function tools with per-provider schema
+    // cleanup (strip $schema / $id / additionalProperties / strict etc.).
+    // Every function tool gets the STRICT PARAMETERS description hint,
+    // plus function.strict: true when the provider honors it. Bash /
+    // PowerShell tool descriptions may be replaced with compact
+    // example-driven versions for weak compat-lane models — see
+    // shell_descriptions.ts.
+    const buildToolsCtx: BuildToolsCtx = {
+      platform: getPlatform() === 'windows' ? 'win32' : (process.platform),
+      psEdition,
+    }
+    const builtTools = buildOpenAITools(filteredTools, provider, model, buildToolsCtx)
+
+    // Prepend the tool usage rules to the system message when tools are
+    // present — in-context reminder of schema authority for providers that
+    // don't enforce `strict: true` server-side (Mistral, generic long-tail).
+    // Small-tier models (Groq Llama free TPM) can opt out via
+    // `skipToolUsagePreamble` to save input tokens. The rules describe
+    // ToolSearch loading only when this request carries ToolSearch; every
+    // provider that gets its schemas eagerly is told to call tools directly.
+    const skipPreamble = transformerForTools.skipToolUsagePreamble?.(model) ?? false
+    const toolUsageRules = buildOpenAICompatToolUsageRules(
+      filteredTools.some(tool => tool.name === TOOL_SEARCH_TOOL_NAME),
+    )
+    const assembledSystemText = builtTools.length > 0 && !skipPreamble
+      ? (rawSystemText
+          ? `${toolUsageRules}\n${rawSystemText}`
+          : toolUsageRules)
+      : rawSystemText
+    const systemText = freezePrompt
+      ? freezeOpenRouterSystem(openRouterSnapshotKey, assembledSystemText)
+      : assembledSystemText
+    const openaiTools = freezePrompt
+      ? freezeOpenRouterTools(openRouterSnapshotKey, builtTools)
+      : builtTools
+
+    // History conversion → OpenAI Chat Completions messages.
+    //
+    // OpenRouter and DeepSeek split the system prompt on
+    // SYSTEM_PROMPT_DYNAMIC_BOUNDARY and relocate the volatile tail so their
+    // implicit prefix caches keep a byte-stable head. Every other provider
+    // gets the marker stripped: shouldEmitSystemPromptBoundary() is keyed to
+    // the SESSION provider, so a request routed to a different compat provider
+    // mid-session would otherwise ship the literal marker text to the model.
+    const chatMessages = provider === 'openrouter'
+      ? convertHistoryToOpenAIForOpenRouter(
+          messages,
+          systemText,
+          model,
+        )
+      : provider === 'deepseek'
+        ? buildDeepSeekCacheStableMessages(
+            messages,
+            systemText,
+            model,
+            cacheSessionId,
+          )
+        : provider === 'mistral'
+          ? convertHistoryToOpenAI(messages, stripSystemDynamicBoundary(systemText), provider, model)
+        : isDirectThinkingProvider(provider)
+          ? buildDirectCacheStableMessages(messages, systemText, provider, model, cacheSessionId)
+          : convertHistoryToOpenAI(
+            messages,
+            stripSystemDynamicBoundary(systemText),
+            provider,
+            model,
+          )
+
+    // Build request body with per-provider quirks applied.
+    const body = applyProviderRequestQuirks(
+      {
+        model,
+        messages: chatMessages,
+        stream: true,
+        stream_options: { include_usage: true },
+        // OpenRouter / AgentRouter / OpenCode Zen + Go: surface detailed usage
+        // including cache_discount. Mirrors the Kilo lane's body. Without
+        // this flag the cache_read / cache_write fields aren't populated
+        // on those gateways, which is what made every call look like a
+        // cold miss even when the upstream actually had a cache hit.
+        ...((provider === 'openrouter' || provider === 'agentrouter' || provider === 'opencode' || provider === 'opencodego') && { usage: { include: true } }),
+        // Only bare/unknown local servers get tools stripped (they may not
+        // implement function-calling). Named providers behind a local dev
+        // proxy — and ollama/lmstudio — keep full tool calling.
+        tools: openaiTools.length > 0 && !isBareLocalServer ? openaiTools : undefined,
+        tool_choice: openaiTools.length > 0 && !isBareLocalServer ? 'auto' : undefined,
+        max_tokens: clampMaxTokens(provider, max_tokens),
+        temperature: temperature ?? (isLocalModelServer ? 0.7 : undefined),
+        stop: stop_sequences?.length ? stop_sequences : undefined,
+      },
+      provider,
+      thinking,
+      cacheSessionId,
+      params.effortValue,
+    )
+
+    if (provider === 'openrouter' && openRouterRecovery) {
+      // Request one complete response for recovery instead of another stream.
+      // Keep the model, messages, schemas and cache identity identical.
+      body.stream = false
+      delete body.stream_options
+    }
+    // Appended after every cached message, so the prefix stays byte-identical.
+    if (provider === 'openrouter' && openRouterNote) body.messages.push({ role: 'user', content: openRouterNote })
+
+    // TAU_CACHE_DEBUG: report the first changed tracked prefix segment.
+    // A stable prefix does not guarantee an upstream cache hit.
+    // No-op unless the env var is set. See cache_debug.ts.
+    recordCompatCacheDebug(provider, model, cacheSessionId, body, querySource)
+
+    // Ollama branch: skip the OpenAI-compat /v1 path entirely and use
+    // the native /api/chat endpoint so we can set num_ctx + keep_alive.
+    // The /v1 shim ignores those, so the model runs at its default 4096
+    // context (everything beyond gets truncated and prefilled fresh each
+    // turn — that was the latency cancer). Other providers stay on /v1
+    // unchanged.
+    if (provider === 'ollama') {
+      const ollamaUsage = yield* streamOllamaNative(cfg, body, model, signal)
+      return ollamaUsage
+    }
+
+    // Headers per-provider.
+    const headers = buildRequestHeaders(provider, cfg.apiKey, model, cacheSessionId)
+
+    // Fire request.
+    const url = normalizeBaseUrl(cfg.baseUrl) + '/chat/completions'
+
+    const messageId = `compat-${Date.now()}`
+    let messageStartEmitted = false
+    let inputTokens = 0
+    let outputTokens = 0
+    let reportedCachedInputTokens = 0
+    let cacheWriteTokens = 0
+    let reasoningTokens = 0
+
+    const cacheReadTokens = () =>
+      cacheWriteTokens > 0
+        ? Math.max(0, reportedCachedInputTokens - cacheWriteTokens)
+        : reportedCachedInputTokens
+    const mistralCacheDebug = beginMistralCacheDebug(provider, body, querySource, messageId)
+    const diagnosticUsage = () => ({
+      prompt_tokens: inputTokens,
+      input_tokens: Math.max(0, inputTokens - cacheReadTokens() - cacheWriteTokens),
+      output_tokens: outputTokens,
+      cache_read_input_tokens: cacheReadTokens(),
+      cache_creation_input_tokens: cacheWriteTokens,
+      reasoning_tokens: reasoningTokens,
+    })
+
+    // Content-block state.
+    let currentBlockIndex = 0
+    let inTextBlock = false
+    let inThinkingBlock = false
+    const toolCallBuffers = new Map<number, {
+      id: string; name: string; args: string; anthropicIndex: number
+      decodeStatus?: ReturnType<typeof decodeToolArguments>['status']
+      reasoning?: OpenRouterReasoning
+    }>()
+    let emittedAnyToolUse = false
+    let emittedAnyAssistantOutput = false
+    // Output-cap truncation state. `inFlightToolCall` names the buffer that
+    // was still taking argument fragments when the stream ended — the only
+    // one that can be half-written. See ../shared/truncation.ts.
+    let outputCapTruncated = false
+    const inFlightToolCall = new InFlightToolCall<number>()
+
+    const emitMessageStart = () => {
+      if (messageStartEmitted) return undefined
+      messageStartEmitted = true
+      return {
+        type: 'message_start' as const,
+        message: {
+          id: messageId,
+          type: 'message' as const,
+          role: 'assistant' as const,
+          content: [],
+          model,
+          stop_reason: null,
+          stop_sequence: null,
+          usage: {
+            // OpenRouter totals arrive at the end. Do not seed the additive
+            // accumulator with a total that already includes cached tokens.
+            input_tokens: provider === 'openrouter' ? 0 : inputTokens,
+            output_tokens: 0,
+            ...(provider !== 'openrouter' && cacheReadTokens() > 0 && { cache_read_input_tokens: cacheReadTokens() }),
+            ...(provider !== 'openrouter' && cacheWriteTokens > 0 && { cache_creation_input_tokens: cacheWriteTokens }),
+          },
+        },
+      }
+    }
+
+    if (provider === 'lmstudio') {
+      const contextMessage = await getLmStudioContextPreflightMessage(cfg, model, body).catch(() => null)
+      if (contextMessage) {
+        const mst = emitMessageStart()
+        if (mst) yield mst
+        yield* emitErrorText(contextMessage)
+        yield { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: outputTokens } }
+        yield { type: 'message_stop' }
+        return blankUsage(inputTokens, outputTokens, cacheReadTokens(), reasoningTokens)
+      }
+    }
+
+    let response!: Response
+    let errText = ''
+    // One self-heal attempt: an upstream that runs OpenAI's strict
+    // function-schema validator says so in its 400, and the schemas it will
+    // accept are a pure re-derivation of the ones already built. Retrying
+    // here means the model works on the turn the user asked for, and
+    // openrouterStrictSchema.ts remembers the row so no later turn pays for
+    // it. Nothing has been yielded yet, so the retry is invisible.
+    let strictToolSchemaRetried = false
+    for (;;) {
+      try {
+        response = await fetch(url, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify(body),
+          signal,
+        })
+      } catch (err: any) {
+        mistralCacheDebug?.finish(isAbortError(err, signal) ? 'aborted' : 'transport_error', diagnosticUsage())
+        // A request that never received a response produced nothing durable.
+        // Throw into the shared retry controller instead of persisting an
+        // assistant error turn, which would shift every provider's cache prefix.
+        if (isAbortError(err, signal)) throw err
+        throw createProviderConnectionError(provider, err)
+      }
+
+      // Harvested before the ok check on purpose: a 429 carries the most useful
+      // rate limit headers of any response, and this is the path real traffic
+      // takes. The legacy openai_provider shim harvests separately.
+      recordProviderRateLimits(provider, response.headers)
+      mistralCacheDebug?.response(response)
+      if (response.ok) break
+
+      errText = await response.text().catch(() => '')
+      if (
+        !strictToolSchemaRetried
+        && provider === 'openrouter'
+        && response.status === 400
+        && body.tools?.length
+        && isOpenRouterStrictToolSchemaError(errText)
+      ) {
+        strictToolSchemaRetried = true
+        recordOpenRouterStrictToolSchemaModel(model)
+        const stamped = body.tools[body.tools.length - 1]?.cache_control
+        body.tools = buildOpenAITools(filteredTools, provider, model, buildToolsCtx)
+        const lastTool = body.tools[body.tools.length - 1]
+        // Re-stamp the tool-prefix cache breakpoint the transformer placed on
+        // the original array; losing it would cold-start the upstream cache.
+        if (stamped && lastTool) lastTool.cache_control = stamped
+        continue
+      }
+      break
+    }
+
+    if (!response.ok) {
+      mistralCacheDebug?.finish('http_error', diagnosticUsage())
+      if (provider === 'openrouter') {
+        // A rejection is not the assistant's reply. Emitted as text it was
+        // saved as the model's own words and replayed on every later turn.
+        // The stream wrapper retries what waiting can fix; the rest surfaces
+        // as an API error, which never re-enters the conversation.
+        const lowered = errText.toLowerCase()
+        const isPromptTooLong = getTransformer(provider).contextExceededMarkers()
+          .some(m => lowered.includes(m.toLowerCase()))
+        const error = openRouterHttpError(response.status, errText, response.headers,
+          formatProviderHttpError(provider, response.status, errText, isPromptTooLong, model))
+        if (error.canRetryBeforeOutput) forgetOpenRouterServedProvider(cacheSessionId, model, error.provider)
+        throw error
+      }
+      throwRetryableProviderHttpError(provider, response, errText)
+      if (!messageStartEmitted) {
+        const mst = emitMessageStart()
+        if (mst) yield mst
+      }
+      const isCopilotModelUnsupported =
+        provider === 'copilot'
+        && response.status === 400
+        && isCopilotModelUnsupportedError(errText)
+      const isCopilotQuotaExceeded =
+        provider === 'copilot'
+        && response.status === 402
+        && isCopilotQuotaExceededError(errText)
+
+      if (isCopilotModelUnsupported) {
+        yield* emitErrorText(formatCopilotModelUnsupportedMessage(model))
+        yield { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: outputTokens } }
+        yield { type: 'message_stop' }
+        return blankUsage(inputTokens, outputTokens, cacheReadTokens(), reasoningTokens)
+      }
+
+      if (isCopilotQuotaExceeded) {
+        yield* emitErrorText(formatCopilotQuotaExceededMessage())
+        yield { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: outputTokens } }
+        yield { type: 'message_stop' }
+        return blankUsage(inputTokens, outputTokens, cacheReadTokens(), reasoningTokens)
+      }
+
+      // Detect prompt-too-long / context-window-exceeded per the
+      // transformer's known markers. Emit with the "Prompt is too long"
+      // prefix claude.ts reactive-compact text-matches against —
+      // otherwise Flash / smaller models 400 on oversized turns and
+      // the user has to `/compact` manually.
+      const transformer = getTransformer(provider as ProviderId)
+      const markers = transformer.contextExceededMarkers()
+      const lowered = errText.toLowerCase()
+      const isPromptTooLong = markers.some(m => lowered.includes(m.toLowerCase()))
+      yield* emitErrorText(formatProviderHttpError(provider, response.status, errText, isPromptTooLong, model))
+      yield { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: outputTokens } }
+      yield { type: 'message_stop' }
+      return blankUsage(inputTokens, outputTokens, cacheReadTokens(), reasoningTokens)
+    }
+
+    if (provider === 'openrouter' && openRouterRecovery) response = await openRouterCompletionAsSSE(response)
+    if (!response.body) {
+      mistralCacheDebug?.finish('empty_response', diagnosticUsage())
+      throw new Error('OpenAI-compat: empty response body')
+    }
+
+    // Check the exact contracts sent, including strict-schema normalization
+    // and any HTTP 400 schema retry. Optional nullable fields on the wire
+    // must not be mistaken for repeated invalid arguments before execution.
+    const openRouterToolStream = provider === 'openrouter'
+      ? new OpenRouterToolStream(messages, (body.tools ?? []).map(tool => ({
+          name: tool.function.name, description: tool.function.description ?? '',
+          input_schema: tool.function.parameters,
+        })), filteredTools, openRouterRecovery)
+      : undefined
+    const reader = response.body.getReader()
+    const decoder = new TextDecoder()
+    let buffer = ''
+    const openRouterFrames = openRouterToolStream ? new OpenRouterSSEDecoder() : undefined
+    let openRouterServedProvider: string | undefined
+    let streamReadCompleted = false
+
+    try {
+      reading: while (true) {
+        const { done, value } = await reader.read()
+        const decodedText = done ? decoder.decode() : decoder.decode(value, { stream: true })
+        let lines: string[]
+        if (openRouterFrames) {
+          lines = openRouterFrames.feed(decodedText, done).map(payload => `data:${payload}`)
+        } else {
+          buffer += decodedText
+          lines = buffer.split('\n')
+          buffer = done ? '' : (lines.pop() ?? '')
+        }
+
+        for (const rawLine of lines) {
+          const line = rawLine.trim()
+          if (!line) continue
+          if (!line.startsWith('data:')) continue
+          const payload = line.slice(5).trim()
+          if (payload === '[DONE]') break reading
+          if (!payload) continue
+
+          let chunk: any
+          try {
+            chunk = JSON.parse(payload)
+          } catch {
+            if (openRouterToolStream) {
+              // Dropping an invalid SSE payload could drop part of a write.
+              throw new OpenRouterToolCallError('The stream contained an invalid JSON event; pending tools were not dispatched.')
+            }
+            continue
+          }
+          mistralCacheDebug?.frame(chunk)
+          if (openRouterToolStream) {
+            try {
+              chunk = openRouterToolStream.accept(chunk)
+            } catch (error) {
+              // OpenRouter cannot switch providers mid-answer. Stop asking for
+              // the pinned one first, so the retry can be routed elsewhere.
+              if (error instanceof OpenRouterUpstreamError && error.canRetryBeforeOutput) {
+                forgetOpenRouterServedProvider(cacheSessionId, model, error.provider)
+              }
+              throw error
+            }
+            yield { type: 'openrouter_progress' }
+          }
+
+          // OpenRouter chunks name the upstream provider that actually served
+          // this request — top-level `provider` on older responses, or under
+          // `openrouter_metadata` when the X-OpenRouter-Metadata header is on.
+          // Record it per session+model so the NEXT request can pin provider
+          // routing: OR's session_id stickiness is best-effort, and a silent
+          // re-route is a full upstream prompt-cache cold start.
+          if (provider === 'openrouter') {
+            const served =
+              typeof chunk.provider === 'string' && chunk.provider
+                ? chunk.provider
+                : typeof chunk.openrouter_metadata?.provider === 'string'
+                  ? chunk.openrouter_metadata.provider
+                  : undefined
+            if (served) {
+              openRouterServedProvider = served
+            }
+          }
+
+          // Apply per-provider response normalization (reasoning field
+          // renames etc.) so downstream IR emission is uniform.
+          chunk = applyProviderResponseQuirks(chunk, provider)
+
+          // Stream-level usage (present on final chunk for most providers).
+          if (chunk.usage) {
+            inputTokens = chunk.usage.prompt_tokens ?? inputTokens
+            outputTokens = chunk.usage.completion_tokens ?? outputTokens
+            const cacheUsage = extractOpenAICompatCacheUsage(chunk.usage, provider)
+            cacheWriteTokens =
+              providerReportsOpenAICompatCacheUsage(provider)
+                ? cacheUsage.write ?? cacheWriteTokens
+                : 0
+            if (cacheUsage.read !== undefined) {
+              reportedCachedInputTokens = cacheUsage.read + cacheWriteTokens
+            } else if (cacheUsage.cachedTotal !== undefined) {
+              // OpenRouter documents `cached_tokens` as cache reads only,
+              // while this lane stores an internal read+write total so the
+              // final Anthropic-shaped usage can subtract write tokens once.
+              reportedCachedInputTokens = provider === 'openrouter'
+                ? cacheUsage.cachedTotal + cacheWriteTokens
+                : cacheUsage.cachedTotal
+            }
+            reasoningTokens = chunk.usage.completion_tokens_details?.reasoning_tokens ?? reasoningTokens
+
+          }
+
+          // Fireworks reports cached prompt tokens via perf_metrics
+          // (`cached-prompt-tokens`), which for streaming arrives in the
+          // final chunk when perf_metrics_in_response is set. The standard
+          // usage block omits prompt_tokens_details mid-stream, so fold this
+          // value into the cache-read count. Fireworks-only — no other
+          // provider's usage/billing path is touched. perf_metrics may ride
+          // on a chunk without `usage`, so it lives outside the block above.
+          if (provider === 'fireworks' && chunk.perf_metrics && typeof chunk.perf_metrics === 'object') {
+            const cached = (chunk.perf_metrics as Record<string, unknown>)['cached-prompt-tokens']
+            if (typeof cached === 'number' && cached > reportedCachedInputTokens) {
+              reportedCachedInputTokens = cached
+            }
+          }
+
+          const choice = chunk.choices?.[0]
+          if (!choice) continue
+          const delta = choice.delta ?? {}
+
+          if (!messageStartEmitted && (delta.content || delta.tool_calls || delta.reasoning_content || delta.thinking)) {
+            const mst = emitMessageStart()
+            if (mst) yield mst
+          }
+
+          // Reasoning / thinking content. We normalize into a thinking
+          // block that claude.ts can render. Providers disagree: some
+          // stream reasoning_content (DeepSeek reasoner), some stream
+          // reasoning (Groq / OpenRouter), some stream thinking (already
+          // normalized).
+          const thinkingDelta: string | undefined =
+            delta.thinking ?? delta.reasoning_content ?? delta.reasoning
+          if (typeof thinkingDelta === 'string' && thinkingDelta.length > 0) {
+            emittedAnyAssistantOutput = true
+            inFlightToolCall.noteOtherOutput()
+            if (inTextBlock) {
+              yield { type: 'content_block_stop', index: currentBlockIndex }
+              currentBlockIndex++
+              inTextBlock = false
+            }
+            if (!inThinkingBlock) {
+              yield {
+                type: 'content_block_start',
+                index: currentBlockIndex,
+                content_block: { type: 'thinking', thinking: '' },
+              }
+              inThinkingBlock = true
+            }
+            yield {
+              type: 'content_block_delta',
+              index: currentBlockIndex,
+              delta: { type: 'thinking_delta', thinking: thinkingDelta },
+            }
+          }
+
+          // Text content.
+          if (typeof delta.content === 'string' && delta.content.length > 0) {
+            emittedAnyAssistantOutput = true
+            inFlightToolCall.noteOtherOutput()
+            if (inThinkingBlock) {
+              yield { type: 'content_block_stop', index: currentBlockIndex }
+              currentBlockIndex++
+              inThinkingBlock = false
+            }
+            if (!inTextBlock) {
+              yield {
+                type: 'content_block_start',
+                index: currentBlockIndex,
+                content_block: { type: 'text', text: '' },
+              }
+              inTextBlock = true
+            }
+            yield {
+              type: 'content_block_delta',
+              index: currentBlockIndex,
+              delta: { type: 'text_delta', text: delta.content },
+            }
+          }
+
+          // Tool-call deltas. OpenAI-style tool_calls arrive piece-by-piece
+          // indexed by position. We accumulate args until finish_reason
+          // signals completion.
+          if (Array.isArray(delta.tool_calls)) {
+            if (delta.tool_calls.length > 0) emittedAnyAssistantOutput = true
+            for (const tc of delta.tool_calls) {
+              const idx = tc.index ?? 0
+              let buf = toolCallBuffers.get(idx)
+              if (!buf) {
+                // Close any currently-open text/thinking block.
+                if (inTextBlock || inThinkingBlock) {
+                  yield { type: 'content_block_stop', index: currentBlockIndex }
+                  currentBlockIndex++
+                  inTextBlock = false
+                  inThinkingBlock = false
+                }
+                buf = {
+                  id: tc.id ?? `call_${idx}`,
+                  name: tc.function?.name ?? '',
+                  args: '',
+                  anthropicIndex: currentBlockIndex,
+                }
+                currentBlockIndex++
+                toolCallBuffers.set(idx, buf)
+                emittedAnyToolUse = true
+              }
+              if (tc.id) buf.id = tc.id
+              if (openRouterToolStream && tc._tau_decode_status) buf.decodeStatus = tc._tau_decode_status
+              if (openRouterToolStream && tc._openrouter_reasoning) buf.reasoning = tc._openrouter_reasoning
+              if (tc.function?.name) buf.name = tc.function.name
+              if (typeof tc.function?.arguments === 'string') {
+                buf.args += tc.function.arguments
+                inFlightToolCall.noteArgs(idx)
+              }
+            }
+          }
+
+          // finish_reason signals completion of this choice's output.
+          const finishReason = choice.finish_reason
+          if (finishReason) {
+            // Close open text / thinking blocks.
+            if (inTextBlock || inThinkingBlock) {
+              yield { type: 'content_block_stop', index: currentBlockIndex }
+              inTextBlock = false
+              inThinkingBlock = false
+            }
+
+            // `length` means the model was cut off at the output cap, so the
+            // call still taking argument fragments is half-written. Drop it
+            // instead of emitting it: its arguments may still parse (some
+            // routers close the JSON object for us), in which case the tool
+            // layer cannot tell a truncated call from a finished one and
+            // either rejects it with a misleading "required parameter is
+            // missing" or, worse, runs it and writes a truncated file.
+            // Dropping before any event is emitted means nothing downstream
+            // ever sees the block, so no tool_result is owed for it.
+            if (isOutputCapTruncation(finishReason)) {
+              outputCapTruncated = true
+              const dropKey = inFlightToolCall.toDrop(true)
+              const dropped = dropKey === null ? undefined : toolCallBuffers.get(dropKey)
+              // Only ever the last-opened block, so the emitted indices stay
+              // contiguous and claude.ts is never left holding a gap.
+              const isLastBlock =
+                dropped !== undefined &&
+                [...toolCallBuffers.values()].every(b => b.anthropicIndex <= dropped.anthropicIndex)
+              if (dropKey !== null && isLastBlock) toolCallBuffers.delete(dropKey)
+            }
+
+            // Emit final tool_use blocks with the accumulated arguments.
+            for (const buf of toolCallBuffers.values()) {
+              const implId = normalizeToolName(buf.name)
+              const decoded = decodeToolArguments(buf.args)
+              if (buf.decodeStatus) decoded.status = buf.decodeStatus
+              const repaired = decoded.status
+                ? { toolName: implId, input: decoded.input }
+                : repairCompatToolCall(implId, decoded.input)
+              const input = repaired.input
+              const anthropicToolUseId = buf.id.startsWith('toolu_') ? buf.id : `toolu_compat_${buf.id}`
+              // Three-event sequence: start (empty input) + input_json_delta
+              // (args as JSON string) + stop. claude.ts's accumulator reads
+              // partial_json, not the inline input field — inline input gets
+              // dropped and every tool sees `{}`.
+              yield {
+                type: 'content_block_start',
+                index: buf.anthropicIndex,
+                content_block: {
+                  type: 'tool_use',
+                  id: anthropicToolUseId,
+                  name: repaired.toolName,
+                  input: {},
+                  ...toolDecodeFields(decoded),
+                  ...(buf.reasoning && { _openrouter_reasoning: buf.reasoning }),
+                  ...(openRouterToolStream && { _openrouter_tool_call_id: buf.id }),
+                },
+              }
+              yield {
+                type: 'content_block_delta',
+                index: buf.anthropicIndex,
+                delta: {
+                  type: 'input_json_delta',
+                  partial_json: JSON.stringify(input ?? {}),
+                },
+              }
+              yield { type: 'content_block_stop', index: buf.anthropicIndex }
+            }
+            toolCallBuffers.clear()
+            inFlightToolCall.noteOtherOutput()
+          }
+        }
+
+        if (done) break
+      }
+      streamReadCompleted = true
+    } catch (error) {
+      mistralCacheDebug?.finish(isAbortError(error, signal) ? 'aborted' : 'stream_error', diagnosticUsage())
+      throw error
+    } finally {
+      if (!streamReadCompleted) {
+        mistralCacheDebug?.finish(signal?.aborted ? 'aborted' : 'consumer_closed', diagnosticUsage())
+      }
+      if (openRouterToolStream) await reader.cancel().catch(() => {})
+      reader.releaseLock()
+    }
+    openRouterToolStream?.end()
+    // A failed attempt must not pin later traffic to the provider that failed.
+    if (openRouterServedProvider) await recordOpenRouterServedProvider(cacheSessionId, model, openRouterServedProvider)
+
+    if (provider === 'lmstudio' && !emittedAnyAssistantOutput) {
+      const fallback = await fetchLmStudioNonStreamingCompletion(cfg, body, model, signal).catch(() => null)
+      const textOnlyFallback = !fallback?.text?.trim() && !fallback?.thinking?.trim() && !(fallback?.toolCalls?.length)
+        ? await fetchLmStudioNonStreamingCompletion(cfg, body, model, signal, true).catch(() => null)
+        : null
+      const recovered = textOnlyFallback ?? fallback
+      const fallbackText = recovered?.text?.trim()
+      const fallbackThinking = recovered?.thinking?.trim()
+      const fallbackToolCalls = recovered?.toolCalls ?? []
+      if (fallbackText || fallbackThinking || fallbackToolCalls.length > 0) {
+        inputTokens = recovered?.usage?.prompt_tokens ?? inputTokens
+        outputTokens = recovered?.usage?.completion_tokens ?? outputTokens
+        reasoningTokens = recovered?.usage?.completion_tokens_details?.reasoning_tokens ?? reasoningTokens
+
+        if (!messageStartEmitted) {
+          const mst = emitMessageStart()
+          if (mst) yield mst
+        }
+
+        if (fallbackThinking) {
+          yield {
+            type: 'content_block_start',
+            index: currentBlockIndex,
+            content_block: { type: 'thinking', thinking: '' },
+          }
+          yield {
+            type: 'content_block_delta',
+            index: currentBlockIndex,
+            delta: { type: 'thinking_delta', thinking: fallbackThinking },
+          }
+          yield { type: 'content_block_stop', index: currentBlockIndex }
+          currentBlockIndex++
+        }
+
+        if (fallbackText) {
+          yield {
+            type: 'content_block_start',
+            index: currentBlockIndex,
+            content_block: { type: 'text', text: '' },
+          }
+          yield {
+            type: 'content_block_delta',
+            index: currentBlockIndex,
+            delta: { type: 'text_delta', text: fallbackText },
+          }
+          yield { type: 'content_block_stop', index: currentBlockIndex }
+          currentBlockIndex++
+        }
+
+        for (const toolCall of fallbackToolCalls) {
+          const toolName = toolCall.function?.name
+          if (!toolName) continue
+          const implId = normalizeToolName(toolName)
+          const decoded = decodeToolArguments(toolCall.function?.arguments)
+          const repaired = decoded.status
+            ? { toolName: implId, input: decoded.input }
+            : repairCompatToolCall(implId, decoded.input)
+          const input = repaired.input
+          const toolId = toolCall.id?.startsWith('toolu_') ? toolCall.id : `toolu_compat_${toolCall.id ?? `lmstudio_${currentBlockIndex}`}`
+          yield {
+            type: 'content_block_start',
+            index: currentBlockIndex,
+            content_block: {
+              type: 'tool_use',
+              id: toolId,
+              name: repaired.toolName,
+              input: {},
+              ...toolDecodeFields(decoded),
+            },
+          }
+          yield {
+            type: 'content_block_delta',
+            index: currentBlockIndex,
+            delta: {
+              type: 'input_json_delta',
+              partial_json: JSON.stringify(input ?? {}),
+            },
+          }
+          yield { type: 'content_block_stop', index: currentBlockIndex }
+          currentBlockIndex++
+          emittedAnyToolUse = true
+        }
+
+        const stopReason: 'tool_use' | 'end_turn' = emittedAnyToolUse ? 'tool_use' : 'end_turn'
+        yield {
+          type: 'message_delta',
+          delta: { stop_reason: stopReason },
+          usage: {
+            output_tokens: outputTokens,
+            input_tokens: inputTokens,
+          },
+        }
+        yield { type: 'message_stop' }
+        return blankUsage(inputTokens, outputTokens, cacheReadTokens(), reasoningTokens)
+      }
+
+      if (!signal?.aborted) {
+        if (!messageStartEmitted) {
+          const mst = emitMessageStart()
+          if (mst) yield mst
+        }
+        const contextMessage = await getLmStudioContextPreflightMessage(cfg, model, body).catch(() => null)
+        yield* emitErrorText(contextMessage ?? 'LM Studio returned an empty response. Check LM Studio logs for the selected local model and retry.')
+        yield { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: outputTokens } }
+        yield { type: 'message_stop' }
+        return blankUsage(inputTokens, outputTokens, cacheReadTokens(), reasoningTokens)
+      }
+    }
+
+    // A terminal stream that carried no text, no reasoning, and no tool calls
+    // is a provider glitch, not a finished turn. Falling through would emit
+    // stop_reason 'end_turn', logging an empty assistant message and settling
+    // the turn as completed — so retry never runs, nothing reaches the caller,
+    // and an automated driver (goal rounds, team-mode) consumes a round on no
+    // progress. Throw instead: the shared retry controller can only retry
+    // thrown errors, and repeating the identical request preserves the rolling
+    // cache prefix that persisting an assistant error would shift (same reason
+    // the OpenCode transport failure above throws). Safe to repeat because the
+    // attempt produced nothing durable. Scoped to a non-aborted stream, and
+    // lmstudio is excluded because its non-streaming fallback above already
+    // owns this case and returns on every path it handles.
+    if (
+      !emittedAnyAssistantOutput &&
+      (provider !== 'openrouter' || !outputCapTruncated) &&
+      !signal?.aborted &&
+      provider !== 'lmstudio'
+    ) {
+      mistralCacheDebug?.finish('empty_response', diagnosticUsage())
+      throw new APIConnectionError({
+        message: `${provider} returned an empty response (no content, reasoning, or tool calls).`,
+        cause: new Error('EMPTY_RESPONSE'),
+      })
+    }
+
+    if (!messageStartEmitted) {
+      const mst = emitMessageStart()
+      if (mst) yield mst
+    }
+
+    const stopReason = laneStopReason({
+      truncated: outputCapTruncated,
+      hadToolUse: emittedAnyToolUse,
+    })
+    mistralCacheDebug?.finish(signal?.aborted ? 'aborted' : 'success', diagnosticUsage())
+    yield {
+      type: 'message_delta',
+      delta: { stop_reason: stopReason },
+      usage: {
+        output_tokens: outputTokens,
+        // OpenAI-style `prompt_tokens` is total (fresh + cached). Split
+        // into fresh + cache_read to match Anthropic's additive buckets.
+        input_tokens: Math.max(
+          0,
+          inputTokens - cacheReadTokens() - cacheWriteTokens,
+        ),
+        ...(cacheReadTokens() > 0 && { cache_read_input_tokens: cacheReadTokens() }),
+        ...(cacheWriteTokens > 0 && { cache_creation_input_tokens: cacheWriteTokens }),
+        ...(provider === 'openrouter' && openRouterInputUsage(model, inputTokens, cacheReadTokens(), cacheWriteTokens)),
+      },
+    }
+    yield { type: 'message_stop' }
+
+    return {
+      input_tokens: inputTokens,
+      output_tokens: outputTokens,
+      cache_read_tokens: cacheReadTokens(),
+      cache_write_tokens: cacheWriteTokens,
+      thinking_tokens: reasoningTokens,
+    }
+  }
+
+  // ── Lane-owns-loop (Phase-2, not wired yet) ─────────────────────
+
+  async *run(_context: LaneRunContext): AsyncGenerator<AnthropicStreamEvent, LaneRunResult> {
+    throw new Error('OpenAICompatLane.run (lane-owns-loop) is not wired yet — use streamAsProvider via LaneBackedProvider.')
+  }
+
+  async listModels(providerFilter?: string): Promise<ModelInfo[]> {
+    // Query /v1/models on every configured provider in parallel, cache
+    // per-provider for 5 minutes. Errors on individual providers don't
+    // block the rest — a slow Ollama install shouldn't delay Groq's list.
+    //
+    // When `providerFilter` is given, only that sub-provider is queried
+    // and returned, so /models groq only shows Groq models (not the
+    // union of every compat provider's catalog).
+    const now = Date.now()
+    const cacheKey = providerFilter ?? '__all__'
+    const liveOnlyCatalog =
+      providerFilter !== undefined && (isDirectProvider(providerFilter) || providerFilter === 'mistral')
+    const cached = _modelsCacheByProvider.get(cacheKey)
+    if (!liveOnlyCatalog && cached && now - cached.at < MODELS_CACHE_TTL_MS) {
+      return cached.models
+    }
+    const entries = Array.from(this.configs.entries())
+      .filter(([name]) => !providerFilter || name === providerFilter)
+    const results = await Promise.allSettled(entries.map(async ([providerName, cfg]) => {
+      if (providerName === 'xai') return listXaiModels(cfg)
+      if (providerName === 'meta') return listMetaModels(cfg)
+      if (isDirectProvider(providerName)) {
+        return listDirectProviderModels(providerName, cfg.baseUrl, { Authorization: `Bearer ${cfg.apiKey}`, Accept: 'application/json' })
+      }
+      if (providerName === 'lmstudio') {
+        const openAIModels = await listLmStudioOpenAIModels(cfg)
+        if (openAIModels.length > 0) return openAIModels
+        const nativeModels = await listLmStudioNativeModels(cfg)
+        if (nativeModels.length > 0) return nativeModels
+      }
+
+      const transformer = getTransformer(providerName as ProviderId)
+      // Most compat providers either want a fully-curated catalog or a
+      // direct pass-through from `/models`. Copilot is the main exception:
+      // its live catalog changes often enough that we want fresh data, but
+      // still need a fallback when `/models` is unavailable.
+      const fixed = transformer.staticCatalog?.() ?? []
+      const preferLiveCatalog = transformer.preferLiveModelCatalog?.() ?? false
+      if (!preferLiveCatalog && fixed.length > 0) {
+        // The curated list is what the picker gets, unchanged. But when it
+        // carries no window for some of its models, learn those out-of-band
+        // rather than letting them fall through to the 200K default forever.
+        if (
+          fixed.some(
+            model =>
+              !(typeof model.contextWindow === 'number' && model.contextWindow > 0),
+          )
+        ) {
+          learnContextWindowsFromUpstream(providerName, cfg, transformer)
+        }
+        return fixed
+      }
+      try {
+        const url = `${normalizeBaseUrl(cfg.baseUrl)}/models`
+        const headers: Record<string, string> = { 'Accept': 'application/json' }
+        if (cfg.apiKey) headers['Authorization'] = `Bearer ${cfg.apiKey}`
+        const extra = transformer.buildHeaders?.(cfg.apiKey) ?? {}
+        for (const [k, v] of Object.entries(extra)) {
+          // Reuse provider-specific auth/catalog headers (e.g. Copilot's
+          // editor-version / integration-id) but keep the GET request's
+          // Accept as JSON rather than the streaming default.
+          if (k.toLowerCase() === 'accept') continue
+          headers[k] = v
+        }
+        const resp = await fetch(url, { headers, method: 'GET' })
+        if (resp.ok) {
+          const data = await resp.json() as { data?: CompatCatalogModel[]; result?: CompatCatalogModel[] }
+          const raw = (data.data ?? data.result ?? [])
+            .map(m => toCompatCatalogModel(providerName, m))
+            .filter((model): model is ModelInfo => model !== null)
+          // Per-provider catalog filter: e.g. Groq hides whisper/preview
+          // models so `/models` only shows chat-capable production IDs.
+          const filtered = (transformer.filterModelCatalog?.(raw) ?? raw) as ModelInfo[]
+          const visible = providerName === 'opencode' && cfg.apiKey === 'public'
+            ? filtered.filter(isOpencodeAnonymousCatalogModel)
+            : filtered
+          if (visible.length > 0 || providerName === 'mistral') {
+            return providerName === 'cloudflare'
+              ? mergeCatalogModels(visible, fixed)
+              : visible
+          }
+        }
+      } catch {
+        // Fall back to the curated list below.
+      }
+      return fixed
+    }))
+    const out: ModelInfo[] = []
+    for (const r of results) {
+      if (r.status !== 'fulfilled') continue
+      // filterModelCatalog declares `name?: string` so the union with
+      // staticCatalog widens; backfill from id when the upstream omitted it.
+      for (const m of r.value) out.push({ ...m, name: m.name ?? m.id })
+    }
+    const hasIncompleteLmStudioContext =
+      providerFilter === 'lmstudio'
+      && out.length > 0
+      && out.some(model => typeof model.contextWindow !== 'number' || model.contextWindow <= 0)
+    if (!liveOnlyCatalog && !hasIncompleteLmStudioContext) {
+      _modelsCacheByProvider.set(cacheKey, { models: out, at: now })
+    }
+    return out
+  }
+
+  resolveModel(model: string): string {
+    return resolveOpenRouterVirtualModelId(model)
+  }
+
+  smallFastModel(): string | null {
+    // Compat lane: no universal fast model — provider-specific hints
+    // live in each transformer. The caller passes the currently-
+    // configured model to resolveSmallFastModel() below to get a
+    // provider-appropriate fast model when present.
+    return null
+  }
+
+  isHealthy(): boolean {
+    return this._healthy
+  }
+
+  setHealthy(healthy: boolean): void {
+    this._healthy = healthy
+  }
+
+  dispose(): void {}
+}
+
+function isOpencodeAnonymousCatalogModel(model: ModelInfo): boolean {
+  return isOpencodeAnonymousModelId(model.id)
+    || model.tags?.some(tag => tag.toLowerCase() === 'free') === true
+}
+
+/** Providers whose upstream catalog has already been consulted for metadata. */
+const contextWindowLearnAttempted = new Set<string>()
+
+/**
+ * Learn context windows for providers whose curated catalog suppresses
+ * `/models`.
+ *
+ * A `staticCatalog()` decides what the picker *shows* — curated ordering, a
+ * deliberate subset, junk hidden. It is not a statement about model metadata,
+ * and most of these catalogs omit `contextWindow` entirely. Because returning
+ * the curated list short-circuits the `/models` request, nothing downstream
+ * ever sees a window for those models, so every one of them resolves to
+ * MODEL_CONTEXT_WINDOW_DEFAULT — the number auto-compact then divides by.
+ *
+ * Fetching the upstream catalog purely for its metadata separates the two
+ * concerns: the displayed list stays byte-identical, while the context-window
+ * store learns real sizes, including for models the provider adds later. That
+ * is what keeps this from becoming another hand-maintained table.
+ *
+ * Best-effort by construction: at most one attempt per provider per process,
+ * a bounded timeout, every failure silent, and no effect on the caller's
+ * return value.
+ */
+function learnContextWindowsFromUpstream(
+  providerName: string,
+  cfg: { apiKey: string; baseUrl: string },
+  transformer: ReturnType<typeof getTransformer>,
+): void {
+  if (contextWindowLearnAttempted.has(providerName)) return
+  contextWindowLearnAttempted.add(providerName)
+
+  void (async () => {
+    try {
+      const headers: Record<string, string> = { Accept: 'application/json' }
+      if (cfg.apiKey) headers['Authorization'] = `Bearer ${cfg.apiKey}`
+      // Same provider-specific auth/catalog headers the live path builds, but
+      // keep Accept as JSON rather than the streaming default.
+      for (const [k, v] of Object.entries(transformer.buildHeaders?.(cfg.apiKey) ?? {})) {
+        if (k.toLowerCase() === 'accept') continue
+        headers[k] = v
+      }
+      const resp = await fetch(`${normalizeBaseUrl(cfg.baseUrl)}/models`, {
+        method: 'GET',
+        headers,
+        signal: AbortSignal.timeout(10_000),
+      })
+      if (!resp.ok) return
+
+      const data = await resp.json() as {
+        data?: CompatCatalogModel[]
+        result?: CompatCatalogModel[]
+      }
+      const models = (data.data ?? data.result ?? [])
+        .map(m => toCompatCatalogModel(providerName, m))
+        .filter(
+          (model): model is ModelInfo =>
+            model !== null &&
+            typeof model.contextWindow === 'number' &&
+            model.contextWindow > 0,
+        )
+      if (models.length > 0) {
+        recordProviderModelContextWindows(providerName as APIProvider, models)
+      }
+    } catch {
+      // Metadata-only: a provider without /models, an expired key, or an
+      // offline box just leaves the existing resolution in place.
+    }
+  })()
+}
+
+function toCompatCatalogModel(
+  providerName: string,
+  model: CompatCatalogModel,
+): ModelInfo | null {
+  if (providerName === 'openrouter') {
+    return toOpenRouterModelInfo(model)
+  }
+
+  if (providerName === 'mistral') {
+    return toMistralCatalogModel(model)
+  }
+
+  if (providerName === 'cloudflare') {
+    return toCloudflareCatalogModel(model)
+  }
+
+  if (typeof model.id !== 'string' || model.id.length === 0) {
+    return null
+  }
+
+  if (typeof model.api === 'string' && model.api.length > 0 && model.api.toLowerCase() !== 'chat') {
+    return null
+  }
+
+  if (!isTextGenerationCatalogType(model.type)) {
+    return null
+  }
+
+  const tags = normalizeCompatCatalogTags(model)
+  if (providerName === 'opencode' && isOpencodeAnonymousModelId(model.id) && !tags.includes('free')) {
+    tags.push('free')
+  }
+  // Remember whether this provider says the model takes image input, so
+  // request-time conversion can send real pixels instead of transcribing.
+  // Only recorded when the payload actually carried modality information:
+  // absence of a `vision` tag is not evidence of blindness.
+  if (compatCatalogStatesModality(model)) {
+    recordModelVision(providerName, model.id, tags.includes('vision'))
+  }
+  const provider =
+    typeof model.owned_by === 'string'
+    && model.owned_by.length > 0
+    && model.owned_by.toLowerCase() !== 'system'
+      ? model.owned_by
+      : undefined
+  const limits = model.capabilities?.limits
+  const contextWindow =
+    // A stated prompt ceiling is the limit the host enforces. Copilot rejects
+    // a prompt over max_prompt_tokens even where the model's whole window is
+    // larger (Opus 4.7: 168K of 200K), so that is the number compaction has
+    // to respect. The whole window only stands in when no ceiling is stated.
+    positiveCatalogNumber(limits?.max_prompt_tokens)
+    ?? model.context_length
+    ?? model.context_window
+    ?? model.max_context_length
+    ?? positiveCatalogNumber(limits?.max_context_window_tokens)
+
+  return {
+    id: model.id,
+    name: typeof model.name === 'string' && model.name.length > 0
+      ? model.name
+      : model.id,
+    contextWindow,
+    ...(provider ? { provider } : {}),
+    ...(tags.length > 0 ? { tags } : {}),
+    ...(model.supports_tool_calling === true || model.capabilities?.function_calling === true
+      ? { supportsToolCalling: true }
+      : {}),
+  }
+}
+
+function positiveCatalogNumber(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0
+    ? value
+    : undefined
+}
+
+function isTextGenerationCatalogType(type: string | undefined): boolean {
+  if (!type) return true
+  const normalized = type.toLowerCase()
+  return normalized === 'language' || normalized === 'text' || normalized === 'chat'
+}
+
+function mergeCatalogModels(
+  primary: readonly ModelInfo[],
+  fallback: readonly ModelInfo[],
+): ModelInfo[] {
+  const seen = new Set<string>()
+  const merged: ModelInfo[] = []
+  for (const model of [...primary, ...fallback]) {
+    const key = model.id.toLowerCase()
+    if (seen.has(key)) continue
+    seen.add(key)
+    merged.push(model)
+  }
+  return merged
+}
+
+function toCloudflareCatalogModel(model: CompatCatalogModel): ModelInfo | null {
+  if (typeof model.id !== 'string' || model.id.length === 0) {
+    return null
+  }
+
+  if (!isCloudflareTextGenerationModel(model)) {
+    return null
+  }
+
+  const tags = normalizeCompatCatalogTags(model)
+  const provider =
+    typeof model.owned_by === 'string'
+    && model.owned_by.length > 0
+    && model.owned_by.toLowerCase() !== 'system'
+      ? model.owned_by
+      : 'Cloudflare Workers AI'
+  const contextWindow =
+    model.context_length
+    ?? model.context_window
+    ?? model.max_context_length
+
+  return {
+    id: model.id,
+    name: typeof model.name === 'string' && model.name.length > 0
+      ? model.name
+      : model.id,
+    provider,
+    ...(contextWindow ? { contextWindow } : {}),
+    ...(tags.length > 0 ? { tags } : {}),
+    ...(model.supports_tool_calling === true || model.capabilities?.function_calling === true
+      ? { supportsToolCalling: true }
+      : {}),
+  }
+}
+
+function isCloudflareTextGenerationModel(model: CompatCatalogModel): boolean {
+  const id = typeof model.id === 'string' ? model.id.toLowerCase() : ''
+  const markers = [
+    'embedding', 'embed', 'bge-', 'reranker', 'whisper', 'flux', 'aura',
+    'melotts', 'transcribe', 'speech', 'tts', 'image', 'video', 'translation',
+    'classification', 'guard', 'detector',
+  ]
+  if (markers.some(marker => id.includes(marker))) return false
+
+  const rawTask = typeof model.task === 'string'
+    ? model.task
+    : model.task?.name ?? model.task?.type ?? model.task?.id
+  const task = rawTask?.toLowerCase()
+  if (task) {
+    return task.includes('text generation')
+      || task.includes('text-generation')
+      || task.includes('language')
+      || task.includes('chat')
+  }
+
+  const type = model.type?.toLowerCase()
+  if (type) {
+    return type === 'language'
+      || type === 'text'
+      || type === 'chat'
+      || type === 'text_generation'
+      || type === 'text-generation'
+      || type === 'text generation'
+  }
+
+  return id.startsWith('@cf/')
+}
+
+/**
+ * True when the catalog entry actually said something about modality.
+ *
+ * The distinction matters: a provider that simply lists model ids tells us
+ * nothing, and "no vision flag" from such a provider must stay `unknown`
+ * rather than being recorded as "cannot see". Unknown falls back to text,
+ * which is safe; a false negative would permanently blind a model that can
+ * in fact see.
+ */
+function compatCatalogStatesModality(model: CompatCatalogModel): boolean {
+  return (
+    typeof model.supports_vision === 'boolean'
+    || typeof model.capabilities?.vision === 'boolean'
+    || (Array.isArray(model.tags) && model.tags.some(t => t === 'vision'))
+    || openRouterModelAcceptsImages(model)
+  )
+}
+
+function normalizeCompatCatalogTags(model: CompatCatalogModel): string[] {
+  const tags = new Set<string>()
+  for (const tag of model.tags ?? []) {
+    if (typeof tag === 'string' && tag.length > 0) tags.add(tag)
+  }
+  if (model.supports_tool_calling === true || model.capabilities?.function_calling === true) {
+    tags.add('tools')
+  }
+  if (model.supports_reasoning === true || tags.has('reasoning')) {
+    tags.add('reasoning')
+  }
+  if (
+    model.supports_vision === true
+    || model.capabilities?.vision === true
+    || tags.has('vision')
+    // OpenRouter-shaped rows carry `architecture.input_modalities`.
+    || openRouterModelAcceptsImages(model)
+  ) {
+    tags.add('vision')
+  }
+  if (model.supports_caching === true || tags.has('implicit-caching') || tags.has('explicit-caching')) {
+    tags.add('caching')
+  }
+  return [...tags]
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────
+
+// ─── Per-lane /v1/models cache ────────────────────────────────────
+// Keyed by provider filter so `/models groq` doesn't share state with
+// `/models openrouter`. Unfiltered calls use the `__all__` key.
+
+const _modelsCacheByProvider = new Map<string, { models: ModelInfo[]; at: number }>()
+const MODELS_CACHE_TTL_MS = 5 * 60_000
+
+/**
+ * Resolve a small/fast model for a given main-loop model by delegating
+ * to the appropriate transformer. Exported so session-title /
+ * tool-use-summary callers can request the cheaper model per-provider.
+ */
+export function resolveCompatSmallFastModel(
+  provider: ProviderType,
+  model: string,
+): string | null {
+  return getTransformer(provider as ProviderId).smallFastModel(model)
+}
+
+function blankUsage(i: number, o: number, c: number, r: number): NormalizedUsage {
+  return {
+    input_tokens: i,
+    output_tokens: o,
+    cache_read_tokens: c,
+    cache_write_tokens: 0,
+    thinking_tokens: r,
+  }
+}
+
+function createProviderConnectionError(
+  provider: ProviderType,
+  error: unknown,
+): APIConnectionError {
+  return createRetryableConnectionError(`${provider} API connection error`, error)
+}
+
+function* emitErrorText(text: string): Generator<AnthropicStreamEvent> {
+  yield { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } }
+  yield { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text } }
+  yield { type: 'content_block_stop', index: 0 }
+}
+
+// The pinned qwen rows are forwarded as Anthropic-format messages, so image
+// blocks reach the model untouched. Recording that here is a fact about our
+// own transport, not a guess about the model, and it stops the attachment
+// prefetch paying for OCR whose output the route would never use. Rows
+// models.dev describes answer from its `modalities` (openCodeRouteCanSeeImages).
+for (const routeModel of OPENCODE_ANTHROPIC_ROUTE_MODELS) {
+  recordModelVision('opencode', routeModel, true)
+  recordModelVision('opencodego', routeModel, true)
+}
+
+// Anthropic 4-breakpoint budget: 1 on the system tail + 2 rolling on the last
+// two messages (mirrors opencode-dev's applyCaching: system slice(0,2) +
+// final slice(-2)). Existing markers are stripped first so replayed history
+// can't accumulate stale breakpoints past the limit; inputs are cloned so the
+// caller's message objects are never mutated.
+function stampOpenCodeAnthropicCacheBreakpoints(
+  system: LaneProviderCallParams['system'],
+  messages: LaneProviderCallParams['messages'],
+): { system: unknown; messages: unknown } {
+  const ephemeral = { type: 'ephemeral' }
+  const stripBlock = (block: Record<string, unknown>) => { delete block.cache_control }
+  const stampLastBlock = (msg: Record<string, any>) => {
+    if (typeof msg.content === 'string') {
+      msg.content = [{ type: 'text', text: msg.content, cache_control: ephemeral }]
+      return
+    }
+    if (!Array.isArray(msg.content)) return
+    // cache_control is invalid on thinking blocks — stamp the last other block.
+    for (let i = msg.content.length - 1; i >= 0; i--) {
+      const block = msg.content[i]
+      if (!block || block.type === 'thinking' || block.type === 'redacted_thinking') continue
+      block.cache_control = ephemeral
+      return
+    }
+  }
+
+  const clonedMessages = JSON.parse(JSON.stringify(messages)) as Array<Record<string, any>>
+  for (const msg of clonedMessages) {
+    if (Array.isArray(msg.content)) msg.content.forEach(stripBlock)
+  }
+  for (const msg of clonedMessages.slice(-2)) stampLastBlock(msg)
+
+  let clonedSystem: unknown = system
+  if (typeof system === 'string') {
+    clonedSystem = system.trim()
+      ? [{ type: 'text', text: system, cache_control: ephemeral }]
+      : system
+  } else if (Array.isArray(system) && system.length > 0) {
+    const blocks = JSON.parse(JSON.stringify(system)) as Array<Record<string, unknown>>
+    blocks.forEach(stripBlock)
+    blocks[blocks.length - 1]!.cache_control = ephemeral
+    clonedSystem = blocks
+  }
+  return { system: clonedSystem, messages: clonedMessages }
+}
+
+type OpenCodeRouteParams = Pick<
+  LaneProviderCallParams,
+  'model' | 'messages' | 'system' | 'tools' | 'max_tokens'
+  | 'temperature' | 'stop_sequences' | 'signal' | 'thinking'
+  | 'effortValue'
+>
+
+/** The session's own thinking level, when its thinking is on. */
+function sessionEffortOf(
+  thinking: LaneProviderCallParams['thinking'] | undefined,
+): 'low' | 'medium' | 'high' | null {
+  return resolveReasoningEffort(thinking) ?? null
+}
+
+/** The system prompt as one string, for the routes that take it that way. */
+function routeSystemText(system: LaneProviderCallParams['system']): string {
+  const text = typeof system === 'string'
+    ? system
+    : (system ?? []).map(block => block.text).join('\n\n')
+  return stripSystemDynamicBoundary(text)
+}
+
+/**
+ * Whether a request to this row may carry images. What models.dev says about
+ * the row's input is recorded as catalog evidence, and the answer comes from
+ * decideImageSupport, which freezes it per process so a conversation's images
+ * cannot switch rendering under a live cache.
+ */
+function openCodeRouteCanSeeImages(provider: string, model: string): boolean {
+  const meta = getOpencodeModelMeta(provider, model)
+  if (meta) recordModelVision(provider, model, meta.imageInput)
+  return decideImageSupport(provider, model)
+}
+
+/**
+ * History as the /messages route sends it, the way @ai-sdk/anthropic builds
+ * it: a thinking block without a signature is left out (another provider's
+ * reasoning carries none, and Anthropic rejects one it cannot verify), a
+ * redacted block needs its data, and Tau's own `_`-prefixed bookkeeping
+ * (Gemini thought signatures, OpenRouter state, decode status) stays home.
+ * Images go as images only where the model takes them.
+ */
+function prepareOpenCodeAnthropicMessages(
+  messages: LaneProviderCallParams['messages'],
+  canSeeImages: boolean,
+): LaneProviderCallParams['messages'] {
+  const source = canSeeImages ? messages : substituteUnsendableMedia(messages)
+  const clean = (block: Record<string, unknown>): Record<string, unknown> => {
+    const out: Record<string, unknown> = {}
+    for (const [key, value] of Object.entries(block)) {
+      if (key.startsWith('_')) continue
+      out[key] = key === 'content' && Array.isArray(value)
+        ? value.map(child =>
+          child && typeof child === 'object' ? clean(child as Record<string, unknown>) : child)
+        : value
+    }
+    return out
+  }
+  const out: LaneProviderCallParams['messages'] = []
+  for (const message of source) {
+    if (typeof message.content === 'string') {
+      out.push(message)
+      continue
+    }
+    const content = message.content
+      .filter(block => {
+        if (block.type === 'thinking') return typeof block.signature === 'string' && block.signature.length > 0
+        if (block.type === 'redacted_thinking') return typeof (block as { data?: unknown }).data === 'string'
+        return true
+      })
+      .map(block => clean(block as unknown as Record<string, unknown>) as unknown as typeof block)
+    if (content.length === 0 && message.role === 'assistant') continue
+    out.push({ ...message, content })
+  }
+  return out
+}
+
+function legacyThinkingBudget(effort: string): number {
+  return effort === 'low' ? 4000 : effort === 'medium' ? 8000 : 16000
+}
+
+/**
+ * Claude's thinking shape by version, as the official client picks it
+ * (anthropicUsesModernAdaptiveThinking / anthropicAdaptiveEfforts): 4.7 and
+ * later think adaptively and return empty thinking text unless
+ * `display: 'summarized'`, 4.6 thinks adaptively with summaries by default,
+ * and older rows take a token budget, which 4.7 and later reject.
+ */
+function claudeThinkingKind(id: string): 'modern' | 'adaptive' | 'budget' {
+  const version = /claude-(?:[a-z]+-)?(\d+)(?:[.-](\d{1,2}))?(?:[.@-]|$)/.exec(id)
+  if (!version) return 'modern'
+  const major = Number(version[1])
+  const minor = Number(version[2] ?? 0)
+  if (major > 4 || (major === 4 && minor >= 7)) return 'modern'
+  return major === 4 && minor === 6 ? 'adaptive' : 'budget'
+}
+
+/**
+ * The thinking fields a /messages request carries, as the official client
+ * sends them. Claude: adaptive thinking plus `output_config.effort` (Opus 4.5:
+ * a 16K budget plus the effort; older rows: a budget), and never a
+ * temperature. MiniMax M3: adaptive thinking, OpenCode's default there.
+ * Other rows with a published ladder (Qwen3.8 Flash): the effort alone. The
+ * pinned qwen rows keep their per-pick budget.
+ */
+function applyOpenCodeAnthropicThinking(
+  body: Record<string, unknown>,
+  provider: string,
+  model: string,
+  sessionEffort: 'low' | 'medium' | 'high' | null,
+  effortValue?: LaneProviderCallParams['effortValue'],
+): void {
+  const id = model.trim().toLowerCase()
+  let budget: number
+  if (id.startsWith('claude-')) {
+    delete body.temperature
+    const effort = resolveOpencodeRouteEffort(provider, model, sessionEffort, effortValue)
+    if (!effort) return
+    const kind = claudeThinkingKind(id)
+    if (kind !== 'budget') {
+      body.thinking = { type: 'adaptive', ...(kind === 'modern' && { display: 'summarized' }) }
+      body.output_config = { effort }
+      return
+    }
+    if (id.includes('opus-4-5')) {
+      budget = 16_000
+      body.output_config = { effort }
+    } else {
+      budget = legacyThinkingBudget(effort)
+    }
+  } else if (id.startsWith('minimax-m3')) {
+    body.thinking = { type: 'adaptive' }
+    return
+  } else if (usesOpencodeCatalogEfforts(provider, model)) {
+    const effort = resolveOpencodeRouteEffort(provider, model, sessionEffort, effortValue)
+    if (effort) body.output_config = { effort }
+    return
+  } else {
+    // qwen3.7-max on Go exposes no effort selection
+    // (supportsOpencodeThinkingSelection is false there) and keeps its
+    // server default.
+    if (!supportsOpencodeThinkingSelection(provider, model)) return
+    const effort = getOpencodeEffort(model, provider, effortValue)
+    if (effort === 'default') return
+    budget = legacyThinkingBudget(effort)
+  }
+  body.thinking = { type: 'enabled', budget_tokens: budget }
+  // The budget is spent out of max_tokens, so it goes on top, as the SDK does.
+  body.max_tokens = Math.min(Number(body.max_tokens) + budget, 64_000)
+}
+
+/**
+ * POST to an OpenCode route. Its upstreams intermittently 500 with
+ * "InternalError: Request timed out." before any bytes arrive; the AI SDK
+ * retries 5xx by default, so the official client never surfaces these, and
+ * this mirrors that. Retrying is safe: nothing has been yielded until a 200
+ * arrives. 429s are NOT retried: the gateway's quota errors carry retry-after
+ * semantics the user should see immediately. A connection failure is thrown
+ * for the shared request retry layer rather than multiplied here.
+ */
+async function postOpenCodeRoute(
+  provider: 'opencode' | 'opencodego',
+  url: string,
+  headers: Record<string, string>,
+  body: unknown,
+  signal: AbortSignal | undefined,
+): Promise<Response> {
+  const RETRYABLE_STATUSES = new Set([500, 502, 503, 504, 529])
+  const MAX_STATUS_RETRIES = 3
+  let response: Response | null = null
+  let connectionError: unknown = null
+  for (let attempt = 0; attempt <= MAX_STATUS_RETRIES; attempt += 1) {
+    if (attempt > 0) {
+      await new Promise(resolve => setTimeout(resolve, 500 * 2 ** (attempt - 1)))
+      if (signal?.aborted) break
+    }
+    try {
+      response = await fetch(url, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(body),
+        signal,
+      })
+      connectionError = null
+    } catch (error) {
+      connectionError = error
+      response = null
+      break
+    }
+    if (RETRYABLE_STATUSES.has(response.status) && attempt < MAX_STATUS_RETRIES) {
+      await response.text().catch(() => {})
+      continue
+    }
+    break
+  }
+
+  if (!response) {
+    if (isAbortError(connectionError, signal)) throw connectionError
+    throw createProviderConnectionError(provider, connectionError)
+  }
+  recordProviderRateLimits(provider, response.headers)
+  return response
+}
+
+async function* streamOpenCodeAnthropicRoute(
+  provider: 'opencode' | 'opencodego',
+  cfg: { apiKey: string; baseUrl: string },
+  params: OpenCodeRouteParams,
+  sessionId?: string,
+): AsyncGenerator<AnthropicStreamEvent, NormalizedUsage> {
+  // Cache breakpoints matter most here: the alibaba upstream behind the qwen
+  // rows only caches via explicit cache_control, forwarded verbatim.
+  const { system, messages } = stampOpenCodeAnthropicCacheBreakpoints(
+    params.system,
+    prepareOpenCodeAnthropicMessages(
+      params.messages,
+      openCodeRouteCanSeeImages(provider, params.model),
+    ),
+  )
+
+  const body: Record<string, unknown> = {
+    model: params.model,
+    messages,
+    max_tokens: Math.min(params.max_tokens, OPENCODE_MAX_OUTPUT_TOKENS),
+    stream: true,
+  }
+
+  if (typeof system === 'string') {
+    if (system.trim()) body.system = system
+  } else if (Array.isArray(system) && system.length > 0) {
+    body.system = system
+  }
+  if (params.tools.length > 0) body.tools = params.tools
+  if (params.temperature !== undefined) body.temperature = params.temperature
+  if (params.stop_sequences?.length) body.stop_sequences = params.stop_sequences
+  applyOpenCodeAnthropicThinking(body, provider, params.model,
+    params.effortValue === undefined ? sessionEffortOf(params.thinking) : null, params.effortValue)
+
+  // `/messages` authenticates with x-api-key. Keep the same OpenCode
+  // affinity/rate-limit headers as the compat route.
+  const headers = buildRequestHeaders(provider, cfg.apiKey, params.model, sessionId)
+  delete headers.Authorization
+  headers['x-api-key'] = cfg.apiKey
+  headers['anthropic-version'] = '2023-06-01'
+
+  const url = `${normalizeBaseUrl(cfg.baseUrl)}/messages`
+  const messageId = `compat-${Date.now()}`
+  let sawMessageStart = false
+  let sawMessageStop = false
+  let inputTokens = 0
+  let outputTokens = 0
+  let cacheReadTokens = 0
+  let cacheWriteTokens = 0
+
+  const emitSyntheticStart = (): AnthropicStreamEvent => ({
+    type: 'message_start',
+    message: {
+      id: messageId,
+      type: 'message',
+      role: 'assistant',
+      content: [],
+      model: params.model,
+      stop_reason: null,
+      stop_sequence: null,
+      usage: { input_tokens: 0, output_tokens: 0 },
+    },
+  })
+
+  const response = await postOpenCodeRoute(provider, url, headers, body, params.signal)
+
+  if (!response.ok) {
+    const errText = await response.text().catch(() => '')
+    throwRetryableProviderHttpError(provider, response, errText)
+    yield emitSyntheticStart()
+    yield* emitErrorText(formatProviderHttpError(provider, response.status, errText, false, params.model))
+    yield {
+      type: 'message_delta',
+      delta: { stop_reason: 'end_turn' },
+      usage: { output_tokens: 0 },
+    }
+    yield { type: 'message_stop' }
+    return blankUsage(0, 0, 0, 0)
+  }
+
+  if (!response.body) {
+    yield emitSyntheticStart()
+    yield* emitErrorText(`${provider} API error: empty response body`)
+    yield {
+      type: 'message_delta',
+      delta: { stop_reason: 'end_turn' },
+      usage: { output_tokens: 0 },
+    }
+    yield { type: 'message_stop' }
+    return blankUsage(0, 0, 0, 0)
+  }
+
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      buffer += done ? decoder.decode() : decoder.decode(value, { stream: true })
+      buffer = buffer.replace(/\r\n/g, '\n')
+
+      let boundary: number
+      while ((boundary = buffer.indexOf('\n\n')) !== -1) {
+        const rawEvent = buffer.slice(0, boundary)
+        buffer = buffer.slice(boundary + 2)
+        const data = rawEvent
+          .split('\n')
+          .filter(line => line.startsWith('data:'))
+          .map(line => line.slice(5).trimStart())
+          .join('\n')
+          .trim()
+        if (!data || data === '[DONE]') continue
+
+        let parsed: any
+        try {
+          parsed = JSON.parse(data)
+        } catch {
+          continue
+        }
+
+        if (parsed.type === 'error') {
+          if (!sawMessageStart) {
+            sawMessageStart = true
+            yield emitSyntheticStart()
+          }
+          const detail =
+            parsed.error?.message
+            ?? parsed.message
+            ?? JSON.stringify(parsed.error ?? parsed)
+          yield* emitErrorText(`${provider} API stream error: ${detail}`)
+          yield {
+            type: 'message_delta',
+            delta: { stop_reason: 'end_turn' },
+            usage: { output_tokens: outputTokens },
+          }
+          yield { type: 'message_stop' }
+          return {
+            input_tokens: inputTokens,
+            output_tokens: outputTokens,
+            cache_read_tokens: cacheReadTokens,
+            cache_write_tokens: cacheWriteTokens,
+            thinking_tokens: 0,
+          }
+        }
+
+        if (parsed.type === 'message_start') {
+          sawMessageStart = true
+          const usage = parsed.message?.usage ?? {}
+          inputTokens = usage.input_tokens ?? inputTokens
+          outputTokens = usage.output_tokens ?? outputTokens
+          cacheReadTokens = usage.cache_read_input_tokens ?? cacheReadTokens
+          cacheWriteTokens = usage.cache_creation_input_tokens ?? cacheWriteTokens
+        } else if (parsed.type === 'message_delta') {
+          const usage = parsed.usage ?? {}
+          inputTokens = usage.input_tokens ?? inputTokens
+          outputTokens = usage.output_tokens ?? outputTokens
+          cacheReadTokens = usage.cache_read_input_tokens ?? cacheReadTokens
+          cacheWriteTokens = usage.cache_creation_input_tokens ?? cacheWriteTokens
+        } else if (parsed.type === 'message_stop') {
+          sawMessageStop = true
+        }
+
+        if (
+          parsed.type === 'message_start'
+          || parsed.type === 'content_block_start'
+          || parsed.type === 'content_block_delta'
+          || parsed.type === 'content_block_stop'
+          || parsed.type === 'message_delta'
+          || parsed.type === 'message_stop'
+        ) {
+          yield parsed as AnthropicStreamEvent
+        }
+      }
+
+      if (done) break
+    }
+  } finally {
+    reader.releaseLock()
+  }
+
+  if (!sawMessageStart) yield emitSyntheticStart()
+  if (!sawMessageStop) {
+    yield {
+      type: 'message_delta',
+      delta: { stop_reason: 'end_turn' },
+      usage: {
+        input_tokens: inputTokens,
+        output_tokens: outputTokens,
+        ...(cacheReadTokens > 0 && { cache_read_input_tokens: cacheReadTokens }),
+        ...(cacheWriteTokens > 0 && { cache_creation_input_tokens: cacheWriteTokens }),
+      },
+    }
+    yield { type: 'message_stop' }
+  }
+
+  return {
+    input_tokens: inputTokens,
+    output_tokens: outputTokens,
+    cache_read_tokens: cacheReadTokens,
+    cache_write_tokens: cacheWriteTokens,
+    thinking_tokens: 0,
+  }
+}
+
+/** A message that is only a notice, for requests no route can serve. */
+function* emitOpenCodeRouteNotice(
+  model: string,
+  text: string,
+): Generator<AnthropicStreamEvent, NormalizedUsage> {
+  yield {
+    type: 'message_start',
+    message: {
+      id: `compat-${Date.now()}`,
+      type: 'message',
+      role: 'assistant',
+      content: [],
+      model,
+      stop_reason: null,
+      stop_sequence: null,
+      usage: { input_tokens: 0, output_tokens: 0 },
+    },
+  }
+  yield* emitErrorText(text)
+  yield {
+    type: 'message_delta',
+    delta: { stop_reason: 'end_turn' },
+    usage: { output_tokens: 0 },
+  }
+  yield { type: 'message_stop' }
+  return blankUsage(0, 0, 0, 0)
+}
+
+/** What the /responses and Gemini stream translators share. */
+interface OpenCodeRouteStream {
+  push(event: Record<string, any>): AnthropicStreamEvent[]
+  fail(text: string): AnthropicStreamEvent[]
+  finish(): AnthropicStreamEvent[]
+  failure: string | null
+  readonly usage: NormalizedUsage
+}
+
+async function* runOpenCodeRouteStream(
+  provider: 'opencode' | 'opencodego',
+  url: string,
+  headers: Record<string, string>,
+  body: unknown,
+  params: Pick<OpenCodeRouteParams, 'model' | 'signal'>,
+  stream: OpenCodeRouteStream,
+): AsyncGenerator<AnthropicStreamEvent, NormalizedUsage> {
+  const response = await postOpenCodeRoute(provider, url, headers, body, params.signal)
+  if (!response.ok) {
+    const errText = await response.text().catch(() => '')
+    throwRetryableProviderHttpError(provider, response, errText)
+    return yield* emitOpenCodeRouteNotice(
+      params.model,
+      formatProviderHttpError(provider, response.status, errText, false, params.model),
+    )
+  }
+  if (!response.body) {
+    return yield* emitOpenCodeRouteNotice(params.model, `${provider} API error: empty response body`)
+  }
+
+  const responseBody = response.body
+  for await (const payload of readSseDataPayloads(responseBody)) {
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(payload)
+    } catch {
+      continue
+    }
+    if (!parsed || typeof parsed !== 'object') continue
+    for (const event of stream.push(parsed as Record<string, any>)) yield event
+    if (stream.failure) break
+  }
+  if (stream.failure) {
+    await responseBody.cancel().catch(() => {})
+    for (const event of stream.fail(`${provider} API stream error: ${stream.failure}`)) yield event
+  }
+  for (const event of stream.finish()) yield event
+  return stream.usage
+}
+
+async function* streamOpenCodeResponsesRoute(
+  provider: 'opencode' | 'opencodego',
+  cfg: { apiKey: string; baseUrl: string },
+  params: OpenCodeRouteParams,
+  sessionId?: string,
+): AsyncGenerator<AnthropicStreamEvent, NormalizedUsage> {
+  const body = buildOpenCodeResponsesBody({
+    model: params.model,
+    system: routeSystemText(params.system),
+    messages: params.messages,
+    tools: params.tools,
+    maxTokens: params.max_tokens,
+    temperature: params.temperature,
+    sessionId,
+    effort: resolveOpencodeRouteEffort(provider, params.model,
+      params.effortValue === undefined ? sessionEffortOf(params.thinking) : null, params.effortValue),
+    canSeeImages: openCodeRouteCanSeeImages(provider, params.model),
+  })
+  return yield* runOpenCodeRouteStream(
+    provider,
+    `${normalizeBaseUrl(cfg.baseUrl)}/responses`,
+    buildRequestHeaders(provider, cfg.apiKey, params.model, sessionId),
+    body,
+    params,
+    new OpenCodeResponsesStream(params.model, `compat-${Date.now()}`),
+  )
+}
+
+async function* streamOpenCodeGoogleRoute(
+  provider: 'opencode' | 'opencodego',
+  cfg: { apiKey: string; baseUrl: string },
+  params: OpenCodeRouteParams,
+  sessionId?: string,
+): AsyncGenerator<AnthropicStreamEvent, NormalizedUsage> {
+  const body = buildOpenCodeGeminiBody({
+    model: params.model,
+    system: routeSystemText(params.system),
+    messages: params.messages,
+    tools: params.tools,
+    maxTokens: params.max_tokens,
+    temperature: params.temperature,
+    stopSequences: params.stop_sequences,
+    effort: resolveOpencodeRouteEffort(provider, params.model,
+      params.effortValue === undefined ? sessionEffortOf(params.thinking) : null, params.effortValue),
+    canSeeImages: openCodeRouteCanSeeImages(provider, params.model),
+  })
+  // Google's format takes the key in x-goog-api-key, next to the same
+  // OpenCode affinity/rate-limit headers as the other routes.
+  const headers = buildRequestHeaders(provider, cfg.apiKey, params.model, sessionId)
+  delete headers.Authorization
+  headers['x-goog-api-key'] = cfg.apiKey
+  return yield* runOpenCodeRouteStream(
+    provider,
+    `${normalizeBaseUrl(cfg.baseUrl)}/models/${encodeURIComponent(params.model)}:streamGenerateContent?alt=sse`,
+    headers,
+    body,
+    params,
+    new OpenCodeGeminiStream(params.model, `compat-${Date.now()}`),
+  )
+}
+
+interface ProviderErrorPayload {
+  code?: string
+  message?: string
+}
+
+function formatProviderHttpError(
+  provider: ProviderType,
+  status: number,
+  errText: string,
+  isPromptTooLong: boolean,
+  model?: string,
+): string {
+  if (provider === 'glm') {
+    return formatGlmHttpError(status, errText, isPromptTooLong)
+  }
+  if (provider === 'openrouter' && !isPromptTooLong) {
+    const guardrail = formatOpenRouterGuardrailError(status, errText, model)
+    if (guardrail) return guardrail
+    const detail = formatOpenRouterErrorDetail(errText)
+    if (detail) return `openrouter API error ${status}${detail}`
+  }
+  if ((provider === 'opencode' || provider === 'opencodego') && status === 429 && errText.includes('FreeUsageLimitError')) {
+    // FreeUsageLimitError comes from the gateway's IP-based anonymous
+    // limiter for allowAnonymous=true models (big-pickle, *-free rows,
+    // gpt-5-nano). A real API key only changes quota when the user also
+    // switches to a non-anonymous paid model.
+    return [
+      'opencode API error 429: This is the IP-based daily limit for OpenCode Zen anonymous/free models',
+      '(big-pickle, *-free rows, gpt-5-nano). Use a real OPENCODE_API_KEY and switch to a paid model in /models opencode',
+      '(e.g. claude-opus-4-7, claude-sonnet-4-6, gpt-5.4, gemini-3.1-pro, glm-5.1, kimi-k2.5)',
+      `to use your API-key quota instead. Raw: ${errText.slice(0, 200)}`,
+    ].join(' ')
+  }
+  if (provider === 'opencode' && status === 403 && errText.includes('FreeTierError')) {
+    const said = parseProviderErrorPayload(errText)?.message ?? errText.slice(0, 200)
+    return [
+      `opencode API error 403: OpenCode Zen rejected the free-tier request for ${model ?? 'this model'}.`,
+      'Its compatibility checks can reject requests with a reduced tool set, including tool-free requests.',
+      'Try a normal coding session with the standard tools enabled, or select a paid Zen model with /models opencode',
+      `(an OpenCode API key is required for paid models). OpenCode says: ${said}`,
+    ].join(' ')
+  }
+  const headline = isPromptTooLong
+    ? `Prompt is too long (${provider} ${status})`
+    : `${provider} API error ${status}`
+  return `${headline}: ${errText.slice(0, 500)}`
+}
+
+/**
+ * OpenRouter's "no endpoint matches your policy" refusal, made readable.
+ *
+ * When every endpoint for a model is filtered out by the ACCOUNT's guardrail
+ * and data-policy settings, OpenRouter answers 404 with a machine-readable
+ * `metadata.ineligibility_reasons` list, each carrying a `configure_url`. It
+ * is not a request problem — nothing Tau can send changes the outcome — but
+ * raw it reaches the user as a wall of escaped JSON, usually truncated before
+ * the URL that would tell them what to change.
+ *
+ * The reasons are echoed straight from the payload rather than enumerated
+ * here, so a policy OpenRouter adds later still renders with its own slug,
+ * count and settings link.
+ */
+function formatOpenRouterGuardrailError(
+  status: number,
+  errText: string,
+  model?: string,
+): string | null {
+  if (status !== 404) return null
+
+  let reasons: Array<Record<string, unknown>> = []
+  let message = ''
+  try {
+    const error = (JSON.parse(errText) as { error?: Record<string, unknown> })?.error
+    if (!error) return null
+    if (typeof error.message === 'string') message = error.message
+    const metadata = error.metadata as Record<string, unknown> | undefined
+    if (Array.isArray(metadata?.ineligibility_reasons)) {
+      reasons = metadata.ineligibility_reasons.filter(
+        (entry): entry is Record<string, unknown> =>
+          entry !== null && typeof entry === 'object' && !Array.isArray(entry),
+      )
+    }
+  } catch {
+    return null
+  }
+
+  // Only claim this shape when the payload actually carries it; any other 404
+  // (a retired model id, a bad base URL) falls through to the generic text.
+  if (reasons.length === 0 && !/endpoints .* are available/i.test(message)) return null
+
+  const lines = [
+    `openrouter API error 404: no endpoint for ${model ?? 'this model'} passes your OpenRouter account settings.`,
+  ]
+  for (const entry of reasons) {
+    const reason = typeof entry.reason === 'string' ? entry.reason : 'unspecified'
+    const count = typeof entry.endpoint_count === 'number' ? entry.endpoint_count : null
+    const url = typeof entry.configure_url === 'string' ? entry.configure_url : null
+    lines.push(
+      `  - ${reason}${count === null ? '' : ` (${count} endpoint${count === 1 ? '' : 's'})`}`
+      + `${url ? ` — change it at ${url}` : ''}`,
+    )
+  }
+  if (reasons.length === 0 && message) lines.push(`  ${message.split('\n').join(' ')}`)
+  lines.push(
+    'This is an account policy, not a request problem — retrying or changing the prompt cannot route it.',
+    'Either change the setting above, or pick a model whose endpoints match your policy with /models.',
+  )
+  return lines.join('\n')
+}
+
+/**
+ * OpenRouter wraps a provider's own rejection as "Provider returned error",
+ * with the provider's words in `metadata.raw` (sometimes itself JSON). Show
+ * those words and the provider's name instead of the escaped envelope, which
+ * the 500-character cut often ends before the part that explains anything.
+ */
+function formatOpenRouterErrorDetail(errText: string): string | null {
+  let error: Record<string, unknown> | undefined
+  try {
+    error = (JSON.parse(errText) as { error?: Record<string, unknown> })?.error
+  } catch {
+    return null
+  }
+  if (!error || typeof error !== 'object') return null
+  const metadata = (error.metadata && typeof error.metadata === 'object'
+    ? error.metadata : {}) as Record<string, unknown>
+  let raw = typeof metadata.raw === 'string' ? metadata.raw.trim() : ''
+  try {
+    const nested = (JSON.parse(raw) as { error?: { message?: unknown } })?.error?.message
+    if (typeof nested === 'string') raw = nested
+  } catch { /* already plain text */ }
+  const message = typeof error.message === 'string' ? error.message.trim() : ''
+  const text = raw && (!message || /^provider returned error$/i.test(message))
+    ? raw : [message, raw].filter(Boolean).join(' ')
+  if (!text) return null
+  const provider = typeof metadata.provider_name === 'string' ? ` (${metadata.provider_name})` : ''
+  return `${provider}: ${text.replace(/\s+/g, ' ').slice(0, 500)}`
+}
+
+function formatGlmHttpError(
+  status: number,
+  errText: string,
+  isPromptTooLong: boolean,
+): string {
+  if (isPromptTooLong) {
+    return `Prompt is too long (glm ${status})`
+  }
+
+  const parsed = parseProviderErrorPayload(errText)
+  const code = parsed?.code
+  const detail = parsed?.message ?? errText.trim()
+  const isInsufficientBalance =
+    status === 429 &&
+    (code === '1113' ||
+      /余额不足|无可用资源包|请充值|\binsufficient\b|\bbalance\b|\bquota\b|\bresource package\b/i.test(
+        detail,
+      ))
+
+  if (isInsufficientBalance) {
+    return [
+      `glm API error ${status}: BigModel balance is insufficient or no resource package is available.`,
+      'Open /usage for BigModel links, recharge the account, or switch provider/model with /models.',
+    ].join(' ')
+  }
+
+  const suffix = code ? ` (${code})` : ''
+  const text = detail || errText
+  return `glm API error ${status}${suffix}: ${text.slice(0, 500)}`
+}
+
+function parseProviderErrorPayload(raw: string): ProviderErrorPayload | null {
+  try {
+    const value = JSON.parse(raw) as unknown
+    if (!value || typeof value !== 'object') return null
+    const root = value as Record<string, unknown>
+    const error =
+      root.error && typeof root.error === 'object'
+        ? root.error as Record<string, unknown>
+        : root
+    const code = error.code
+    const message = error.message
+    return {
+      code: typeof code === 'string' || typeof code === 'number' ? String(code) : undefined,
+      message: typeof message === 'string' ? message : undefined,
+    }
+  } catch {
+    return null
+  }
+}
+
+function toMistralCatalogModel(model: CompatCatalogModel): ModelInfo | null {
+  if (typeof model.id !== 'string' || model.id.length === 0) {
+    return null
+  }
+
+  const capabilities = model.capabilities
+  const lifecycle = model as CompatCatalogModel & { status?: string; deprecated?: boolean; deprecation?: string | null }
+  if (capabilities?.completion_chat === false || capabilities?.function_calling === false
+    || lifecycle.deprecated === true || /deprecated|retired/i.test(lifecycle.status ?? '')
+    || (lifecycle.deprecation && Date.parse(lifecycle.deprecation) <= Date.now())) return null
+  return mistralModelInfo(model.id, model.max_context_length ?? model.context_length)
+}
+
+async function listLmStudioNativeModels(
+  cfg: { apiKey: string; baseUrl: string },
+): Promise<LmStudioModelInfo[]> {
+  const url = `${lmStudioServerRoot(cfg.baseUrl)}/api/v1/models`
+  const headers: Record<string, string> = { Accept: 'application/json' }
+  if (cfg.apiKey) headers.Authorization = `Bearer ${cfg.apiKey}`
+
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), 5_000)
+    try {
+      const resp = await fetch(url, { headers, method: 'GET', signal: controller.signal })
+      if (!resp.ok) continue
+      const data = await resp.json() as { models?: LmStudioNativeModel[] }
+      const models = (data.models ?? [])
+        .map(toLmStudioNativeModelInfo)
+        .filter((model): model is LmStudioModelInfo => model !== null)
+      if (models.length > 0) {
+        recordProviderModelContextWindows('lmstudio', models)
+        return models
+      }
+    } catch {
+      // Retry once. LM Studio can briefly reject metadata requests while
+      // loading or swapping a local model.
+    } finally {
+      clearTimeout(timeout)
+    }
+  }
+  return []
+}
+
+async function getLmStudioContextPreflightMessage(
+  cfg: { apiKey: string; baseUrl: string },
+  model: string,
+  body: OpenAIChatRequest,
+): Promise<string | null> {
+  const info = await getLmStudioModelInfo(cfg, model)
+  const loadedContextWindow = info?.lmStudioLoadedContextWindow
+  if (!loadedContextWindow || loadedContextWindow <= 0) return null
+
+  const estimatedInputTokens = estimateOpenAICompatRequestTokens(body)
+  if (estimatedInputTokens < loadedContextWindow) return null
+
+  const maxContextWindow = info.lmStudioMaxContextWindow ?? info.contextWindow
+  const suggestedContextWindow = maxContextWindow
+    ? Math.min(
+        maxContextWindow,
+        roundUpToMultiple(estimatedInputTokens + 4096, 8192),
+      )
+    : undefined
+  const reloadHint = suggestedContextWindow && suggestedContextWindow > loadedContextWindow
+    ? ` Reload it with a larger context, for example: lms unload "${model}"; lms load "${model}" -c ${suggestedContextWindow} -y --identifier "${model}".`
+    : ''
+
+  return `LM Studio has "${model}" loaded with ${formatTokenCount(loadedContextWindow)} context tokens, but Tau's agent request is about ${formatTokenCount(estimatedInputTokens)} tokens before generation. LM Studio can return an empty response in that state.${maxContextWindow ? ` This model reports up to ${formatTokenCount(maxContextWindow)} tokens available.` : ''}${reloadHint}`
+}
+
+async function getLmStudioModelInfo(
+  cfg: { apiKey: string; baseUrl: string },
+  modelId: string,
+): Promise<LmStudioModelInfo | null> {
+  const models = await listLmStudioNativeModels(cfg)
+  const byId = new Map<string, LmStudioModelInfo>()
+  for (const model of models) {
+    byId.set(model.id, model)
+    for (const alias of model.lmStudioAliases ?? []) byId.set(alias, model)
+  }
+  return byId.get(modelId) ?? null
+}
+
+function estimateOpenAICompatRequestTokens(body: OpenAIChatRequest): number {
+  const messageChars = JSON.stringify(body.messages).length
+  const toolChars = body.tools ? JSON.stringify(body.tools).length : 0
+  return Math.ceil((messageChars + toolChars) / 4)
+}
+
+function roundUpToMultiple(value: number, multiple: number): number {
+  return Math.ceil(value / multiple) * multiple
+}
+
+function formatTokenCount(value: number): string {
+  return Math.round(value).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',')
+}
+
+function providerReportsOpenAICompatCacheUsage(provider: ProviderType): boolean {
+  return provider === 'copilot'
+    || provider === 'openrouter'
+    || provider === 'agentrouter'
+    || provider === 'modelrouter'
+    || provider === 'opencode'
+    || provider === 'opencodego'
+}
+
+function extractOpenAICompatCacheUsage(
+  usage: Record<string, unknown>,
+  provider: ProviderType,
+): {
+  read?: number
+  write?: number
+  cachedTotal?: number
+} {
+  const details = firstOpenAICompatRecord(
+    usage.prompt_tokens_details,
+    usage.promptTokensDetails,
+    usage.input_tokens_details,
+    usage.inputTokenDetails,
+  )
+  const read = firstOpenAICompatNumber(
+    details?.cache_read_input_tokens,
+    details?.cache_read_tokens,
+    details?.cache_hit_input_tokens,
+    details?.cache_hit_tokens,
+    details?.cached_input_tokens,
+    details?.cachedInputTokens,
+    usage.cache_read_input_tokens,
+    usage.cache_read_tokens,
+    usage.cache_hit_input_tokens,
+    usage.cache_hit_tokens,
+    usage.cached_input_tokens,
+    usage.cachedInputTokens,
+  )
+  const write = firstOpenAICompatNumber(
+    details?.cache_write_tokens,
+    details?.cache_write_input_tokens,
+    details?.cache_creation_tokens,
+    details?.cache_creation_input_tokens,
+    usage.cache_write_tokens,
+    usage.cache_write_input_tokens,
+    usage.cache_creation_tokens,
+    usage.cache_creation_input_tokens,
+  )
+  const cachedTotal = firstOpenAICompatNumber(
+    details?.cached_tokens,
+    details?.cachedTokens,
+    usage.prompt_cache_hit_tokens,
+    usage.promptCacheHitTokens,
+    provider === 'openrouter' ? usage.cached_tokens : undefined,
+    provider === 'openrouter' ? usage.cachedTokens : undefined,
+    provider === 'moonshot' ? usage.cached_tokens : undefined,
+  )
+  return { read, write, cachedTotal }
+}
+
+function firstOpenAICompatRecord(
+  ...values: unknown[]
+): Record<string, unknown> | undefined {
+  for (const value of values) {
+    if (value && typeof value === 'object' && !Array.isArray(value)) {
+      return value as Record<string, unknown>
+    }
+  }
+  return undefined
+}
+
+function firstOpenAICompatNumber(...values: unknown[]): number | undefined {
+  for (const value of values) {
+    if (typeof value === 'number' && Number.isFinite(value)) return value
+    if (typeof value === 'string' && value.trim().length > 0) {
+      const parsed = Number(value)
+      if (Number.isFinite(parsed)) return parsed
+    }
+  }
+  return undefined
+}
+
+async function fetchLmStudioNonStreamingCompletion(
+  cfg: { apiKey: string; baseUrl: string },
+  body: OpenAIChatRequest,
+  model: string,
+  signal?: AbortSignal,
+  textOnly = false,
+): Promise<{
+  text?: string
+  thinking?: string
+  toolCalls?: NonNullable<OpenAIChatMessage['tool_calls']>
+  usage?: {
+    prompt_tokens?: number
+    completion_tokens?: number
+    completion_tokens_details?: { reasoning_tokens?: number }
+  }
+} | null> {
+  const headers = buildRequestHeaders('lmstudio', cfg.apiKey, model)
+  const fallbackBody: OpenAIChatRequest = { ...body, stream: false }
+  delete fallbackBody.stream_options
+  if (textOnly) {
+    delete fallbackBody.tools
+    fallbackBody.tool_choice = 'none'
+  }
+  fallbackBody.thinking = { type: 'disabled' }
+
+  const resp = await fetch(`${normalizeBaseUrl(cfg.baseUrl)}/chat/completions`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(fallbackBody),
+    signal,
+  })
+  if (!resp.ok) return null
+
+  const data = await resp.json() as {
+    choices?: Array<{
+      message?: {
+        content?: string | null
+        reasoning_content?: string
+        reasoning?: string
+        thinking?: string
+        tool_calls?: NonNullable<OpenAIChatMessage['tool_calls']>
+      }
+    }>
+    usage?: {
+      prompt_tokens?: number
+      completion_tokens?: number
+      completion_tokens_details?: { reasoning_tokens?: number }
+    }
+  }
+  const message = data.choices?.[0]?.message
+  if (!message) return null
+  return {
+    text: typeof message.content === 'string' ? message.content : undefined,
+    thinking: message.thinking ?? message.reasoning_content ?? message.reasoning,
+    toolCalls: message.tool_calls,
+    usage: data.usage,
+  }
+}
+
+async function listLmStudioOpenAIModels(
+  cfg: { apiKey: string; baseUrl: string },
+): Promise<ModelInfo[]> {
+  try {
+    const headers: Record<string, string> = { Accept: 'application/json' }
+    if (cfg.apiKey) headers.Authorization = `Bearer ${cfg.apiKey}`
+    const resp = await fetch(`${normalizeBaseUrl(cfg.baseUrl)}/models`, {
+      headers,
+      method: 'GET',
+    })
+    if (!resp.ok) return []
+    const data = await resp.json() as { data?: CompatCatalogModel[] }
+    const openAIModels = (data.data ?? [])
+      .map(model => toCompatCatalogModel('lmstudio', model))
+      .filter((model): model is ModelInfo => model !== null)
+      .filter(model => !looksLikeEmbeddingModel(model.id))
+
+    const nativeModels = await listLmStudioNativeModels(cfg)
+    if (nativeModels.length === 0) return openAIModels
+
+    const nativeById = new Map<string, ModelInfo>()
+    for (const model of nativeModels) {
+      nativeById.set(model.id, model)
+      const variantIds = (model as ModelInfo & { lmStudioAliases?: string[] }).lmStudioAliases ?? []
+      for (const alias of variantIds) nativeById.set(alias, model)
+    }
+    const enriched = openAIModels
+      .filter(model => nativeById.has(model.id))
+      .map(model => {
+        const native = nativeById.get(model.id)
+        return {
+          ...model,
+          ...(native ?? {}),
+          id: model.id,
+        }
+      })
+    return enriched.length > 0 ? enriched : openAIModels
+  } catch {
+    return []
+  }
+}
+
+function toLmStudioNativeModelInfo(model: LmStudioNativeModel): LmStudioModelInfo | null {
+  if (model.type && model.type !== 'llm') return null
+  if (typeof model.key !== 'string' || model.key.length === 0) return null
+
+  const loaded =
+    model.loaded_instances?.find(instance =>
+      instance.id === model.key || instance.id?.startsWith(`${model.key}@`),
+    )
+    ?? model.loaded_instances?.[0]
+  const contextWindow =
+    model.max_context_length
+    ?? model.context_length
+    ?? loaded?.config?.context_length
+    ?? undefined
+  const loadedContextWindow = loaded?.config?.context_length
+  const aliases = [
+    ...(model.selected_variant ? [model.selected_variant] : []),
+    ...(model.variants ?? []),
+    ...(model.loaded_instances ?? []).map(instance => instance.id).filter((id): id is string => typeof id === 'string' && id.length > 0),
+  ]
+
+  return {
+    id: model.key,
+    name: typeof model.display_name === 'string' && model.display_name.length > 0
+      ? model.display_name
+      : model.key,
+    ...(contextWindow ? { contextWindow } : {}),
+    ...(loadedContextWindow ? { lmStudioLoadedContextWindow: loadedContextWindow } : {}),
+    ...(model.max_context_length ? { lmStudioMaxContextWindow: model.max_context_length } : {}),
+    ...(typeof model.capabilities?.trained_for_tool_use === 'boolean'
+      ? { supportsToolCalling: model.capabilities.trained_for_tool_use }
+      : {}),
+    ...(aliases.length > 0 ? { lmStudioAliases: aliases } : {}),
+    provider: 'LM Studio',
+  }
+}
+
+function looksLikeEmbeddingModel(modelId: string): boolean {
+  const normalized = modelId.toLowerCase()
+  return normalized.includes('embedding') || normalized.includes('embed')
+}
+
+function lmStudioServerRoot(baseUrl: string): string {
+  return normalizeBaseUrl(baseUrl).replace(/\/(?:api\/)?v1$/i, '')
+}
+
+function normalizeBaseUrl(baseUrl: string): string {
+  return baseUrl.endsWith('/') ? baseUrl.slice(0, -1) : baseUrl
+}
+
+function buildRequestHeaders(
+  provider: ProviderType,
+  apiKey: string,
+  model: string,
+  sessionId?: string,
+): Record<string, string> {
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    'Accept': 'text/event-stream',
+  }
+  // Delegate provider-specific header additions (e.g. OpenRouter's
+  // HTTP-Referer) to the transformer. Adding a new provider = one
+  // buildHeaders() method in its transformer file.
+  const transformer = getTransformer(provider as ProviderId)
+  // Most providers take the credential as a Bearer token. A transformer can
+  // claim auth for itself when its vendor uses a bare header instead (MiMo's
+  // `api-key`), so the key isn't also sent as a Bearer it never reads.
+  if (apiKey && !transformer.ownsAuthHeader?.()) {
+    headers['Authorization'] = `Bearer ${apiKey}`
+  }
+  const extra = transformer.buildHeaders?.(apiKey, { model, sessionId }) ?? {}
+  for (const [k, v] of Object.entries(extra)) headers[k] = v
+  return headers
+}
+
+function normalizeToolName(rawName: string): string {
+  // Tool name arrives as whatever the model called. If it matches a native
+  // entry in the registry, map to shared impl id. Otherwise pass through.
+  const reg = OPENAI_COMPAT_TOOL_REGISTRY.find(r => r.nativeName === rawName)
+  return reg?.implId ?? rawName
+}
+
+function clampMaxTokens(provider: ProviderType, requested: number): number {
+  // Per-provider ceilings live in each transformer (e.g. DeepSeek 8192).
+  return getTransformer(provider as ProviderId).clampMaxTokens(requested)
+}
+
+// ─── Per-Provider Request Quirks ─────────────────────────────────
+//
+// Consolidates the transformations the reference transformers do. Each
+// quirk has a brief comment explaining *why* (usually: a specific error
+// the provider returns on non-compliant requests).
+
+function applyProviderRequestQuirks(
+  body: OpenAIChatRequest,
+  provider: ProviderType,
+  thinking: LaneProviderCallParams['thinking'] | undefined,
+  sessionId?: string,
+  effortValue?: LaneProviderCallParams['effortValue'],
+): OpenAIChatRequest {
+  const transformer = getTransformer(provider as ProviderId)
+  const isReasoning = !!(thinking && thinking.type !== 'disabled')
+  const effort = resolveReasoningEffort(thinking) ?? null
+
+  // Cache-control placement per-transformer: strip when the provider
+  // doesn't honor it (DeepSeek, Groq, Mistral, NIM, Ollama, generic);
+  // pass through for OpenRouter (its upstream relocates for Anthropic
+  // cap compliance automatically).
+  const cacheMode = transformer.cacheControlMode(body.model)
+  if (cacheMode === 'none') {
+    body.messages = body.messages.map(stripCacheControlFromMessage)
+  } else if (cacheMode === 'last-only') {
+    // Apply Anthropic's 4-breakpoint rolling cache (one for system, two
+    // for the trailing user/tool messages). Without this OpenRouter ships
+    // a request without a single cache_control marker, Anthropic upstream
+    // never sees the prefix anchor, and every turn is billed as a cold
+    // write — the user-visible "unstable cache hit" symptom. After the
+    // cold write, the system breakpoint anchors a deep read and the two
+    // rolling user breakpoints extend it to the latest tool result, so
+    // subsequent turns hit ~100% of the prefix.
+    applyLastOnlyCacheBreakpoints(body.messages, body.model, provider)
+  }
+
+  // Let the transformer apply its provider-specific quirks. Every
+  // provider implements this; adding a new one = one new file.
+  transformer.transformRequest(body, {
+    model: body.model,
+    isReasoning,
+    reasoningEffort: effort,
+    effortValue,
+    sessionId,
+    provider,
+  })
+
+  // Per-model default generation params (Qwen 0.55, Kimi-k2 0.6,
+  // MiniMax 1.0, Gemini-via-OR 1.0/0.95/64, …). Mirrors opencode's
+  // temperature/topP/topK helpers in provider/transform.ts. ONLY
+  // applied when the caller passed undefined — explicit values from
+  // claude.ts / frontier defaults always win.
+  const defaults = transformer.defaultGenerationParams?.(body.model)
+  if (defaults) {
+    if (body.temperature === undefined && defaults.temperature !== undefined) {
+      body.temperature = defaults.temperature
+    }
+    if (body.top_p === undefined && defaults.top_p !== undefined) {
+      body.top_p = defaults.top_p
+    }
+    if (defaults.top_k !== undefined) {
+      // top_k isn't part of the OpenAI Chat Completions shape; ride
+      // along via extra_body so DashScope / OpenRouter / Vercel
+      // gateways that accept it forward it to the upstream. Providers
+      // that don't recognize it ignore the field. Skip the override if
+      // the caller already populated extra_body.top_k.
+      const bag = body as unknown as Record<string, any>
+      bag.extra_body = bag.extra_body ?? {}
+      if (bag.extra_body.top_k === undefined) bag.extra_body.top_k = defaults.top_k
+    }
+  }
+
+  // Groq rejects null-valued `function_call` on assistant messages;
+  // always strip null tool_calls regardless of provider (the cost of
+  // doing it uniformly is < 1ms, the risk of missing it per-provider
+  // is a subtle 400 on certain replay flows).
+  body.messages = body.messages.map(stripNullToolCall)
+
+  // Remove undefined fields — many providers 400 on explicit `null` on
+  // optional fields they don't recognize.
+  const bag = body as unknown as Record<string, unknown>
+  for (const k of Object.keys(bag)) {
+    if (bag[k] === undefined) delete bag[k]
+  }
+
+  return body
+}
+
+function resolveReasoningEffort(
+  thinking: LaneProviderCallParams['thinking'] | undefined,
+): 'low' | 'medium' | 'high' | undefined {
+  if (!thinking || thinking.type === 'disabled') return undefined
+  if (thinking.type === 'adaptive') return 'medium'
+  const budget = (thinking as any).budget_tokens as number | undefined
+  if (budget == null) return 'medium'
+  if (budget < 2000) return 'low'
+  if (budget < 8000) return 'medium'
+  return 'high'
+}
+
+function stripCacheControlFromMessage(m: OpenAIChatMessage): OpenAIChatMessage {
+  if (!m.content || typeof m.content === 'string') return m
+  const cleanedContent = m.content.map(part => {
+    if (typeof part !== 'object' || part === null) return part
+    const { cache_control: _cc, ...rest } = part as any
+    return rest
+  })
+  return { ...m, content: cleanedContent as any }
+}
+
+/**
+ * Anthropic-via-OpenRouter rolling cache: stamp ephemeral cache_control on
+ * the last text block of the system message and the last two non-system
+ * user/tool messages. Mirrors the Kilo lane's _applyCacheBreakpoints and
+ * the strategy native Kilo CLI uses (`slice(-2)` rolling).
+ *
+ * Three breakpoints (system + 2 trailing) is the sweet spot for
+ * Anthropic's 4-breakpoint cap: turn N's trailing breakpoint becomes
+ * turn N+1's deep cache anchor, so the cached prefix walks forward
+ * with the conversation instead of resetting to the system block. The
+ * fourth breakpoint is intentionally left unused so OpenRouter has
+ * headroom if it inserts its own (it doesn't today, but nothing in the
+ * docs guarantees it won't).
+ *
+ * String content gets promoted to a single-element parts array so the
+ * marker has somewhere to land. Empty tool results fall back to ' ' so
+ * the part is well-formed without altering visible prompt content.
+ * Outside the Gemini anchor, OpenRouter promotes every user/tool message,
+ * marked or not, so a message keeps its encoding after the markers move on.
+ *
+ * Idempotent: existing markers are left untouched, so a SystemBlock that
+ * arrived with cache_control already set isn't re-stamped.
+ */
+function applyLastOnlyCacheBreakpoints(
+  messages: OpenAIChatMessage[],
+  model = '',
+  provider?: ProviderType,
+): void {
+  const stampLast = (parts: Array<{ type: string; text?: string; cache_control?: { type: string } }>): void => {
+    if (parts.length === 0) return
+    // Walk back to the last TEXT part rather than only inspecting the final
+    // element: a message carrying an attachment ends with an image part, and
+    // stamping nothing there would silently drop a rolling breakpoint on
+    // every turn that includes a screenshot.
+    for (let i = parts.length - 1; i >= 0; i--) {
+      const part = parts[i]
+      if (!part || part.type !== 'text') continue
+      if (!part.cache_control) part.cache_control = { type: 'ephemeral' }
+      return
+    }
+  }
+
+  const stampTrailing = (m: OpenAIChatMessage): void => {
+    if (typeof m.content === 'string') {
+      const text = m.content
+      m.content = [
+        { type: 'text', text: text.length > 0 ? text : ' ', cache_control: { type: 'ephemeral' } },
+      ]
+    } else if (Array.isArray(m.content) && m.content.length > 0) {
+      stampLast(m.content as any)
+    }
+  }
+
+  if (isGeminiOnOpenRouter(model)) {
+    // Gemini explicit caching uses only the LAST breakpoint, creates the
+    // cache synchronously, and treats it as both floor and ceiling for
+    // reads — so Gemini gets a single quantized anchor instead of the
+    // rolling trailing stamps (which move every turn and re-write a cache
+    // that is never re-used). See or_gemini_cache.ts for the measurements.
+    applyGeminiOpenRouterCacheAnchor(messages)
+    return
+  }
+
+  // 1. System breakpoint — anchors the whole system-prompt-plus-tools prefix.
+  const sys = messages.find((m) => m.role === 'system')
+  if (sys) {
+    if (typeof sys.content === 'string' && sys.content.length > 0) {
+      sys.content = [{ type: 'text', text: sys.content, cache_control: { type: 'ephemeral' } }]
+    } else if (Array.isArray(sys.content)) {
+      stampLast(sys.content as any)
+    }
+  }
+
+  // OpenRouter: every user/tool message goes as parts, not only the two that
+  // carry a marker. Promoted only while marked, a message went back to a plain
+  // string once the markers moved on, and the request no longer extended the
+  // previous one byte for byte.
+  if (provider === 'openrouter') {
+    for (const m of messages) {
+      if ((m.role === 'user' || m.role === 'tool') && typeof m.content === 'string') {
+        m.content = [{ type: 'text', text: m.content.length > 0 ? m.content : ' ' }]
+      }
+    }
+  }
+
+  // 2 & 3. Last TWO non-system user/tool breakpoints — rolling cache.
+  let stamped = 0
+  for (let i = messages.length - 1; i >= 0 && stamped < 2; i--) {
+    const m = messages[i]!
+    if (m[OPENROUTER_VOLATILE_CONTEXT]) continue
+    if (m.role !== 'user' && m.role !== 'tool') continue
+    stampTrailing(m)
+    stamped++
+  }
+}
+
+function stripNullToolCall(m: OpenAIChatMessage): OpenAIChatMessage {
+  if (!m.tool_calls) return m
+  const cleaned = m.tool_calls.filter(tc => tc && tc.function && tc.function.name)
+  if (cleaned.length === 0) {
+    const { tool_calls: _tc, ...rest } = m
+    return rest
+  }
+  return { ...m, tool_calls: cleaned }
+}
+
+function stripNameField(m: OpenAIChatMessage): OpenAIChatMessage {
+  if (!m.name) return m
+  const { name: _n, ...rest } = m
+  return rest
+}
+
+function injectMagistralThinkingPrompt(messages: OpenAIChatMessage[]): OpenAIChatMessage[] {
+  const thinkingPrompt =
+    'Reason step-by-step inside <think>...</think> tags before answering. '
+    + 'Emit your thinking first, then provide your final answer outside the tags.'
+  const existingSystem = messages.findIndex(m => m.role === 'system')
+  if (existingSystem >= 0) {
+    const sys = messages[existingSystem]
+    const merged = typeof sys.content === 'string'
+      ? thinkingPrompt + '\n\n' + sys.content
+      : thinkingPrompt
+    return messages.map((m, i) => i === existingSystem ? { ...m, content: merged } : m)
+  }
+  return [{ role: 'system', content: thinkingPrompt }, ...messages]
+}
+
+// ─── Ollama Native /api/chat Path ────────────────────────────────
+//
+// The /v1/chat/completions shim ignores `keep_alive` and `options.num_ctx`,
+// so the model runs at its 4096-token default and unloads after 5 minutes
+// idle. Both kill latency for agent use: every turn overflows ctx and
+// re-prefills from scratch, and every coffee break costs a 20s reload.
+// Going direct to /api/chat lets us set both. Tools, tool_call_id, and
+// the tools schema use the same shape as OpenAI's API, so this is a
+// thin transport swap rather than a full re-implementation.
+
+function safeParseObject(s: string): Record<string, unknown> {
+  if (!s) return {}
+  try { return JSON.parse(s) as Record<string, unknown> } catch { return {} }
+}
+
+export interface RepairedCompatToolCall {
+  toolName: string
+  input: Record<string, unknown>
+}
+
+export function repairCompatToolCall(
+  toolName: string,
+  input: Record<string, unknown>,
+): RepairedCompatToolCall {
+  return { toolName, input }
+}
+
+function hasMeaningfulToolValue(value: unknown): boolean {
+  if (value === undefined || value === null) return false
+  if (Array.isArray(value)) return value.length > 0
+  if (typeof value === 'string') return value.trim().length > 0
+  return true
+}
+
+function targetsContainFilePath(value: unknown): boolean {
+  const targets = Array.isArray(value) ? value : [value]
+  return targets.some(target => isToolRecord(target) && hasMeaningfulToolValue(target.filePath))
+}
+
+function isToolRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function toOllamaMessage(m: OpenAIChatMessage): Record<string, unknown> {
+  // Ollama wants flat string content; collapse OpenAI parts arrays.
+  let content = ''
+  // /api/chat carries images in a sibling `images` array of bare base64
+  // (no data: prefix), NOT inside content. Without this, an image part sent
+  // to a vision-capable local model (llava, qwen-vl) would be filtered out
+  // of the text collapse and silently disappear.
+  const images: string[] = []
+  if (typeof m.content === 'string') {
+    content = m.content
+  } else if (Array.isArray(m.content)) {
+    const texts: string[] = []
+    for (const p of m.content as any[]) {
+      if (!p || typeof p !== 'object') continue
+      if (p.type === 'text' && typeof p.text === 'string') {
+        texts.push(p.text)
+        continue
+      }
+      if (p.type === 'image_url') {
+        const url = p.image_url?.url
+        if (typeof url === 'string') {
+          const base64 = /^data:[^;,]+;base64,(.+)$/.exec(url)?.[1]
+          if (base64) images.push(base64)
+        }
+      }
+    }
+    content = texts.join('\n')
+  }
+
+  const out: Record<string, unknown> = { role: m.role, content }
+  if (images.length > 0) out.images = images
+
+  if (m.tool_calls && m.tool_calls.length > 0) {
+    out.tool_calls = m.tool_calls.map(tc => ({
+      ...(tc.id && { id: tc.id }),
+      type: 'function',
+      function: {
+        name: tc.function.name,
+        // Ollama's /api/chat accepts arguments as object; we always have
+        // a JSON string from the OpenAI conversion path so parse here.
+        arguments: safeParseObject(tc.function.arguments),
+      },
+    }))
+  }
+  if (m.tool_call_id) out.tool_call_id = m.tool_call_id
+
+  return out
+}
+
+async function* streamOllamaNative(
+  cfg: { apiKey: string; baseUrl: string },
+  body: OpenAIChatRequest,
+  model: string,
+  signal: AbortSignal | undefined,
+): AsyncGenerator<AnthropicStreamEvent, NormalizedUsage> {
+  const root = normalizeBaseUrl(cfg.baseUrl).replace(/\/v1$/i, '')
+  const url = `${root}/api/chat`
+
+  const numCtx = parseInt(process.env.OLLAMA_NUM_CTX ?? '16384', 10)
+  const keepAlive = process.env.OLLAMA_KEEP_ALIVE ?? '30m'
+
+  const ollamaBody: Record<string, unknown> = {
+    model: body.model,
+    messages: body.messages.map(toOllamaMessage),
+    stream: true,
+    keep_alive: keepAlive,
+    options: {
+      num_ctx: numCtx,
+      ...(body.max_tokens != null && { num_predict: body.max_tokens }),
+      ...(body.temperature !== undefined && { temperature: body.temperature }),
+      ...(body.stop?.length && { stop: body.stop }),
+    },
+  }
+  if (body.tools && body.tools.length > 0) ollamaBody.tools = body.tools
+
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' }
+  if (cfg.apiKey) headers['Authorization'] = `Bearer ${cfg.apiKey}`
+
+  const messageId = `ollama-${Date.now()}`
+  let messageStartEmitted = false
+  let inputTokens = 0
+  let outputTokens = 0
+  let currentBlockIndex = 0
+  let inTextBlock = false
+  let inThinkingBlock = false
+  const toolCallBuffers: Array<{ id: string; name: string; args: string; anthropicIndex: number }> = []
+  let emittedAnyToolUse = false
+  let outputCapTruncated = false
+
+  const emitMessageStart = (): AnthropicStreamEvent | undefined => {
+    if (messageStartEmitted) return undefined
+    messageStartEmitted = true
+    return {
+      type: 'message_start',
+      message: {
+        id: messageId,
+        type: 'message',
+        role: 'assistant',
+        content: [],
+        model,
+        stop_reason: null,
+        stop_sequence: null,
+        usage: { input_tokens: 0, output_tokens: 0 },
+      },
+    }
+  }
+
+  let response: Response
+  try {
+    response = await fetch(url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(ollamaBody),
+      signal,
+    })
+  } catch (err: any) {
+    if (isAbortError(err, signal)) throw err
+    throw createProviderConnectionError('ollama', err)
+  }
+
+  if (!response.ok) {
+    const errText = await response.text().catch(() => '')
+    throwRetryableProviderHttpError('ollama', response, errText)
+    const mst = emitMessageStart()
+    if (mst) yield mst
+    const lowered = errText.toLowerCase()
+    const isPromptTooLong = ['context length', 'too long', 'context window'].some(m => lowered.includes(m))
+    const headline = isPromptTooLong
+      ? `Prompt is too long (ollama ${response.status})`
+      : `ollama API error ${response.status}`
+    yield* emitErrorText(`${headline}: ${errText.slice(0, 500)}`)
+    yield { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 0 } }
+    yield { type: 'message_stop' }
+    return blankUsage(0, 0, 0, 0)
+  }
+
+  if (!response.body) throw new Error('Ollama: empty response body')
+
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buffer += decoder.decode(value, { stream: true })
+
+      // /api/chat is NDJSON: each line is a complete JSON object.
+      const lines = buffer.split('\n')
+      buffer = lines.pop() ?? ''
+
+      for (const rawLine of lines) {
+        const line = rawLine.trim()
+        if (!line) continue
+        let chunk: any
+        try { chunk = JSON.parse(line) } catch { continue }
+
+        const message = chunk.message ?? {}
+        const isDone = chunk.done === true
+        // Ollama reports why it stopped on the terminal chunk: "stop",
+        // "length" (num_predict reached), "load".
+        if (isDone && isOutputCapTruncation(chunk.done_reason)) outputCapTruncated = true
+
+        if (typeof chunk.prompt_eval_count === 'number') inputTokens = chunk.prompt_eval_count
+        if (typeof chunk.eval_count === 'number') outputTokens = chunk.eval_count
+
+        const hasContent = typeof message.content === 'string' && message.content.length > 0
+        const hasToolCalls = Array.isArray(message.tool_calls) && message.tool_calls.length > 0
+
+        if (!messageStartEmitted && (hasContent || hasToolCalls)) {
+          const mst = emitMessageStart()
+          if (mst) yield mst
+        }
+
+        if (hasContent) {
+          if (inThinkingBlock) {
+            yield { type: 'content_block_stop', index: currentBlockIndex }
+            currentBlockIndex++
+            inThinkingBlock = false
+          }
+          if (!inTextBlock) {
+            yield {
+              type: 'content_block_start',
+              index: currentBlockIndex,
+              content_block: { type: 'text', text: '' },
+            }
+            inTextBlock = true
+          }
+          yield {
+            type: 'content_block_delta',
+            index: currentBlockIndex,
+            delta: { type: 'text_delta', text: message.content },
+          }
+        }
+
+        if (hasToolCalls) {
+          if (inTextBlock || inThinkingBlock) {
+            yield { type: 'content_block_stop', index: currentBlockIndex }
+            currentBlockIndex++
+            inTextBlock = false
+            inThinkingBlock = false
+          }
+          for (const tc of message.tool_calls) {
+            const fn = tc.function ?? {}
+            const name = fn.name ?? ''
+            const argsStr = typeof fn.arguments === 'string'
+              ? fn.arguments
+              : fn.arguments === undefined ? '' : JSON.stringify(fn.arguments)
+            const id = tc.id ?? `call_${toolCallBuffers.length}`
+            toolCallBuffers.push({
+              id,
+              name,
+              args: argsStr,
+              anthropicIndex: currentBlockIndex,
+            })
+            currentBlockIndex++
+            emittedAnyToolUse = true
+          }
+        }
+
+        if (isDone) {
+          if (inTextBlock || inThinkingBlock) {
+            yield { type: 'content_block_stop', index: currentBlockIndex }
+            inTextBlock = false
+            inThinkingBlock = false
+          }
+          // Cut off at num_predict: the last call in the list is the one the
+          // model was still writing. Drop it rather than run a half-built
+          // call — see ../shared/truncation.ts.
+          if (outputCapTruncated) toolCallBuffers.pop()
+          for (const buf of toolCallBuffers) {
+            const implId = normalizeToolName(buf.name)
+            const decoded = decodeToolArguments(buf.args)
+            const repaired = decoded.status
+              ? { toolName: implId, input: decoded.input }
+              : repairCompatToolCall(implId, decoded.input)
+            const input = repaired.input
+            const anthropicToolUseId = buf.id.startsWith('toolu_') ? buf.id : `toolu_ollama_${buf.id}`
+            yield {
+              type: 'content_block_start',
+              index: buf.anthropicIndex,
+              content_block: { type: 'tool_use', id: anthropicToolUseId, name: repaired.toolName, input: {}, ...toolDecodeFields(decoded) },
+            }
+            yield {
+              type: 'content_block_delta',
+              index: buf.anthropicIndex,
+              delta: { type: 'input_json_delta', partial_json: JSON.stringify(input ?? {}) },
+            }
+            yield { type: 'content_block_stop', index: buf.anthropicIndex }
+          }
+          toolCallBuffers.length = 0
+        }
+      }
+    }
+  } finally {
+    reader.releaseLock()
+  }
+
+  if (!messageStartEmitted) {
+    const mst = emitMessageStart()
+    if (mst) yield mst
+  }
+
+  const stopReason = laneStopReason({
+    truncated: outputCapTruncated,
+    hadToolUse: emittedAnyToolUse,
+  })
+  yield {
+    type: 'message_delta',
+    delta: { stop_reason: stopReason },
+    usage: { output_tokens: outputTokens, input_tokens: inputTokens },
+  }
+  yield { type: 'message_stop' }
+
+  return {
+    input_tokens: inputTokens,
+    output_tokens: outputTokens,
+    cache_read_tokens: 0,
+    cache_write_tokens: 0,
+    thinking_tokens: 0,
+  }
+}
+
+// ─── Per-Provider Response Quirks ────────────────────────────────
+
+function applyProviderResponseQuirks(chunk: any, provider: ProviderType): any {
+  const choice = chunk?.choices?.[0]
+  if (!choice) return chunk
+  const delta = choice.delta ?? {}
+  if (provider === 'mistral') {
+    getTransformer('mistral').normalizeStreamDelta?.(delta, choice.finish_reason ?? null)
+  }
+
+  // Groq: returns `reasoning` on deltas; normalize to reasoning_content
+  // for uniform downstream handling (not strictly required with our
+  // thinking-delta union fallback, but keeps things tidy).
+  if (provider === 'groq' && typeof delta.reasoning === 'string' && !delta.reasoning_content) {
+    delta.reasoning_content = delta.reasoning
+  }
+  // Qwen (DashScope compatible-mode) reasoning + DashScope error handling
+  // moved to src/lanes/qwen/ (dedicated lane). Compat no longer sees qwen.
+  // DeepSeek already sends reasoning_content; nothing to rename.
+  // OpenRouter may send either reasoning or reasoning_content depending
+  // on the underlying model; the union handling in streamAsProvider
+  // covers both.
+
+  // Rebuild choice with normalized delta.
+  return { ...chunk, choices: [{ ...choice, delta }] }
+}
+
+// ─── Tool Schema Sanitization ────────────────────────────────────
+
+interface BuildToolsCtx {
+  platform: NodeJS.Platform
+  psEdition: 'desktop' | 'core' | null
+}
+
+function buildOpenAITools(
+  tools: ProviderTool[],
+  provider: ProviderType,
+  model: string,
+  ctx: BuildToolsCtx,
+): Array<{
+  type: 'function'
+  function: {
+    name: string
+    description: string
+    parameters: Record<string, unknown>
+    strict?: boolean
+  }
+}> {
+  // Transformer-driven strict mode + schema drop list. Per-provider
+  // config lives in each transformer file — adding a new provider =
+  // one new file; this function is provider-agnostic.
+  const transformer = getTransformer(provider as ProviderId)
+  const useStrict = transformer.supportsStrictMode()
+  return tools.map(t => {
+    const parameters = sanitizeToolSchema(
+      t.input_schema ?? { type: 'object', properties: {} },
+      provider,
+      model,
+    )
+
+    // Shell-description override path: replaces caller's verbose
+    // frontier-tier description with a compact, example-driven version
+    // for Bash / PowerShell so weak compat-lane models stop emitting
+    // cross-shell syntax. The transformer can opt in/out per model;
+    // the default (used when the transformer doesn't override) is the
+    // shared OpenCode-style description from shell_descriptions.ts.
+    const isShellTool = t.name === 'Bash' || t.name === 'PowerShell'
+    const customShellDesc = isShellTool
+      ? transformer.overrideShellToolDescription?.(t.name as 'Bash' | 'PowerShell', model, ctx)
+        ?? getCompatShellDescription(t.name, ctx)
+      : undefined
+    const baseDescription = customShellDesc ?? t.description ?? ''
+
+    return {
+      type: 'function' as const,
+      function: {
+        name: t.name,
+        // Every tool description gets the STRICT PARAMETERS summary
+        // appended — plain-text in-context reminder of required fields
+        // + types. Backstops `strict: true` on providers that honor it
+        // and does the whole job on providers that don't.
+        description: appendStrictParamsHint(baseDescription, parameters),
+        parameters,
+        ...(useStrict && { strict: true }),
+      },
+    }
+  })
+}
+
+// Strip JSON Schema fields that various providers reject. Drop lists
+// are owned by each transformer (schemaDropList()); this wrapper just
+// runs the walk. After the walk, `sanitizeToolSchemaExtra()` (when the
+// transformer implements it) gets one more pass — used for shapes the
+// flat drop list can't express (Moonshot's "$ref must have no
+// siblings", tuple-form `items`, Gemini integer→string enums, …).
+function sanitizeToolSchema(
+  schema: Record<string, unknown>,
+  provider: ProviderType,
+  model: string,
+): Record<string, unknown> {
+  const transformer = getTransformer(provider as ProviderId)
+  const drop = transformer.schemaDropList()
+
+  // Schema-position aware: the drop list applies to keywords only. Applying
+  // it to every key deleted tool parameters literally named `default`,
+  // `format` or `x-label`, while `required` still named them — see
+  // lanes/shared/schema_positions.ts.
+  const dropped = walkSchemaByPosition(schema, (key, value, recurse) => {
+    if (drop.has(key)) return undefined
+    // OpenAPI 3.0 vendor extensions (x-google-enum-descriptions, x-stripe-*,
+    // …) leak in from MCP tool schemas. OpenAI-strict, Mistral, Groq, and
+    // other validators 400 on unknown fields, so strip the whole x-* family
+    // for every transformer.
+    if (key.startsWith('x-')) return undefined
+    return recurse(value)
+  }) as Record<string, unknown>
+  if (transformer.sanitizeToolSchemaExtra) {
+    return transformer.sanitizeToolSchemaExtra(dropped, model)
+  }
+  return dropped
+}
+
+// ─── History Conversion ──────────────────────────────────────────
+
+function convertHistoryToOpenAI(
+  messages: ProviderMessage[],
+  systemText: string,
+  provider: ProviderType = 'generic',
+  model = '',
+): OpenAIChatMessage[] {
+  if (provider === 'deepseek') {
+    return convertHistoryToOpenAIForDeepSeek(messages, systemText, provider, model)
+  }
+  if (isDirectThinkingProvider(provider)) {
+    const out = convertDirectHistory(messages, turns => convertHistoryToOpenAIDefault(turns, '', provider, model))
+    return systemText ? [{ role: 'system', content: systemText }, ...out] : out
+  }
+  // OpenCode Zen with per-model thinking enabled: the gateway forwards
+  // `reasoning_content` from streamed deltas, and the downstream upstream
+  // (DeepSeek, Qwen-DashScope, Kimi-thinking, etc.) expects that field
+  // echoed back on any replayed assistant tool-call message. Without it
+  // the next tool turn 400s with "reasoning_content in thinking mode must
+  // be passed back to the API". The DeepSeek-style conversion already
+  // does exactly this carry-back, so reuse it for every reasoning-on
+  // opencode row.
+  // OpenCode Go shares Zen's gateway + upstreams, so the same reasoning
+  // carry-back applies — without it a thinking-on Go row 400s on the next
+  // tool turn ("reasoning_content must be passed back"). Where models.dev
+  // states a row's replay contract it decides, whatever the chip says.
+  if (
+    (provider === 'opencode' || provider === 'opencodego')
+    && opencodeReplaysReasoningContent(provider, model)
+  ) {
+    return convertHistoryToOpenAIForDeepSeek(messages, systemText, provider, model)
+  }
+  if (provider === 'cloudflare' && cloudflareReasoningContentReplayRequired(model)) {
+    return convertHistoryToOpenAIForDeepSeek(messages, systemText, provider, model)
+  }
+  // LXD relays straight to the upstream model, so a thinking-on row inherits
+  // that upstream's replay contract: DeepSeek V4 and the Qwen/GLM thinking
+  // rows all expect `reasoning_content` echoed back on any replayed assistant
+  // tool-call message, and 400 with "reasoning_content must be passed back"
+  // on the next tool turn without it. The DeepSeek-style conversion does
+  // exactly that carry-back — same reasoning as the opencode branch above.
+  if (provider === 'lxd' && lxdReasoningContentReplayRequired(model)) {
+    return convertHistoryToOpenAIForDeepSeek(messages, systemText, provider, model)
+  }
+  // Xiaomi MiMo declares the same replay contract for every reasoning row
+  // (its integration sets preserveReasoningContent AND
+  // requireReasoningContentOnAssistantMessages), so the carry-back is wired
+  // in from the start rather than surfacing as a second-tool-turn failure.
+  if (provider === 'mimo' && mimoReasoningContentReplayRequired(model)) {
+    return convertHistoryToOpenAIForDeepSeek(messages, systemText, provider, model)
+  }
+  // Model Studio's own DeepSeek, GLM and Kimi rows 400 on the SECOND tool
+  // turn without `reasoning_content` echoed back; its Qwen rows ignore the
+  // field unless `preserve_thinking` is set. Carrying it back is free for
+  // the rows that ignore it and load-bearing for the rest.
+  if (provider === 'alibaba' && alibabaReasoningContentReplayRequired(model)) {
+    return convertHistoryToOpenAIForDeepSeek(messages, systemText, provider, model)
+  }
+  return convertHistoryToOpenAIDefault(messages, systemText, provider, model)
+}
+
+function convertHistoryToOpenAIForOpenRouter(
+  messages: ProviderMessage[],
+  systemText: string,
+  model: string,
+): OpenAIChatMessage[] {
+  const { stable, volatile } = splitSystemPromptForCache(systemText)
+  const out = convertHistoryToOpenAI(messages, stable, 'openrouter', model)
+  // The entire initial system was frozen before this split, including an
+  // initially empty dynamic tail. New state belongs in conversation messages.
+  if (volatile) insertOpenRouterVolatileContext(out, volatile)
+  return out
+}
+
+/**
+ * DeepSeek direct: same stable-prefix discipline OpenRouter gets, because
+ * DeepSeek's automatic context caching hits ONLY on a byte-identical prefix and
+ * the system message is its head.
+ *
+ * The dynamic system sections (git status, env info, memory, MCP server
+ * instructions) are recomputed per turn. Most are memoized for the session, but
+ * `mcp_instructions` is deliberately uncached (servers connect and disconnect
+ * between turns), so an MCP server that comes up on turn 3 rewrites the system
+ * message and cold-starts the ENTIRE conversation — not just the new bytes.
+ * Splitting the block out, freezing it to its first value for the session and
+ * pinning it at a fixed leading position makes it part of the stable prefix
+ * instead of churn inside it. Fresh state still reaches the model through the
+ * conversation tail (tool results, the user's message).
+ *
+ * Unlike the OpenRouter block this uses STRING content: DeepSeek's
+ * chat-completions route takes plain strings for text-only user turns, and the
+ * DeepSeek history converter only ever emits array content when a message
+ * actually carries images.
+ */
+function buildDeepSeekCacheStableMessages(
+  messages: ProviderMessage[],
+  systemText: string,
+  model: string,
+  cacheSessionId?: string,
+): OpenAIChatMessage[] {
+  const { stable, volatile } = splitSystemPromptForCache(systemText)
+  const out = convertHistoryToOpenAI(messages, stable, 'deepseek', model)
+  const frozen = freezeSessionVolatileText(
+    volatileFreezeKey('deepseek', model, cacheSessionId, messages, volatile),
+    volatile,
+  ).trim()
+  if (!frozen) return out
+
+  // FIXED leading position, right after the system message. Spliced in before
+  // the LAST user message instead, the block would move one slot later every
+  // turn and the prefix would diverge at its old position on every single call.
+  const insertAt = out[0]?.role === 'system' ? 1 : 0
+  out.splice(insertAt, 0, {
+    role: 'user',
+    content: `<dynamic_context>\n${frozen}\n</dynamic_context>`,
+  })
+  return out
+}
+
+export function buildDirectCacheStableMessages(
+  messages: ProviderMessage[],
+  systemText: string,
+  provider: 'glm' | 'moonshot' | 'minimax',
+  model: string,
+  sessionId?: string,
+): OpenAIChatMessage[] {
+  return buildDirectHistory(messages, systemText, provider, model, sessionId,
+    turns => convertHistoryToOpenAIDefault(turns, '', provider, model))
+}
+
+function convertHistoryToOpenAIDefault(
+  messages: ProviderMessage[],
+  systemText: string,
+  provider?: ProviderType,
+  model?: string,
+): OpenAIChatMessage[] {
+  const out: OpenAIChatMessage[] = []
+  const openRouterIds = provider === 'openrouter' ? openRouterToolIdMap(messages) : undefined
+  if (systemText) out.push({ role: 'system', content: systemText })
+
+  // Only send pixels when the provider's own catalog said this model takes
+  // image input. Unknown stays on the text path, which every provider
+  // accepts — a wrong answer here can cost quality, never a failed request.
+  //
+  // Resolved lazily and frozen on first use so a catalog that loads mid
+  // conversation cannot re-render an already-sent message and invalidate the
+  // cached prefix. A conversation with no attachments never freezes anything.
+  let imageSupport: boolean | undefined
+  const canSeeImages = (): boolean =>
+    (imageSupport ??= decideImageSupport(provider, model))
+
+  for (const msg of messages) {
+    if (typeof msg.content === 'string') {
+      out.push({
+        role: msg.role === 'assistant' ? 'assistant' : 'user',
+        content: msg.content,
+      })
+      continue
+    }
+
+    const texts: string[] = []
+    const toolCalls: NonNullable<OpenAIChatMessage['tool_calls']> = []
+    const toolResults: OpenAIChatMessage[] = []
+    const imageParts: OpenAIImagePart[] = []
+    const toolResultImageParts: OpenAIImagePart[] = []
+
+    for (const block of msg.content) {
+      switch (block.type) {
+        case 'text':
+          if (block.text) texts.push(block.text)
+          break
+        case 'tool_use':
+          if (block.id && block.name) {
+            toolCalls.push({
+              id: openRouterIds?.get(block.id) ?? block.id,
+              type: 'function',
+              function: {
+                name: block.name,
+                arguments: JSON.stringify(block.input ?? {}),
+              },
+            })
+          }
+          break
+        case 'tool_result':
+          if (block.tool_use_id) {
+            // A `tool` message's content must be a string, so images found
+            // in a tool result ride in a user message emitted right after
+            // it (same shape the shared anthropic_to_openai adapter uses).
+            const forwardImages = contentHasImageBlock(block.content) && canSeeImages()
+            if (forwardImages) {
+              toolResultImageParts.push(...collectImageParts(block.content))
+            }
+            toolResults.push({
+              role: 'tool',
+              tool_call_id: openRouterIds?.get(block.tool_use_id) ?? block.tool_use_id,
+              content: typeof block.content === 'string'
+                ? block.content
+                : stringifyToolContent(block.content, forwardImages),
+            })
+          }
+          break
+        case 'thinking':
+          // OpenAI Chat Completions doesn't echo thinking back — skip.
+          break
+        case 'image': {
+          // Pasted screenshots reach the lane as an Anthropic image block.
+          // Models the catalog says can see get the real bytes; the rest get
+          // OCR text or a marker, because dropping the block silently leaves
+          // the `[Image #N]` marker in the text with nothing behind it and
+          // the model then describes an image it never received.
+          const part = canSeeImages() ? toOpenAIImagePart(block) : null
+          if (part) imageParts.push(part)
+          else texts.push(renderMediaForTextLane(block))
+          break
+        }
+        default:
+          // Anthropic `document` blocks (PDF attachments from FileReadTool)
+          // aren't in ProviderContentBlock's union but do reach the lane.
+          // Every other block type stays silently skipped, exactly as before.
+          if ((block as { type: string }).type === 'document') {
+            texts.push(renderMediaForTextLane(block))
+          }
+          break
+      }
+    }
+
+    // A tool result answers the PREVIOUS assistant turn, so it has to sit
+    // immediately after that turn tool_calls. Text riding in this same
+    // message -- a system-reminder, an attachment, the user typing while the
+    // result lands -- must queue behind it, or the wire order interposes a
+    // user turn between a call and its answer. Assistant turns keep today
+    // order: their own results follow their own tool_calls.
+    const resultsAnswerPriorTurn = msg.role !== 'assistant'
+    if (resultsAnswerPriorTurn) out.push(...toolResults)
+    const openRouterReasoning = provider === 'openrouter' && msg.role === 'assistant'
+      ? openRouterReasoningForBlocks(msg.content) : {}
+    if (texts.length > 0 || toolCalls.length > 0 || imageParts.length > 0 || Object.keys(openRouterReasoning).length > 0) {
+      const role = msg.role === 'assistant' ? 'assistant' : 'user'
+      // Assistant turns can't carry image parts; only user input does.
+      const sendParts = imageParts.length > 0 && role === 'user'
+      out.push({
+        role,
+        content: sendParts
+          ? [
+              ...(texts.length > 0
+                ? [{ type: 'text' as const, text: texts.join('\n') }]
+                : []),
+              ...imageParts,
+            ]
+          : texts.length > 0 ? texts.join('\n') : null,
+        ...(toolCalls.length > 0 && { tool_calls: toolCalls }),
+        ...openRouterReasoning,
+      })
+    }
+    if (!resultsAnswerPriorTurn) out.push(...toolResults)
+    if (toolResultImageParts.length > 0) {
+      out.push({
+        role: 'user',
+        content: [
+          { type: 'text', text: 'Visual observation from the previous tool result:' },
+          ...toolResultImageParts,
+        ],
+      })
+    }
+  }
+
+  return out
+}
+
+const SYSTEM_DYNAMIC_BOUNDARY = '__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__'
+
+const VOLATILE_SYSTEM_PATTERNS: readonly RegExp[] = [
+  /# Session-specific guidance\b[\s\S]*?(?=\n#|$)/,
+  /<env>[\s\S]*?<\/env>/,
+  /# Environment\b[\s\S]*?(?=\n#|$)/,
+  /# currentDate\n[^\n]+/,
+  /Today's date is [^\n]+/,
+  /# gitStatus\b[\s\S]*?(?=\n#|$)/,
+  /gitStatus:[\s\S]*?(?=\n\n|\n#|$)/,
+  /Current branch:[\s\S]*?(?=\n\n|\n#|$)/,
+  /Working directory:[\s\S]*?(?=\n\n|\n#|$)/,
+  /Primary working directory:[\s\S]*?(?=\n\n|\n#|$)/,
+]
+
+/** Remove the boundary marker (and the blank line it leaves) from a system
+ *  prompt the caller is NOT going to split on. */
+function stripSystemDynamicBoundary(text: string): string {
+  if (!text.includes(SYSTEM_DYNAMIC_BOUNDARY)) return text
+  return text.split(SYSTEM_DYNAMIC_BOUNDARY).join('').replace(/\n{3,}/g, '\n\n')
+}
+
+/**
+ * Split the flat system prompt into the part that must stay byte-identical for
+ * the life of the session (cached prefix) and the per-turn dynamic tail. Used
+ * by every implicit-cache provider the lane serves — OpenRouter and DeepSeek
+ * today. Prefers the explicit SYSTEM_PROMPT_DYNAMIC_BOUNDARY marker and falls
+ * back to locating the first known volatile section by regex.
+ */
+function splitSystemPromptForCache(text: string): {
+  stable: string
+  volatile: string
+} {
+  if (!text) return { stable: '', volatile: '' }
+
+  const markerIdx = text.indexOf(SYSTEM_DYNAMIC_BOUNDARY)
+  if (markerIdx >= 0) {
+    return {
+      stable: text.slice(0, markerIdx).replace(/\s+$/, ''),
+      volatile: text.slice(markerIdx + SYSTEM_DYNAMIC_BOUNDARY.length).replace(/^\s+/, ''),
+    }
+  }
+
+  const cutoff = Math.floor(text.length * 0.3)
+  const matches: Array<{ start: number; end: number }> = []
+  for (const pattern of VOLATILE_SYSTEM_PATTERNS) {
+    const match = text.match(pattern)
+    if (match && match.index != null && match.index >= cutoff) {
+      matches.push({ start: match.index, end: match.index + match[0].length })
+    }
+  }
+  if (matches.length === 0) return { stable: text, volatile: '' }
+
+  matches.sort((a, b) => a.start - b.start)
+  const cut = matches[0]!.start
+  return {
+    stable: text.slice(0, cut).replace(/\s+$/, ''),
+    volatile: text.slice(cut).replace(/^\s+/, ''),
+  }
+}
+
+function insertOpenRouterVolatileContext(
+  messages: OpenAIChatMessage[],
+  volatileText: string,
+): void {
+  const text = volatileText.trim()
+  if (!text) return
+
+  const contextMessage: OpenAIChatMessage = {
+    role: 'user',
+    content: [
+      {
+        type: 'text',
+        text: `<dynamic_context>\n${text}\n</dynamic_context>`,
+      },
+    ],
+    [OPENROUTER_VOLATILE_CONTEXT]: true,
+  }
+
+  // FIXED leading position: right after the system message, ahead of the
+  // whole conversation. The block is session-frozen (see caller), so pinned
+  // here it becomes part of the byte-stable cached prefix. The previous
+  // placement — spliced in before the LAST user message — moved one slot
+  // later every turn, so the prefix diverged at the block's old position and
+  // every upstream re-billed the volatile block plus the latest exchange on
+  // every single call (on turn 2 the hit shrank to just the system message).
+  const insertAt = messages[0]?.role === 'system' ? 1 : 0
+  messages.splice(insertAt, 0, contextMessage)
+}
+
+function convertHistoryToOpenAIForDeepSeek(
+  messages: ProviderMessage[],
+  systemText: string,
+  provider?: ProviderType,
+  model?: string,
+): OpenAIChatMessage[] {
+  const out: OpenAIChatMessage[] = []
+  if (systemText) out.push({ role: 'system', content: systemText })
+  let imageSupport: boolean | undefined
+  const canSeeImages = (): boolean =>
+    (imageSupport ??= decideImageSupport(provider, model))
+
+  let pendingReasoning: string | null = null
+  let pendingAssistantTexts: string[] = []
+
+  const clearPendingAssistant = () => {
+    pendingReasoning = null
+    pendingAssistantTexts = []
+  }
+
+  const flushPendingAssistantText = () => {
+    if (pendingAssistantTexts.length > 0) {
+      out.push({ role: 'assistant', content: pendingAssistantTexts.join('\n') })
+    }
+    clearPendingAssistant()
+  }
+
+  const appendPendingReasoning = (thinking: string) => {
+    pendingReasoning = pendingReasoning
+      ? `${pendingReasoning}\n${thinking}`
+      : thinking
+  }
+
+  for (const msg of messages) {
+    if (typeof msg.content === 'string') {
+      flushPendingAssistantText()
+      out.push({
+        role: msg.role === 'assistant' ? 'assistant' : 'user',
+        content: msg.content,
+      })
+      continue
+    }
+
+    const texts: string[] = []
+    const toolCalls: NonNullable<OpenAIChatMessage['tool_calls']> = []
+    const toolResults: OpenAIChatMessage[] = []
+    const thinkingBlocks: string[] = []
+    const imageParts: OpenAIImagePart[] = []
+    const toolResultImageParts: OpenAIImagePart[] = []
+
+    for (const block of msg.content) {
+      switch (block.type) {
+        case 'text':
+          if (block.text) texts.push(block.text)
+          break
+        case 'tool_use':
+          if (block.id && block.name) {
+            toolCalls.push({
+              id: block.id,
+              type: 'function',
+              function: {
+                name: block.name,
+                arguments: JSON.stringify(block.input ?? {}),
+              },
+            })
+          }
+          break
+        case 'tool_result':
+          if (block.tool_use_id) {
+            const forwardImages = contentHasImageBlock(block.content) && canSeeImages()
+            if (forwardImages) {
+              toolResultImageParts.push(...collectImageParts(block.content))
+            }
+            toolResults.push({
+              role: 'tool',
+              tool_call_id: block.tool_use_id,
+              content: typeof block.content === 'string'
+                ? block.content
+                : stringifyToolContent(block.content, forwardImages),
+            })
+          }
+          break
+        case 'thinking':
+          if (block.thinking) thinkingBlocks.push(block.thinking)
+          break
+        case 'image': {
+          // Same rule as the default converter: real pixels when the catalog
+          // says the model takes them, OCR text or a marker otherwise.
+          const part = canSeeImages() ? toOpenAIImagePart(block) : null
+          if (part) imageParts.push(part)
+          else texts.push(renderMediaForTextLane(block))
+          break
+        }
+        default:
+          if ((block as { type: string }).type === 'document') {
+            texts.push(renderMediaForTextLane(block))
+          }
+          break
+      }
+    }
+
+    if (msg.role === 'assistant') {
+      for (const thinking of thinkingBlocks) appendPendingReasoning(thinking)
+
+      if (toolCalls.length > 0) {
+        const contentParts = [...pendingAssistantTexts, ...texts]
+        out.push({
+          role: 'assistant',
+          content: contentParts.length > 0 ? contentParts.join('\n') : null,
+          // DeepSeek thinking mode requires this field on every replayed
+          // assistant tool-call message. Old cross-provider history may not
+          // have a thinking block, so preserve protocol shape with "".
+          reasoning_content: pendingReasoning ?? '',
+          tool_calls: toolCalls,
+        })
+        clearPendingAssistant()
+      } else if (texts.length > 0) {
+        pendingAssistantTexts.push(...texts)
+      }
+
+      if (toolResults.length > 0) {
+        flushPendingAssistantText()
+        out.push(...toolResults)
+      }
+      continue
+    }
+
+    flushPendingAssistantText()
+    // Tool results first -- see the note in convertHistoryToOpenAI. Here the
+    // stakes are higher: sanitizeDeepSeekToolCallAdjacency drops a tool_call
+    // whose result is not adjacent, AND drops the orphaned result, so a user
+    // turn interposed between them erases both from history. The model then
+    // sees its own narration with no evidence it ever called anything and
+    // repeats it -- a silent loop rather than a visible error.
+    out.push(...toolResults)
+    if (texts.length > 0 || imageParts.length > 0) {
+      out.push({
+        role: 'user',
+        content: imageParts.length > 0
+          ? [
+              ...(texts.length > 0
+                ? [{ type: 'text' as const, text: texts.join('\n') }]
+                : []),
+              ...imageParts,
+            ]
+          : texts.join('\n'),
+      })
+    }
+    if (toolResultImageParts.length > 0) {
+      out.push({
+        role: 'user',
+        content: [
+          { type: 'text', text: 'Visual observation from the previous tool result:' },
+          ...toolResultImageParts,
+        ],
+      })
+    }
+  }
+
+  flushPendingAssistantText()
+  return out
+}
+
+/** Test-only: Ollama native message shaping (images ride in a sibling field). */
+export function _toOllamaMessageForTest(m: OpenAIChatMessage): Record<string, unknown> {
+  return toOllamaMessage(m)
+}
+
+/** Test-only: rolling cache-breakpoint placement. */
+export function _applyLastOnlyCacheBreakpointsForTest(
+  messages: OpenAIChatMessage[],
+  model = '',
+): void {
+  applyLastOnlyCacheBreakpoints(messages, model)
+}
+
+export function _convertHistoryToOpenAIForTest(
+  messages: ProviderMessage[],
+  systemText: string,
+  provider: ProviderType,
+  model: string,
+): OpenAIChatMessage[] {
+  return convertHistoryToOpenAI(messages, systemText, provider, model)
+}
+
+/** OpenAI Chat Completions image content part. */
+type OpenAIImagePart = { type: 'image_url'; image_url: { url: string } }
+
+/**
+ * Anthropic image block → OpenAI `image_url` part. Base64 becomes a data URL,
+ * remote URLs pass through, anything else returns null so the caller can fall
+ * back to text.
+ */
+function toOpenAIImagePart(block: unknown): OpenAIImagePart | null {
+  const src = (
+    block as { source?: { data?: string; media_type?: string; url?: string } } | null
+  )?.source
+  if (!src) return null
+  if (typeof src.data === 'string' && src.data.length > 0) {
+    const mime = src.media_type ?? 'image/png'
+    return { type: 'image_url', image_url: { url: `data:${mime};base64,${src.data}` } }
+  }
+  if (typeof src.url === 'string' && src.url.length > 0) {
+    return { type: 'image_url', image_url: { url: src.url } }
+  }
+  return null
+}
+
+/** Cheap probe so the capability decision is only taken when it matters. */
+function contentHasImageBlock(content: unknown): boolean {
+  return Array.isArray(content)
+    && (content as any[]).some(b => b && typeof b === 'object' && b.type === 'image')
+}
+
+function collectImageParts(content: unknown): OpenAIImagePart[] {
+  if (!Array.isArray(content)) return []
+  const out: OpenAIImagePart[] = []
+  for (const b of content as any[]) {
+    if (!b || typeof b !== 'object' || b.type !== 'image') continue
+    const part = toOpenAIImagePart(b)
+    if (part) out.push(part)
+  }
+  return out
+}
+
+/**
+ * @param imagesSentSeparately true when the caller is also emitting the
+ *   images as real `image_url` parts in a following user message, so the
+ *   string should point at them instead of announcing they were dropped.
+ */
+function stringifyToolContent(
+  content: unknown,
+  imagesSentSeparately = false,
+): string {
+  if (typeof content === 'string') return content
+  if (Array.isArray(content)) {
+    const parts: string[] = []
+    for (const b of content as any[]) {
+      if (b && typeof b === 'object') {
+        if ('text' in b && typeof b.text === 'string') parts.push(b.text)
+        else if (isMediaBlock(b)) {
+          parts.push(
+            imagesSentSeparately && b.type === 'image'
+              ? '[image attached below]'
+              : renderMediaForTextLane(b),
+          )
+        }
+        else parts.push(JSON.stringify(b))
+      }
+    }
+    return parts.join('\n')
+  }
+  return JSON.stringify(content ?? '')
+}
+
+// ─── Singleton Export ────────────────────────────────────────────
+
+export const openaiCompatLane = new OpenAICompatLane()

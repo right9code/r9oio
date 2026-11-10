@@ -1,0 +1,176 @@
+{
+  "name": "tau-vscode",
+  "displayName": "Tau",
+  "description": "Tau companion for VS Code: one-click launch with full IDE awareness - diagnostics, inline diffs, selection context, and provider switching.",
+  "version": "0.6.0",
+  "publisher": "devnull-bootloader",
+  "engines": {
+    "vscode": "^1.95.0"
+  },
+  "categories": [
+    "AI",
+    "Chat",
+    "Themes",
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./src/extension.js",
+  "files": [
+    "README.md",
+    "media/**",
+    "src/extension.js",
+    "src/presentation.js",
+    "src/state.js",
+    "src/companion/**/*.js",
+    "themes/**"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "claudex.start",
+        "title": "Tau: Launch in Terminal",
+        "category": "Tau"
+      },
+      {
+        "command": "claudex.startInWorkspaceRoot",
+        "title": "Tau: Launch in Workspace Root",
+        "category": "Tau"
+      },
+      {
+        "command": "claudex.openDocs",
+        "title": "Tau: Open Repository",
+        "category": "Tau"
+      },
+      {
+        "command": "claudex.openSetupDocs",
+        "title": "Tau: Open Setup Guide",
+        "category": "Tau"
+      },
+      {
+        "command": "claudex.openWorkspaceProfile",
+        "title": "Tau: Open Workspace Profile",
+        "category": "Tau"
+      },
+      {
+        "command": "claudex.openControlCenter",
+        "title": "Tau: Open Control Center",
+        "category": "Tau"
+      },
+      {
+        "command": "claudex.switchProvider",
+        "title": "Tau: Switch Provider",
+        "category": "Tau"
+      },
+      {
+        "command": "claudex.acceptDiff",
+        "title": "Tau: Accept Diff",
+        "category": "Tau",
+        "icon": "$(check)"
+      },
+      {
+        "command": "claudex.rejectDiff",
+        "title": "Tau: Reject Diff",
+        "category": "Tau",
+        "icon": "$(close)"
+      }
+    ],
+    "menus": {
+      "editor/title": [
+        {
+          "command": "claudex.acceptDiff",
+          "when": "claudex.diff.isVisible",
+          "group": "navigation@1"
+        },
+        {
+          "command": "claudex.rejectDiff",
+          "when": "claudex.diff.isVisible",
+          "group": "navigation@2"
+        }
+      ]
+    },
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "claudex",
+          "title": "Tau",
+          "icon": "media/claudex.svg"
+        }
+      ]
+    },
+    "views": {
+      "claudex": [
+        {
+          "id": "claudex.controlCenter",
+          "name": "Control Center",
+          "type": "webview"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Tau",
+      "properties": {
+        "claudex.launchCommand": {
+          "type": "string",
+          "default": "tau",
+          "description": "Command run in the integrated terminal when launching Tau."
+        },
+        "claudex.terminalName": {
+          "type": "string",
+          "default": "Tau",
+          "description": "Integrated terminal tab name for Tau sessions."
+        },
+        "claudex.activeProvider": {
+          "type": "string",
+          "default": "",
+          "enum": ["", "anthropic", "openai", "gemini", "openrouter", "groq", "nim", "deepseek", "ollama"],
+          "enumDescriptions": [
+            "Auto-detect from environment",
+            "Anthropic (first-party)",
+            "OpenAI",
+            "Google Gemini",
+            "OpenRouter",
+            "Groq",
+            "NVIDIA NIM",
+            "DeepSeek",
+            "Ollama (local)"
+          ],
+          "description": "Active LLM provider. Sets CLAUDE_CODE_USE_<PROVIDER>=1 in launched terminals."
+        }
+      }
+    },
+    "themes": [
+      {
+        "label": "Tau Dark",
+        "uiTheme": "vs-dark",
+        "path": "./themes/claudex-dark.json"
+      },
+      {
+        "label": "Tau Light",
+        "uiTheme": "vs",
+        "path": "./themes/claudex-light.json"
+      }
+    ]
+  },
+  "scripts": {
+    "test": "node --test ./src/*.test.js ./src/companion/*.test.js ./src/companion/handlers/*.test.js",
+    "lint": "node ./scripts/lint.js",
+    "package": "npx @vscode/vsce package"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "keywords": [
+    "tau",
+    "multi-provider",
+    "terminal",
+    "theme",
+    "cli",
+    "llm",
+    "openai",
+    "gemini",
+    "ollama"
+  ],
+  "license": "MIT"
+}

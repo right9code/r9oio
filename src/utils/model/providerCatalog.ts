@@ -1,0 +1,1208 @@
+import type { ModelInfo } from '../../services/api/providers/base_provider.js'
+import { resolveProviderAuth } from '../../services/api/auth/provider_auth.js'
+import { getProvider } from '../../services/api/providers/providerShim.js'
+import type { EffortLevel } from '../effort.js'
+import { validateProviderAuth } from '../auth.js'
+import {
+  getOllamaCatalog,
+  type OllamaCatalog,
+  type OllamaModelInfo,
+} from './ollamaCatalog.js'
+import {
+  NIM_PROVIDER_GROUPS,
+  type NimModelEntry,
+} from './nim_catalog.js'
+import {
+  SELECTABLE_PROVIDERS,
+  type APIProvider,
+  getAPIProvider,
+  PROVIDER_DISPLAY_NAMES,
+} from './providers.js'
+import {
+  getCustomProviders,
+  getCustomProvider,
+  getCustomProviderApiKey,
+  getCustomProviderBaseUrl,
+} from '../customProviders.js'
+import { recordProviderModelContextWindows } from './contextWindows.js'
+import { getStoredCatalogAgeMs } from './contextWindowStore.js'
+import { logForDebugging } from '../debug.js'
+import { isEssentialTrafficOnly } from '../privacyLevel.js'
+import { modelSupportsReasoning } from './openaiReasoning.js'
+import {
+  CURSOR_ORDERED_MODEL_GROUPS,
+  type CursorModelGroup,
+  type CursorModelSection,
+  type CursorVariantTag,
+} from '../../lanes/cursor/catalog.js'
+import { inferProviderLabelFromModelId } from './openrouterCatalog.js'
+import { warmOpenRouterReasoningCatalog } from './openrouterReasoningCatalog.js'
+import { getOpencodeContextWindow, waitForOpencodeModelsDev } from './opencodeModelsDevCatalog.js'
+import {
+  VOICE_CONVERSATION_LABEL,
+  DEFAULT_LIVE_VOICE,
+  LIVE_VOICE_OPTIONS,
+  VOICE_CONVERSATION_PROVIDER,
+} from '../../voice/voiceConversation.js'
+import {
+  encodeClineEffortVariant,
+  getClineEffort,
+  getClineEffortLabel,
+  getClineThinkingLadder,
+  parseClineEffortVariant,
+  type ClineEffort,
+} from './clineThinking.js'
+import { isClinePassProvider } from './clinePassCatalog.js'
+import {
+  ANTIGRAVITY_CLAUDE_DEFAULT_EFFORT,
+  ANTIGRAVITY_CLAUDE_EFFORTS,
+  antigravityClaudeEffortLabel,
+  antigravityClaudeTierModelId,
+  parseAntigravityClaudeTier,
+  type AntigravityClaudeTierModel,
+} from './antigravityClaudeTiers.js'
+
+/** Longest the picker waits for OpenCode's ladders when none are on disk. */
+const OPENCODE_MODELS_DEV_WAIT_MS = 8_000
+
+/**
+ * A browsable provider is either a built-in/selectable provider id or the
+ * synthetic voice-conversation entry. User-defined custom provider ids flow
+ * through the same path but are typed as the widened
+ * {@link AnyBrowsableModelProvider} at the dynamic boundaries, so the narrow
+ * union keeps its exhaustiveness for the built-in tables.
+ */
+export type BrowsableModelProvider =
+  | APIProvider
+  | typeof VOICE_CONVERSATION_PROVIDER
+
+/** The browsable provider union widened to include custom provider ids. */
+export type AnyBrowsableModelProvider = BrowsableModelProvider | string
+
+export const BROWSABLE_MODEL_PROVIDERS: readonly BrowsableModelProvider[] =
+  [...SELECTABLE_PROVIDERS, VOICE_CONVERSATION_PROVIDER]
+
+/**
+ * The full browsable provider list for this session: the static built-ins
+ * followed by the user's custom providers. The picker reads this instead of
+ * BROWSABLE_MODEL_PROVIDERS so custom providers appear (at the bottom) and
+ * stay selectable. Custom ids are appended in declaration order.
+ */
+export function getBrowsableModelProviders(): AnyBrowsableModelProvider[] {
+  return [
+    ...BROWSABLE_MODEL_PROVIDERS,
+    ...getCustomProviders().map(provider => provider.id),
+  ]
+}
+
+/** True for a user-defined custom provider id (not a built-in). */
+export function isCustomBrowsableProvider(provider: string): boolean {
+  return !BROWSABLE_MODEL_PROVIDERS.includes(provider as BrowsableModelProvider)
+    && getCustomProvider(provider) !== null
+}
+
+export function isVoiceConversationProvider(
+  provider: AnyBrowsableModelProvider,
+): provider is typeof VOICE_CONVERSATION_PROVIDER {
+  return provider === VOICE_CONVERSATION_PROVIDER
+}
+
+export function getDefaultBrowsableProvider(
+  preferredProvider: APIProvider,
+): BrowsableModelProvider {
+  if (getBrowsableModelProviders().includes(preferredProvider)) {
+    return preferredProvider
+  }
+
+  return (
+    BROWSABLE_MODEL_PROVIDERS.find(provider =>
+      !isVoiceConversationProvider(provider) && validateProviderAuth(provider).valid,
+    ) ?? 'firstParty'
+  )
+}
+
+function normalizeProviderQueryToken(
+  token: string,
+): AnyBrowsableModelProvider | null {
+  const normalized = token.trim().toLowerCase()
+  const alias: Record<string, BrowsableModelProvider> = {
+    anthropic: 'firstParty',
+    claude: 'firstParty',
+    firstparty: 'firstParty',
+    'first-party': 'firstParty',
+    voice: VOICE_CONVERSATION_PROVIDER,
+    voiceconversation: VOICE_CONVERSATION_PROVIDER,
+    'voice-conversation': VOICE_CONVERSATION_PROVIDER,
+    kimi: 'moonshot',
+    moonshotai: 'moonshot',
+    'moonshot-ai': 'moonshot',
+    moonshoot: 'moonshot',
+    moonshootai: 'moonshot',
+    minimaxai: 'minimax',
+    'minimax-ai': 'minimax',
+    'mini-max': 'minimax',
+    // `qwen` is deliberately absent: `/models qwen` is documented as a
+    // search of the active provider's catalogue, and claiming the token
+    // here would silently turn it into a provider switch.
+    dashscope: 'alibaba',
+    modelstudio: 'alibaba',
+    'model-studio': 'alibaba',
+    aliyun: 'alibaba',
+    bailian: 'alibaba',
+    tongyi: 'alibaba',
+    mistralai: 'mistral',
+    'mistral-ai': 'mistral',
+    lm: 'lmstudio',
+    lmstudio: 'lmstudio',
+    'lm-studio': 'lmstudio',
+    modelrouter: 'modelrouter',
+    model_router: 'modelrouter',
+    'model-router': 'modelrouter',
+    lxg2it: 'modelrouter',
+    lxg: 'modelrouter',
+    'vercel-ai': 'vercel',
+    'vercel-ai-gateway': 'vercel',
+    'ai-gateway': 'vercel',
+    requestyai: 'requesty',
+    'requesty-ai': 'requesty',
+    opencodezen: 'opencode',
+    'opencode-zen': 'opencode',
+    opencode_zen: 'opencode',
+    zen: 'opencode',
+    'opencode-go': 'opencodego',
+    opencode_go: 'opencodego',
+    ocgo: 'opencodego',
+    fireworksai: 'fireworks',
+    'fireworks-ai': 'fireworks',
+    fw: 'fireworks',
+    cloudflare: 'cloudflare',
+    cloudflareworkersai: 'cloudflare',
+    'cloudflare-workers-ai': 'cloudflare',
+    cloudflare_workers_ai: 'cloudflare',
+    workersai: 'cloudflare',
+    'workers-ai': 'cloudflare',
+    cf: 'cloudflare',
+    commandcode: 'commandcode',
+    'command-code': 'commandcode',
+    command_code: 'commandcode',
+    cmd: 'commandcode',
+    cmdcode: 'commandcode',
+    clineauth: 'cline',
+    'cline-auth': 'cline',
+    cline_auth: 'cline',
+    clinepass: 'clinepass',
+    'cline-pass': 'clinepass',
+    cline_pass: 'clinepass',
+  }
+  if (alias[normalized]) {
+    return alias[normalized]
+  }
+  return (
+    getBrowsableModelProviders().find(
+      provider => provider.toLowerCase() === normalized,
+    ) ?? null
+  )
+}
+
+export function parseProviderModelQuery(
+  rawArgs: string,
+  fallbackProvider: AnyBrowsableModelProvider,
+): { provider: AnyBrowsableModelProvider; query: string } {
+  const args = rawArgs.trim()
+  if (!args) {
+    return { provider: fallbackProvider, query: '' }
+  }
+
+  const colonIndex = args.indexOf(':')
+  if (colonIndex > 0) {
+    const providerCandidate = normalizeProviderQueryToken(
+      args.slice(0, colonIndex),
+    )
+    if (providerCandidate) {
+      return {
+        provider: providerCandidate,
+        query: args.slice(colonIndex + 1).trim(),
+      }
+    }
+  }
+
+  const [firstToken, ...rest] = args.split(/\s+/)
+  const providerCandidate = firstToken
+    ? normalizeProviderQueryToken(firstToken)
+    : null
+  if (providerCandidate) {
+    return {
+      provider: providerCandidate,
+      query: rest.join(' ').trim(),
+    }
+  }
+
+  return { provider: fallbackProvider, query: args }
+}
+
+/** How long a persisted catalogue is trusted before a background re-fetch. */
+const CONTEXT_WINDOW_REFRESH_TTL_MS = 24 * 60 * 60 * 1000
+
+/**
+ * Prime the persistent context-window store for the active provider.
+ *
+ * `recordProviderModelContextWindows` only ever ran from the /models picker,
+ * so a user who never opened it resolved every model through the static tables
+ * — and anything missing from them silently became
+ * MODEL_CONTEXT_WINDOW_DEFAULT. Fetching the catalogue once in the background
+ * gives the store the provider's own numbers, which then survive into later
+ * sessions, so new models get a correct window without a table edit.
+ *
+ * Fire-and-forget from startup: never awaited, never throws, and skipped
+ * entirely while a recent catalogue is already on disk, so the steady state
+ * costs no network at all.
+ */
+export async function refreshProviderContextWindows(): Promise<void> {
+  try {
+    if (isEssentialTrafficOnly()) {
+      return
+    }
+    const provider = getAPIProvider()
+    // The picker's own provider set — the one `loadProviderModels` is built for.
+    if (!SELECTABLE_PROVIDERS.includes(provider)) {
+      return
+    }
+    if (provider === 'opencode' || provider === 'opencodego') {
+      // An old durable window must not prevent the metadata format upgrade.
+      await waitForOpencodeModelsDev(OPENCODE_MODELS_DEV_WAIT_MS)
+    }
+    const ageMs = getStoredCatalogAgeMs(provider)
+    if (ageMs !== undefined && ageMs < CONTEXT_WINDOW_REFRESH_TTL_MS) {
+      return
+    }
+    await loadProviderModels(provider)
+  } catch (error) {
+    logForDebugging(
+      `[contextWindowStore] catalog refresh failed: ${error instanceof Error ? error.message : 'unknown'}`,
+    )
+  }
+}
+
+export async function loadProviderModels(
+  provider: AnyBrowsableModelProvider,
+): Promise<ModelInfo[]> {
+  if (isVoiceConversationProvider(provider)) {
+    return LIVE_VOICE_OPTIONS.map(voice => ({
+      id: voice.value,
+      name: voice.label,
+      tags: voice.value === DEFAULT_LIVE_VOICE ? ['recommended' as const] : [],
+      provider: VOICE_CONVERSATION_LABEL,
+    }))
+  }
+
+  if (provider === 'firstParty') {
+    const models = ANTHROPIC_MODELS.map(model => ({
+      id: model.id,
+      name: model.name,
+      tags: model.tags,
+      contextWindow: model.contextWindow,
+    }))
+    recordProviderModelContextWindows(provider, models)
+    return models
+  }
+
+  // Custom providers are not resolved through the built-in provider registry
+  // (no `getProvider(id)` shim, no auth table). Merge the declared catalog
+  // with whatever the server advertises, so an unlisted endpoint still shows
+  // at least its declared rows.
+  if (isCustomBrowsableProvider(provider)) {
+    return loadCustomProviderModels(provider)
+  }
+
+  // Past the custom guard every remaining id is a built-in provider.
+  const builtin = provider as APIProvider
+
+  await resolveProviderAuth(builtin)
+
+  const [upstreamModels] = await Promise.all([
+    getProvider(builtin).listModels(),
+    // OpenCode's thinking chips are drawn from the ladder models.dev states
+    // per row. Only a machine with no copy yet waits, alongside a fetch the
+    // user is already waiting on; a due refresh otherwise runs behind it.
+    provider === 'opencode' || provider === 'opencodego'
+      ? waitForOpencodeModelsDev(OPENCODE_MODELS_DEV_WAIT_MS)
+      : undefined,
+  ])
+  const models = builtin === 'opencode' || builtin === 'opencodego'
+    ? upstreamModels.map(model => {
+        const contextWindow = getOpencodeContextWindow(builtin, model.id)
+        return contextWindow === undefined ? model : { ...model, contextWindow }
+      })
+    : upstreamModels
+  if (builtin === 'openrouter') {
+    // OpenRouter states each row's reasoning ladder in its own catalogue, and
+    // the picker draws those chips synchronously. Warming here — alongside a
+    // fetch the user is already waiting on — is what makes the ladder correct
+    // on the FIRST /models visit rather than after a keypress.
+    await warmOpenRouterReasoningCatalog()
+  }
+  recordProviderModelContextWindows(builtin, models)
+  if ([
+    'cursor',
+    'cline',
+    'clinepass',
+    'deepseek',
+    'glm',
+    'moonshot',
+    'minimax',
+    'antigravity',
+    'lxd',
+    'mimo',
+    'alibaba',
+    'xai',
+    'meta',
+  ].includes(builtin)) {
+    // Cursor's native picker order is provider-owned and should not be
+    // alphabetized away; the ids intentionally mirror Cursor's own model surface.
+    // Cline, GLM, Moonshot, MiniMax, Antigravity, LXD and Alibaba also return
+    // curated, provider-owned orders (LXD leads with its cheap general-purpose
+    // rows and trails with the limited-time event rows; Alibaba leads with the
+    // newest described model and trails with ids models.dev has not described).
+    // xAI lists newest first, as its catalog states release dates; so does Meta.
+    return models
+  }
+  if (builtin === 'openrouter' || builtin === 'nim' || builtin === 'modelrouter' || builtin === 'vercel' || builtin === 'requesty' || builtin === 'opencode' || builtin === 'commandcode') {
+    return sortProviderModels(
+      models.map(model => enrichUpstreamProviderModel(builtin, model)),
+    )
+  }
+  return sortProviderModels(models)
+}
+
+/** How long a custom provider's /v1/models fetch may take before giving up. */
+const CUSTOM_PROVIDER_MODELS_TIMEOUT_MS = 4_000
+
+/**
+ * Models for a user-defined custom provider: the declared `models` array
+ * merged with what the endpoint advertises. Declared rows win on id collision
+ * so a user can pin a friendly display name over an opaque upstream id.
+ *
+ * A keyless provider (no env var, no stored key, no auth needed) still lists
+ * its declared models; a fetch failure is non-fatal and simply yields the
+ * declared set (or a single placeholder row) so the picker never shows an
+ * empty screen for a provider the user just created.
+ */
+async function loadCustomProviderModels(
+  provider: string,
+): Promise<ModelInfo[]> {
+  const custom = getCustomProvider(provider)
+  const declared: ModelInfo[] = (custom?.models ?? []).map(model => ({
+    id: model.id,
+    name: model.name ?? model.id,
+  }))
+
+  const fetched = await fetchCustomProviderModels(provider)
+
+  const merged = new Map<string, ModelInfo>()
+  for (const model of fetched) merged.set(model.id, model)
+  // Declared rows override fetched ones (friendlier names, pinned ids).
+  for (const model of declared) merged.set(model.id, model)
+
+  const models = Array.from(merged.values())
+  if (models.length === 0) {
+    return [{ id: 'default', name: 'default' }]
+  }
+  return models
+}
+
+/**
+ * Best-effort GET of `<baseUrl>/v1/models` for an OpenAI-compatible custom
+ * provider. Returns [] on any error (network, timeout, non-JSON, bad shape),
+ * so callers fall back to the declared catalog.
+ */
+async function fetchCustomProviderModels(
+  provider: string,
+): Promise<ModelInfo[]> {
+  const baseUrl = getCustomProviderBaseUrl(provider)
+  if (!baseUrl) return []
+
+  // Accept both `https://host` and `https://host/v1` in the stored base URL.
+  const root = baseUrl.replace(/\/+$/, '').replace(/\/v1$/, '')
+  const url = `${root}/v1/models`
+
+  const key = getCustomProviderApiKey(provider)
+  const headers: Record<string, string> = { accept: 'application/json' }
+  if (key) headers.authorization = `Bearer ${key}`
+
+  try {
+    const response = await fetch(url, {
+      headers,
+      signal: AbortSignal.timeout(CUSTOM_PROVIDER_MODELS_TIMEOUT_MS),
+    })
+    if (!response.ok) return []
+    const payload = (await response.json()) as
+      | { data?: Array<{ id?: unknown; name?: unknown }> }
+      | Array<{ id?: unknown; name?: unknown }>
+    const rows = Array.isArray(payload) ? payload : payload.data
+    if (!Array.isArray(rows)) return []
+    return rows
+      .filter((row): row is { id: string; name?: unknown } =>
+        !!row && typeof row.id === 'string' && row.id.length > 0,
+      )
+      .map(row => ({
+        id: row.id,
+        name: typeof row.name === 'string' && row.name ? row.name : row.id,
+      }))
+  } catch {
+    return []
+  }
+}
+
+/**
+ * A sectioned section of models to render inside the picker. Sections are
+ * header-labelled groups with optional capability badges on each row.
+ */
+export interface ProviderModelSection {
+  id: string
+  title: string
+  accent?: 'cloud' | 'local' | 'toolless'
+  models: SectionedModelInfo[]
+}
+
+export interface SectionedModelInfo extends ModelInfo {
+  /** Optional tags to render beside the model name (tools, thinking, etc). */
+  tags?: readonly ModelTag[]
+  /**
+   * Provider-owned concrete variants for this display row. Cursor uses this
+   * to keep thinking/high variants separate from OpenAI's reasoning setting.
+   */
+  variants?: readonly ModelVariantInfo[]
+  /** Optional provider-owned default variant id for picker initialization. */
+  defaultVariantId?: string
+  /** True when the model requires an extra pull/auth step before use. */
+  needsPull?: boolean
+}
+
+export interface ModelVariantInfo extends ModelInfo {
+  label: string
+  tags?: readonly ModelTag[]
+}
+
+export type ModelTag =
+  | 'cloud'
+  | 'local'
+  | 'tools'
+  | 'no-tools'
+  | 'thinking'
+  | 'reasoning'
+  | 'recommended'
+  | 'free'
+  | 'pro'
+  /** Needs a paid Google AI Pro or Ultra plan (Antigravity). */
+  | 'pro-ultra'
+  | 'fast'
+  | 'pulled'
+  | 'missing'
+
+type AnthropicModelInfo = {
+  id: string
+  name: string
+  tags: readonly ModelTag[]
+  effortLevels?: readonly EffortLevel[]
+  defaultEffort?: EffortLevel
+  contextWindow?: number
+}
+
+const ANTHROPIC_EFFORT_SEPARATOR = '::effort='
+const ANTHROPIC_STANDARD_EFFORTS = [
+  'low',
+  'medium',
+  'high',
+  'max',
+] as const satisfies readonly EffortLevel[]
+const ANTHROPIC_EXTENDED_EFFORTS = [
+  'low',
+  'medium',
+  'high',
+  'xhigh',
+  'max',
+] as const satisfies readonly EffortLevel[]
+
+// Opus 4.8 adds the 'ultracode' top tier (native Anthropic path only — selecting
+// an Anthropic model here switches the active provider to firstParty, where
+// modelSupportsUltracodeEffort() is satisfied and it maps to 'max' on the wire).
+const ANTHROPIC_OPUS_48_EFFORTS = [
+  'low',
+  'medium',
+  'high',
+  'xhigh',
+  'max',
+  'ultracode',
+] as const satisfies readonly EffortLevel[]
+
+const ANTHROPIC_MODELS: readonly AnthropicModelInfo[] = [
+  {
+    // Thinking is always on for Opus 5.5 (disabling it is a 400), so effort is
+    // its only control; the API applies `medium` when a request names none.
+    id: 'claude-opus-5-5',
+    name: 'Claude Opus 5.5',
+    tags: ['recommended', 'reasoning'],
+    effortLevels: ANTHROPIC_EXTENDED_EFFORTS,
+    defaultEffort: 'medium',
+    contextWindow: 1_000_000,
+  },
+  {
+    id: 'claude-opus-5',
+    name: 'Claude Opus 5',
+    tags: ['reasoning'],
+    effortLevels: ANTHROPIC_EXTENDED_EFFORTS,
+    defaultEffort: 'high',
+    contextWindow: 1_000_000,
+  },
+  {
+    id: 'claude-opus-4-8',
+    name: 'Claude Opus 4.8',
+    tags: ['reasoning'],
+    effortLevels: ANTHROPIC_OPUS_48_EFFORTS,
+    defaultEffort: 'medium',
+    contextWindow: 1_000_000,
+  },
+  {
+    id: 'claude-sonnet-5',
+    name: 'Claude Sonnet 5',
+    tags: ['reasoning'],
+    effortLevels: ANTHROPIC_EXTENDED_EFFORTS,
+    defaultEffort: 'high',
+    contextWindow: 1_000_000,
+  },
+  {
+    id: 'claude-sonnet-4-6',
+    name: 'Claude Sonnet 4.6',
+    tags: ['reasoning'],
+    effortLevels: ANTHROPIC_STANDARD_EFFORTS,
+    defaultEffort: 'high',
+  },
+  {
+    id: 'claude-haiku-4-5',
+    name: 'Claude Haiku 4.5',
+    tags: ['fast'],
+  },
+]
+
+export type ProviderModelSelection = {
+  modelId: string
+  effort?: EffortLevel
+  clineEffort?: ClineEffort
+}
+
+function encodeAnthropicEffortVariant(
+  modelId: string,
+  effort: EffortLevel,
+): string {
+  return `${modelId}${ANTHROPIC_EFFORT_SEPARATOR}${effort}`
+}
+
+function isAnthropicEffortLevel(value: string): value is EffortLevel {
+  return (ANTHROPIC_OPUS_48_EFFORTS as readonly string[]).includes(value)
+}
+
+export function resolveProviderModelSelection(
+  provider: AnyBrowsableModelProvider,
+  selectedModelId: string,
+): ProviderModelSelection {
+  if (isClinePassProvider(provider)) {
+    const parsed = parseClineEffortVariant(selectedModelId)
+    return {
+      modelId: parsed.modelId,
+      ...(parsed.effort ? { clineEffort: parsed.effort } : {}),
+    }
+  }
+
+  if (provider !== 'firstParty') {
+    return { modelId: selectedModelId }
+  }
+
+  const markerIndex = selectedModelId.lastIndexOf(ANTHROPIC_EFFORT_SEPARATOR)
+  if (markerIndex < 0) {
+    return { modelId: selectedModelId }
+  }
+
+  const modelId = selectedModelId.slice(0, markerIndex)
+  const effort = selectedModelId.slice(
+    markerIndex + ANTHROPIC_EFFORT_SEPARATOR.length,
+  )
+  if (!modelId || !isAnthropicEffortLevel(effort)) {
+    return { modelId: selectedModelId }
+  }
+  const model = ANTHROPIC_MODELS.find(candidate => candidate.id === modelId)
+  if (!model?.effortLevels?.includes(effort)) {
+    return { modelId }
+  }
+  return { modelId, effort }
+}
+
+/**
+ * Load a provider's models split into sections. Ollama splits by local/cloud,
+ * OpenRouter and NIM split by upstream provider, and OpenAI splits reasoning
+ * models from the rest.
+ */
+export async function loadProviderModelSections(
+  provider: AnyBrowsableModelProvider,
+  options: { currentModel?: string } = {},
+): Promise<ProviderModelSection[]> {
+  if (isVoiceConversationProvider(provider)) {
+    return [
+      {
+        id: 'voice-conversation',
+        title: VOICE_CONVERSATION_LABEL,
+        accent: 'cloud',
+        models: LIVE_VOICE_OPTIONS.map(voice => ({
+          id: voice.value,
+          name: voice.label,
+          tags: voice.value === DEFAULT_LIVE_VOICE ? ['recommended' as const] : [],
+          provider: VOICE_CONVERSATION_LABEL,
+        })),
+      },
+    ]
+  }
+
+  if (provider === 'firstParty') {
+    return buildAnthropicSections()
+  }
+
+  // Custom providers get one flat section of their declared + fetched models;
+  // no built-in sectioning (Ollama/OpenRouter/Cursor) applies to them.
+  if (isCustomBrowsableProvider(provider)) {
+    const models = await loadCustomProviderModels(provider)
+    return [
+      {
+        id: 'all',
+        title: 'Models',
+        models: models.map(toProviderSectionedModel),
+      },
+    ]
+  }
+
+  // Past the custom guard every remaining id is a built-in provider.
+  const builtin = provider as APIProvider
+
+  if (builtin === 'ollama') {
+    const catalog = await getOllamaCatalog()
+    return buildOllamaSections(catalog)
+  }
+
+  if (builtin === 'lmstudio') {
+    const models = await loadProviderModels(builtin)
+    return [
+      {
+        id: 'local',
+        title: 'Local models',
+        accent: 'local',
+        models: models.map(model => ({
+          ...model,
+          tags: mergeModelTags(pickKnownModelTags(model), ['local', 'tools']),
+        })),
+      },
+    ]
+  }
+
+  if (builtin === 'cursor') {
+    await resolveProviderAuth(builtin)
+    return buildCursorSections()
+  }
+
+  const models = await loadProviderModels(builtin)
+
+  if (isClinePassProvider(builtin)) {
+    return buildClinePassSections(models)
+  }
+
+  if (builtin === 'openrouter' || builtin === 'nim' || builtin === 'modelrouter' || builtin === 'vercel' || builtin === 'requesty' || builtin === 'opencode' || builtin === 'commandcode') {
+    return buildUpstreamProviderSections(builtin, models)
+  }
+
+  // For OpenAI: split into Codex (reasoning) and other models.
+  if (builtin === 'openai') {
+    const codex: SectionedModelInfo[] = []
+    const other: SectionedModelInfo[] = []
+    for (const m of models) {
+      const tags = mergeModelTags(
+        pickKnownModelTags(m),
+        modelSupportsReasoning(m.id) ? ['reasoning'] : undefined,
+      )
+      const entry: SectionedModelInfo = { ...m, tags: tags.length > 0 ? tags : undefined }
+      if (modelSupportsReasoning(m.id)) {
+        codex.push(entry)
+      } else {
+        other.push(entry)
+      }
+    }
+    const sections: ProviderModelSection[] = []
+    if (codex.length > 0) {
+      sections.push({ id: 'codex', title: 'Codex models  ← → reasoning level', models: codex })
+    }
+    if (other.length > 0) {
+      sections.push({ id: 'other', title: 'Other models', models: other })
+    }
+    return sections.length > 0
+      ? sections
+      : [{ id: 'all', title: 'OpenAI models', models: models.map(toProviderSectionedModel) }]
+  }
+
+  return [
+    {
+      id: 'all',
+      title: `${getProviderBrowseLabel(builtin)} models`,
+      models: builtin === 'antigravity'
+        ? toAntigravitySectionedModels(models, options.currentModel)
+        : models.map(toProviderSectionedModel),
+    },
+  ]
+}
+
+/**
+ * Antigravity lists each Claude 5.5 model once per effort level. Show one row
+ * per model whose arrow-key chip picks the level, as the Anthropic rows pick
+ * effort; every other Antigravity row is listed as before. The chip opens on
+ * the level the session runs, so it never reads High while Low is in use.
+ */
+function toAntigravitySectionedModels(
+  models: readonly ModelInfo[],
+  currentModel?: string,
+): SectionedModelInfo[] {
+  const levelsByModel = new Map<string, ModelInfo[]>()
+  for (const model of models) {
+    const tier = parseAntigravityClaudeTier(model.id)
+    if (!tier) continue
+    const levels = levelsByModel.get(tier.model.id) ?? []
+    levels.push(model)
+    levelsByModel.set(tier.model.id, levels)
+  }
+
+  const rows: SectionedModelInfo[] = []
+  for (const model of models) {
+    const tier = parseAntigravityClaudeTier(model.id)
+    if (!tier) {
+      rows.push(toProviderSectionedModel(model))
+      continue
+    }
+    // The row takes the position of the model's first level.
+    const levels = levelsByModel.get(tier.model.id)
+    if (!levels) continue
+    levelsByModel.delete(tier.model.id)
+    rows.push(toAntigravityClaudeTierRow(tier.model, levels, currentModel))
+  }
+  return rows
+}
+
+function toAntigravityClaudeTierRow(
+  model: AntigravityClaudeTierModel,
+  levels: readonly ModelInfo[],
+  currentModel?: string,
+): SectionedModelInfo {
+  const variants: ModelVariantInfo[] = ANTIGRAVITY_CLAUDE_EFFORTS.flatMap(effort => {
+    const level = levels.find(
+      candidate => parseAntigravityClaudeTier(candidate.id)?.effort === effort,
+    )
+    if (!level) return []
+    return [{
+      id: level.id,
+      name: level.name,
+      label: `${antigravityClaudeEffortLabel(effort)} effort`,
+      tags: pickKnownModelTags(level),
+    }]
+  })
+  const current = currentModel?.toLowerCase()
+  const defaultId = antigravityClaudeTierModelId(model, ANTIGRAVITY_CLAUDE_DEFAULT_EFFORT)
+  const defaultVariant = variants.find(variant => variant.id === current)
+    ?? variants.find(variant => variant.id === defaultId)
+    ?? variants[0]
+  return {
+    id: model.id,
+    name: model.name,
+    tags: mergeModelTags(...variants.map(variant => variant.tags)),
+    variants,
+    ...(defaultVariant ? { defaultVariantId: defaultVariant.id } : {}),
+  }
+}
+
+const CURSOR_SECTION_ORDER: readonly CursorModelSection[] = [
+  'recommended',
+  'cursor',
+  'openai',
+  'anthropic',
+  'other',
+]
+
+const CURSOR_SECTION_TITLES: Record<CursorModelSection, string> = {
+  recommended: 'Auto',
+  cursor: 'Cursor',
+  anthropic: 'Claude',
+  openai: 'OpenAI / Codex',
+  other: 'Others',
+}
+
+function buildAnthropicSections(): ProviderModelSection[] {
+  return [
+    {
+      id: 'claude',
+      title: 'Claude models  <- -> effort',
+      models: ANTHROPIC_MODELS.map(toAnthropicSectionedModel),
+    },
+  ]
+}
+
+function toAnthropicSectionedModel(model: AnthropicModelInfo): SectionedModelInfo {
+  const base: SectionedModelInfo = {
+    id: model.id,
+    name: model.name,
+    tags: model.tags,
+  }
+
+  if (!model.effortLevels || !model.defaultEffort) {
+    return base
+  }
+
+  return {
+    ...base,
+    defaultVariantId: encodeAnthropicEffortVariant(
+      model.id,
+      model.defaultEffort,
+    ),
+    variants: model.effortLevels.map(effort => ({
+      id: encodeAnthropicEffortVariant(model.id, effort),
+      name: `${model.name} (${effort} effort)`,
+      label: `${effort} effort`,
+      tags: ['reasoning'] as const,
+    })),
+  }
+}
+
+function buildClinePassSections(models: readonly ModelInfo[]): ProviderModelSection[] {
+  return [
+    {
+      id: 'cline-pass',
+      title: 'Cline Pass models  <- -> thinking',
+      accent: 'cloud',
+      models: models.map(toClinePassSectionedModel),
+    },
+  ]
+}
+
+function toClinePassSectionedModel(model: ModelInfo): SectionedModelInfo {
+  // Each model's own stops, from models.dev (clineThinking.ts): glm-5.3
+  // cycles Default/Low/High/Max, deepseek-v4-pro Off/Low/Medium/High/Extra High.
+  const ladder = getClineThinkingLadder(model.id)
+  if (!ladder) {
+    return {
+      ...model,
+      tags: mergeModelTags(
+        pickKnownModelTags(model)?.filter(tag => tag !== 'thinking'),
+        ['pro'] as const,
+      ),
+    }
+  }
+  const currentEffort = getClineEffort(model.id)
+  const defaultEffort = ladder.levels.includes(currentEffort)
+    ? currentEffort
+    : ladder.levels[0]!
+  const modelName = model.name && model.name !== model.id ? model.name : model.id
+
+  return {
+    ...model,
+    tags: mergeModelTags(pickKnownModelTags(model), ['thinking', 'pro'] as const),
+    defaultVariantId: encodeClineEffortVariant(model.id, defaultEffort),
+    variants: ladder.levels.map(effort => ({
+      id: encodeClineEffortVariant(model.id, effort),
+      name: `${modelName} (${getClineEffortLabel(effort, model.id)} thinking)`,
+      label: getClineEffortLabel(effort, model.id),
+      tags: effort === 'none'
+        ? (['pro'] as const)
+        : (['thinking', 'pro'] as const),
+    })),
+  }
+}
+
+function buildCursorSections(): ProviderModelSection[] {
+  const buckets: Record<CursorModelSection, SectionedModelInfo[]> = {
+    recommended: [],
+    cursor: [],
+    anthropic: [],
+    openai: [],
+    other: [],
+  }
+
+  for (const group of CURSOR_ORDERED_MODEL_GROUPS) {
+    buckets[group.section].push(toCursorSectionedModel(group))
+  }
+
+  return CURSOR_SECTION_ORDER
+    .map((section): ProviderModelSection => ({
+      id: `cursor-${section}`,
+      title: CURSOR_SECTION_TITLES[section],
+      accent: section === 'openai' ? 'cloud' : undefined,
+      models: buckets[section],
+    }))
+    .filter(section => section.models.length > 0)
+}
+
+function toCursorSectionedModel(group: CursorModelGroup): SectionedModelInfo {
+  const variants = group.variants.map(variant => ({
+    id: variant.id,
+    name: variant.name ?? `${group.name} ${variant.label}`,
+    label: variant.label,
+    tags: variant.tags?.map(toCursorModelTag),
+  }))
+
+  const tags = new Set<ModelTag>()
+  if (variants.some(variant => variant.tags?.includes('thinking'))) {
+    tags.add('thinking')
+  }
+  if (variants.some(variant => variant.tags?.includes('fast'))) {
+    tags.add('fast')
+  }
+
+  return {
+    id: group.id,
+    name: group.name,
+    variants,
+    ...(group.defaultVariantId ? { defaultVariantId: group.defaultVariantId } : {}),
+    tags: tags.size > 0 ? Array.from(tags) : undefined,
+  }
+}
+
+function toCursorModelTag(tag: CursorVariantTag): ModelTag {
+  return tag
+}
+
+function buildOllamaSections(catalog: OllamaCatalog): ProviderModelSection[] {
+  const sections: ProviderModelSection[] = []
+
+  if (catalog.cloud.length > 0) {
+    sections.push({
+      id: 'cloud',
+      title: 'Cloud models',
+      accent: 'cloud',
+      models: catalog.cloud.map(toSectionedModel),
+    })
+  }
+
+  if (catalog.local.length > 0) {
+    sections.push({
+      id: 'local',
+      title: 'Local models',
+      accent: 'local',
+      models: catalog.local.map(toSectionedModel),
+    })
+  }
+
+  if (catalog.toolless.length > 0) {
+    sections.push({
+      id: 'toolless',
+      title: 'Local models without tool support',
+      accent: 'toolless',
+      models: catalog.toolless.map(toSectionedModel),
+    })
+  }
+
+  return sections
+}
+
+function toSectionedModel(model: OllamaModelInfo): SectionedModelInfo {
+  const tags: ModelTag[] = []
+  tags.push(model.category === 'cloud' ? 'cloud' : 'local')
+  tags.push(model.supportsTools ? 'tools' : 'no-tools')
+  if (model.supportsThinking) tags.push('thinking')
+  if (model.category === 'cloud') {
+    tags.push(model.pulled ? 'pulled' : 'missing')
+  }
+
+  return {
+    id: model.id,
+    name: model.name,
+    tags,
+    needsPull: model.category === 'cloud' && !model.pulled,
+  }
+}
+
+export function filterProviderModels(
+  models: readonly ModelInfo[],
+  query: string,
+): ModelInfo[] {
+  const normalized = query.trim().toLowerCase()
+  if (!normalized) {
+    return [...models]
+  }
+
+  return models.filter(model => {
+    const tags = model.tags?.join(' ') ?? ''
+    const provider = model.provider ?? ''
+    const haystack = `${model.id} ${model.name ?? ''} ${provider} ${tags}`.toLowerCase()
+    return haystack.includes(normalized)
+  })
+}
+
+export function getProviderBrowseLabel(provider: AnyBrowsableModelProvider): string {
+  if (isVoiceConversationProvider(provider)) {
+    return VOICE_CONVERSATION_LABEL
+  }
+  const custom = getCustomProvider(provider)
+  if (custom) {
+    return custom.name
+  }
+  return PROVIDER_DISPLAY_NAMES[provider as APIProvider] ?? provider
+}
+
+function buildUpstreamProviderSections(
+  catalogProvider: BrowsableModelProvider,
+  models: readonly ModelInfo[],
+): ProviderModelSection[] {
+  const grouped = new Map<string, ModelInfo[]>()
+  for (const model of models) {
+    const enriched = enrichUpstreamProviderModel(catalogProvider, model)
+    const upstreamProvider = enriched.provider ?? getProviderBrowseLabel(catalogProvider)
+    const list = grouped.get(upstreamProvider) ?? []
+    list.push(enriched)
+    grouped.set(upstreamProvider, list)
+  }
+
+  return Array.from(grouped.entries())
+    .sort(([left], [right]) => compareSectionTitles(catalogProvider, left, right))
+    .map(([title, sectionModels]) => ({
+      id: sectionId(title),
+      title,
+      models: sortProviderModels(sectionModels).map(toProviderSectionedModel),
+    }))
+}
+
+function enrichUpstreamProviderModel(
+  catalogProvider: BrowsableModelProvider,
+  model: ModelInfo,
+): ModelInfo {
+  if (catalogProvider === 'nim') {
+    const catalog = NIM_MODEL_METADATA.get(model.id)
+    return {
+      ...model,
+      name: model.name && model.name !== model.id
+        ? model.name
+        : catalog?.model.name ?? model.name,
+      provider: catalog?.groupName
+        ?? model.provider
+        ?? inferProviderLabelFromModelId(model.id, getProviderBrowseLabel(catalogProvider)),
+    }
+  }
+
+  return {
+    ...model,
+    provider: model.provider
+      ?? inferProviderLabelFromModelId(model.id, getProviderBrowseLabel(catalogProvider)),
+  }
+}
+
+function compareSectionTitles(
+  catalogProvider: BrowsableModelProvider,
+  left: string,
+  right: string,
+): number {
+  if (catalogProvider === 'nim') {
+    const leftOrder = NIM_GROUP_ORDER.get(left) ?? Number.MAX_SAFE_INTEGER
+    const rightOrder = NIM_GROUP_ORDER.get(right) ?? Number.MAX_SAFE_INTEGER
+    if (leftOrder !== rightOrder) return leftOrder - rightOrder
+  }
+
+  return left.localeCompare(right)
+}
+
+function sectionId(title: string): string {
+  return title
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-|-$/g, '')
+    || 'provider'
+}
+
+function sortProviderModels(models: readonly ModelInfo[]): ModelInfo[] {
+  return [...models].sort((left, right) => {
+    const leftProvider = (left.provider ?? '').toLowerCase()
+    const rightProvider = (right.provider ?? '').toLowerCase()
+    if (leftProvider !== rightProvider) {
+      return leftProvider.localeCompare(rightProvider)
+    }
+
+    const leftFreeRank = left.tags?.includes('free') ? 0 : 1
+    const rightFreeRank = right.tags?.includes('free') ? 0 : 1
+    if (leftFreeRank !== rightFreeRank) {
+      return leftFreeRank - rightFreeRank
+    }
+
+    const leftName = (left.name || left.id).toLowerCase()
+    const rightName = (right.name || right.id).toLowerCase()
+
+    if (leftName !== rightName) {
+      return leftName.localeCompare(rightName)
+    }
+
+    return left.id.localeCompare(right.id)
+  })
+}
+
+const NIM_MODEL_METADATA = new Map<string, {
+  model: NimModelEntry
+  groupName: string
+}>(
+  NIM_PROVIDER_GROUPS.flatMap(group =>
+    group.models.map(model => [
+      model.id,
+      { model, groupName: group.name },
+    ] as const),
+  ),
+)
+
+const NIM_GROUP_ORDER = new Map(
+  NIM_PROVIDER_GROUPS.map((group, index) => [group.name, index] as const),
+)
+
+const KNOWN_MODEL_TAGS = new Set<ModelTag>([
+  'cloud',
+  'local',
+  'tools',
+  'no-tools',
+  'thinking',
+  'reasoning',
+  'recommended',
+  'free',
+  'pro',
+  'pro-ultra',
+  'fast',
+  'pulled',
+  'missing',
+])
+
+function isModelTag(tag: string): tag is ModelTag {
+  return KNOWN_MODEL_TAGS.has(tag as ModelTag)
+}
+
+function pickKnownModelTags(model: Pick<ModelInfo, 'tags'>): ModelTag[] | undefined {
+  if (!model.tags || model.tags.length === 0) {
+    return undefined
+  }
+
+  const tags = Array.from(new Set(model.tags.filter(isModelTag)))
+  return tags.length > 0 ? tags : undefined
+}
+
+function mergeModelTags(
+  ...tagGroups: Array<readonly ModelTag[] | undefined>
+): ModelTag[] {
+  const merged = new Set<ModelTag>()
+  for (const group of tagGroups) {
+    if (!group) continue
+    for (const tag of group) {
+      merged.add(tag)
+    }
+  }
+  return Array.from(merged)
+}
+
+function toProviderSectionedModel(model: ModelInfo): SectionedModelInfo {
+  const tags = pickKnownModelTags(model)
+  return {
+    ...model,
+    tags: tags ?? [],
+  }
+}

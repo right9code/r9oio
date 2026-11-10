@@ -1,0 +1,1464 @@
+import { createHash } from 'crypto'
+import { decodeToolArguments, toolDecodeFields } from '../../services/mcp/decodeStatus.js'
+import { logForDebugging } from '../../utils/debug.js'
+/**
+ * Codex Lane — Agent Loop + Provider-Shim Entry
+ *
+ * Two entry points, same pattern as the Gemini lane:
+ *
+ *   1. streamAsProvider(params) — single-turn, provider-shim-compatible.
+ *      Used by src/lanes/provider-bridge.ts. Issues ONE Responses API
+ *      call in the native idiom: POST /responses, apply_patch (freeform
+ *      custom tool), reasoning {effort,summary}, stable prompt_cache_key
+ *      for sticky cache routing, `store: false` except on Azure.
+ *
+ *   2. run(context) — future lane-owns-loop mode. Scaffolded but not
+ *      wired; Phase-2 migration target.
+ *
+ * Native Codex patterns speak the Responses API directly. Using Chat
+ * Completions on GPT-5/gpt-5-codex/o-series produces measurable quality
+ * regressions on tool-heavy agent workloads — the models are post-trained
+ * against response.* events, not chat.completion chunks.
+ *
+ * References:
+ *   - codex-rs/core/src/codex.rs (agent loop)
+ *   - codex-rs/core/src/client.rs (build_responses_request — store/include)
+ *   - codex-rs/codex-api/src/sse/responses.rs (event shapes)
+ *   - codex-rs/core/gpt-5.2-codex_prompt.md (system prompt)
+ */
+
+import type {
+  AnthropicStreamEvent,
+  ModelInfo,
+} from '../../services/api/providers/base_provider.js'
+import type {
+  Lane,
+  LaneRunContext,
+  LaneRunResult,
+  LaneProviderCallParams,
+  NormalizedUsage,
+} from '../types.js'
+import {
+  getCodexRegistrationByNativeName,
+  getCodexRegistrationForTool,
+  CODEX_TOOL_REGISTRY,
+} from './tools.js'
+import {
+  appendStrictParamsHint,
+  CODEX_TOOL_USAGE_RULES,
+} from '../shared/mcp_bridge.js'
+import { describeUnsendableMedia } from '../shared/media_blocks.js'
+import { statedWorkingDirectory } from '../shared/working_directory.js'
+import { toCodexToolParameters } from './tool_schema.js'
+import { codexReasoningForBlocks, type CodexReasoningState } from './reasoning.js'
+import { streamCodexWithNoOutputRetry } from './stream_retry.js'
+import { isOutputCapTruncation, laneStopReason } from '../shared/truncation.js'
+import {
+  createRetryableConnectionError,
+  isAbortError,
+  isRetryableProviderError,
+  isRetryableNetworkError,
+} from '../../services/api/transport_error.js'
+import {
+  codexApi,
+  CodexApiError,
+  type CodexInputItem,
+  type CodexContentPart,
+  type CodexStreamEvent,
+  type CodexReasoningConfig,
+  type CodexResponsesRequest,
+  type CodexToolSpec,
+  type CodexUsage,
+} from './api.js'
+import {
+  resolveOpenAIReasoningEffort,
+  resolveOpenAIRequestEffort,
+  modelSupportsReasoning,
+} from '../../utils/model/openaiReasoning.js'
+import { OPENAI_AGENT_MODEL, OPENAI_CODEX_MODELS } from '../../utils/model/openaiGptModels.js'
+
+// ─── Lane Implementation ─────────────────────────────────────────
+
+export class CodexLane implements Lane {
+  readonly name = 'codex'
+  readonly displayName = 'OpenAI Codex (Native Responses API)'
+
+  private _healthy = true
+
+  configure(opts: { apiKey?: string; baseUrl?: string; chatgptAccessToken?: string; chatgptAccountId?: string; chatgptIdToken?: string }): void {
+    codexApi.configure(opts)
+    this._healthy = codexApi.isConfigured
+  }
+
+  supportsModel(model: string): boolean {
+    const m = model.toLowerCase()
+    return (
+      m.startsWith('gpt-') ||
+      m.startsWith('o1') ||
+      m.startsWith('o3') ||
+      m.startsWith('o4') ||
+      m.startsWith('o5') ||
+      m.startsWith('codex-') ||
+      m.startsWith('gpt-5-codex') ||
+      m.includes('openai/')
+    )
+  }
+
+  // ── Provider-shim-compatible single-turn entry ──────────────────
+
+  async *streamAsProvider(
+    params: LaneProviderCallParams,
+  ): AsyncGenerator<AnthropicStreamEvent, NormalizedUsage> {
+    const { model, messages, system, tools, max_tokens, thinking, signal, sessionId } = params
+    // Resolve before selecting the singleton client's cache session. No await
+    // may separate that selection from capturing the request's cache key.
+    const effort = await resolveOpenAIRequestEffort(model, params.effortValue)
+
+    codexApi.setSessionCacheKey(sessionId)
+
+    // Assemble the full system text the upstream sent us, then split it
+    // into a stable (cache-eligible) prefix and a volatile (per-turn) tail
+    // so the Responses API `instructions` field stays byte-identical
+    // across turns. Without this split, env / git status / memory bleed
+    // into `instructions` each turn → the OpenAI prompt-cache prefix hash
+    // drifts → cache hits land partially or not at all (the user-reported
+    // "cache hits but unstable" pattern under heavy tool-call sessions).
+    //
+    // We mirror the same primary-marker / regex-fallback strategy
+    // gemini_provider.ts ships, since claudex doesn't emit the
+    // `__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__` marker for non-firstParty
+    // providers (`shouldUseGlobalCacheScope()` is firstParty-only).
+    const fullSystemText = typeof system === 'string'
+      ? system
+      : (system ?? []).map(b => b.text).join('\n\n')
+    const { stable: rawInstructions, volatile: volatileSystemText } =
+      splitCodexSystemForCache(fullSystemText)
+
+    // Build tool_use_id → native name map so function_call_output items
+    // send back the correct call_id / name shape across the turn boundary.
+    const toolUseIdToCallId = buildToolUseIdToCallIdMap(messages)
+
+    // Convert Anthropic history → Responses API input items.
+    const replayModel = modelSupportsReasoning(model) && !codexApi.isAzureResponsesEndpoint ? model : undefined
+    const inputItems = convertHistoryToCodex(messages, toolUseIdToCallId, replayModel)
+
+    // Anchor a frozen copy of the volatile system tail as a
+    // `developer` input item at position 0 — same bytes every turn
+    // for the lifetime of the conversation, so the prompt-cache
+    // prefix lands on the same KV-cache-warm chunks turn after turn.
+    //
+    // Why position 0 and not "before the latest user message" (the
+    // earlier shape this code had): every turn the upstream re-sends
+    // the full conversation history starting at user1. If we inject
+    // anywhere AFTER user1, the bytes at input[0] differ between
+    // turn 1 (where input[0] was our injected dev item) and turn 2+
+    // (where input[0] is user1). The cache misses at the very first
+    // byte and reports 0 cached_tokens. Anchoring at position 0 with
+    // a frozen byte-stable payload keeps every turn's input[0]
+    // identical, so the cache hits all the way through to the
+    // newest message.
+    //
+    // The frozen text comes from CodexApiClient.getOrSeedFrozenVolatile:
+    // first turn captures the current env / git / memory; later
+    // turns get the same captured copy back. `clearChain()` wipes
+    // it so a fresh conversation captures fresh env.
+    if (volatileSystemText) {
+      // One anchor per working directory the prompt states, so the first
+      // turn after EnterWorktree/ExitWorktree reaches the model with its env.
+      const frozenAnchor = codexApi.getOrSeedFrozenVolatile(
+        model,
+        volatileSystemText,
+        statedWorkingDirectory(volatileSystemText),
+      )
+      if (frozenAnchor) {
+        inputItems.unshift({
+          type: 'message',
+          role: 'developer',
+          content: [{ type: 'input_text', text: frozenAnchor }],
+        })
+      }
+    }
+
+    // Map caller-provided tools → Codex Responses format. We honor the
+    // native tool registry for tools we recognize (including apply_patch
+    // as a freeform custom tool) and pass through MCP / custom tools as
+    // function-schema tools. Every function tool carries its own schema with
+    // `strict: false`, as native Codex sends them, plus the STRICT PARAMETERS
+    // description hint.
+    const declarations = buildCodexToolDeclarations(tools)
+    const orderedTools = freezeCodexToolOrder(codexApi.sessionCacheKey, declarations.tools)
+    const codexTools = orderedTools.length > 0 ? orderedTools : undefined
+
+    // Prepend CODEX_TOOL_USAGE_RULES to instructions when tools are
+    // present so the model
+    // treats the schema as authoritative and doesn't emit empty-args
+    // function calls. The preamble is tuned to match Codex's concise
+    // native prompt tone.
+    const instructions = codexTools && codexTools.length > 0
+      ? `${CODEX_TOOL_USAGE_RULES}\n${rawInstructions}`
+      : rawInstructions
+
+    // Effort is independent of Anthropic thinking budgets. Use the same
+    // preference resolution as the picker and the OpenAI provider.
+    const reasoning = resolveReasoning(thinking, model, effort ?? null, !codexApi.isAzureResponsesEndpoint)
+
+    // Request body must match codex-rs's `ResponsesApiRequest` wire
+    // shape exactly. Native codex DOES NOT send `max_output_tokens` or
+    // `temperature` — shipping them changes the serialized body and can
+    // move the request to a non-cached partition on the backend (every
+    // extra field contributes to the request-shape hash the server uses
+    // to validate incremental cache eligibility). The server defaults
+    // for output length / sampling are what gpt-5-codex is tuned on.
+    // Ref: codex-rs/codex-api/src/common.rs ResponsesApiRequest
+    //      codex-rs/core/src/client.rs build_responses_request
+    void max_tokens
+    const request: CodexResponsesRequest = {
+      model,
+      instructions,
+      input: inputItems,
+      tools: codexTools,
+      tool_choice: 'auto',
+      parallel_tool_calls: true,
+      reasoning,
+      // codex-rs sets store=true ONLY on Azure; OpenAI + ChatGPT lanes
+      // run with store=false. `store: true` on non-Azure forces the
+      // server to persist and diff response items, which invalidates
+      // the KV cache on every tool-call turn — the dominant cause of
+      // the "cache hit rate = 0" token burn.
+      // Ref: codex-rs/core/src/client.rs line 873.
+      store: codexApi.isAzureResponsesEndpoint,
+      stream: true,
+      // When reasoning is enabled, codex-rs includes
+      // reasoning.encrypted_content so follow-up turns can replay the
+      // model's own thinking back at it. (Ref: client.rs build_responses_request.)
+      include: reasoning ? ['reasoning.encrypted_content'] : undefined,
+      // Stable per-conversation cache routing hint. codex-rs sets this
+      // to `conversation_id` so identical prefixes land on a KV-cache
+      // warm node every turn. Must stay constant across turns — we
+      // rotate only when the conversation resets (dispose()).
+      prompt_cache_key: codexApi.sessionCacheKey,
+    }
+
+    // Stream state.
+    let inputTokens = 0
+    let outputTokens = 0
+    let reasoningTokens = 0
+    let cachedInputTokens = 0
+    let cacheWriteTokens = 0
+    let messageStartEmitted = false
+
+    const messageId = `codex-${Date.now()}`
+
+    const emitMessageStart = () => {
+      if (messageStartEmitted) return undefined
+      messageStartEmitted = true
+      return {
+        type: 'message_start' as const,
+        message: {
+          id: messageId,
+          type: 'message' as const,
+          role: 'assistant' as const,
+          content: [],
+          model,
+          stop_reason: null,
+          stop_sequence: null,
+          usage: {
+            input_tokens: inputTokens,
+            output_tokens: 0,
+            ...(cachedInputTokens > 0 && {
+              cache_read_input_tokens: cachedInputTokens,
+            }),
+            ...(cacheWriteTokens > 0 && {
+              cache_creation_input_tokens: cacheWriteTokens,
+            }),
+          },
+        },
+      }
+    }
+
+    // Track which output_index maps to which Anthropic block index, and
+    // which ones are open so we know when to stop them.
+    const openBlocks = new Map<number, { anthropicIndex: number; kind: 'text' | 'thinking' | 'tool_use' }>()
+    let nextBlockIndex = 0
+    let emittedAnyToolUse = false
+    // Output-cap truncation: see ../shared/truncation.ts.
+    let outputCapTruncated = false
+
+    // Tool-call assembly state. Codex streams arguments as deltas, so we
+    // accumulate them until output_item.done fires with the full item.
+    const toolCallBuffers = new Map<number, { callId: string; name: string; args: string; isCustom: boolean; anthropicIndex: number }>()
+    const reasoningBlocks = new Map<number, CodexReasoningState>()
+    const summaryParts = new Map<number, { index: number; hasText: boolean; needsSeparator: boolean }>()
+    let pendingReasoning: CodexReasoningState['items'] = []
+    const takeReasoning = (): { _codex_reasoning?: CodexReasoningState } => {
+      if (!pendingReasoning.length) return {}
+      const state = { model, items: pendingReasoning }
+      pendingReasoning = []
+      return { _codex_reasoning: state }
+    }
+
+    try {
+      for await (const ev of streamCodexWithNoOutputRetry(request, signal, params.turnId)) {
+        if (signal.aborted) break
+
+        if (ev.type === 'codex.retry_pending') {
+          yield { type: 'ping' }
+          continue
+        }
+
+        // Some usage info can arrive on response.created / .in_progress,
+        // most lands on response.completed. Emit message_start as soon
+        // as we've got enough to populate it (either created or first
+        // token-bearing event).
+        if (ev.type === 'response.created' || ev.type === 'response.in_progress') {
+          if (!messageStartEmitted) {
+            const mst = emitMessageStart()
+            if (mst) yield mst
+          }
+          continue
+        }
+
+        if (ev.type === 'response.output_item.added') {
+          if (!messageStartEmitted) {
+            const mst = emitMessageStart()
+            if (mst) yield mst
+          }
+          const item = (ev as any).item as {
+            type: string
+            id?: string
+            call_id?: string
+            name?: string
+          }
+          const outputIndex = (ev as any).output_index as number
+
+          if (item.type === 'message') {
+            const anthropicIndex = nextBlockIndex++
+            openBlocks.set(outputIndex, { anthropicIndex, kind: 'text' })
+            yield {
+              type: 'content_block_start',
+              index: anthropicIndex,
+              content_block: { type: 'text', text: '', ...takeReasoning() },
+            }
+          } else if (item.type === 'reasoning') {
+            const anthropicIndex = nextBlockIndex++
+            openBlocks.set(outputIndex, { anthropicIndex, kind: 'thinking' })
+            const state: CodexReasoningState = { model, items: [] }
+            reasoningBlocks.set(outputIndex, state)
+            yield {
+              type: 'content_block_start',
+              index: anthropicIndex,
+              content_block: { type: 'thinking', thinking: '', ...(replayModel && { _codex_reasoning: state }) },
+            }
+          } else if (item.type === 'function_call' || item.type === 'custom_tool_call') {
+            const isCustom = item.type === 'custom_tool_call'
+            const anthropicIndex = nextBlockIndex++
+            toolCallBuffers.set(outputIndex, {
+              callId: item.call_id ?? item.id ?? `call-${outputIndex}`,
+              name: item.name ?? 'unknown',
+              args: '',
+              isCustom,
+              anthropicIndex,
+            })
+            emittedAnyToolUse = true
+          }
+          continue
+        }
+
+        if (ev.type === 'response.output_text.delta') {
+          const outputIndex = (ev as any).output_index as number
+          const delta = (ev as any).delta as string
+          const open = openBlocks.get(outputIndex)
+          if (open && open.kind === 'text') {
+            yield {
+              type: 'content_block_delta',
+              index: open.anthropicIndex,
+              delta: { type: 'text_delta', text: delta },
+            }
+          }
+          continue
+        }
+
+        if (ev.type === 'response.reasoning_summary_part.added') {
+          const outputIndex = (ev as any).output_index as number
+          const index = (ev as any).summary_index as number
+          const previous = summaryParts.get(outputIndex)
+          if (previous && previous.index !== index) {
+            previous.index = index
+            previous.needsSeparator = previous.hasText
+          } else if (!previous) {
+            summaryParts.set(outputIndex, { index, hasText: false, needsSeparator: false })
+          }
+          continue
+        }
+
+        if (ev.type === 'response.reasoning_summary_text.delta' || ev.type === 'response.reasoning_text.delta') {
+          const outputIndex = (ev as any).output_index as number
+          const delta = (ev as any).delta as string
+          const open = openBlocks.get(outputIndex)
+          if (open && open.kind === 'thinking') {
+            let text = delta
+            if (ev.type === 'response.reasoning_summary_text.delta') {
+              const index = (ev as any).summary_index ?? 0
+              const part = summaryParts.get(outputIndex) ?? { index, hasText: false, needsSeparator: false }
+              if (part.index !== index) {
+                part.index = index
+                part.needsSeparator = part.hasText
+              }
+              if (delta) {
+                if (part.needsSeparator) text = `\n\n${delta}`
+                part.hasText = true
+                part.needsSeparator = false
+              }
+              summaryParts.set(outputIndex, part)
+            }
+            yield {
+              type: 'content_block_delta',
+              index: open.anthropicIndex,
+              delta: { type: 'thinking_delta', thinking: text },
+            }
+          }
+          continue
+        }
+
+        if (ev.type === 'response.function_call_arguments.delta' || ev.type === 'response.custom_tool_call_input.delta') {
+          const outputIndex = (ev as any).output_index as number
+          const delta = (ev as any).delta as string
+          const buf = toolCallBuffers.get(outputIndex)
+          if (buf) buf.args += delta
+          continue
+        }
+
+        if (ev.type === 'response.function_call_arguments.done' || ev.type === 'response.custom_tool_call_input.done') {
+          const outputIndex = (ev as any).output_index as number
+          const finalPayload = ((ev as any).arguments ?? (ev as any).input) as string
+          const buf = toolCallBuffers.get(outputIndex)
+          if (buf && typeof finalPayload === 'string') buf.args = finalPayload
+          continue
+        }
+
+        if (ev.type === 'response.output_item.done') {
+          const outputIndex = (ev as any).output_index as number
+          const item = (ev as any).item
+          if (replayModel && item?.type === 'reasoning' && typeof item.id === 'string' && typeof item.encrypted_content === 'string' && item.encrypted_content) {
+            const saved = {
+              id: item.id,
+              encrypted_content: item.encrypted_content,
+              summary: Array.isArray(item.summary) ? structuredClone(item.summary) : [],
+            }
+            reasoningBlocks.get(outputIndex)?.items.push(saved)
+            pendingReasoning.push(saved)
+          }
+
+          // Close text / reasoning blocks on their output_index.
+          const open = openBlocks.get(outputIndex)
+          if (open && open.kind !== 'tool_use') {
+            yield { type: 'content_block_stop', index: open.anthropicIndex }
+            openBlocks.delete(outputIndex)
+            continue
+          }
+
+          // Emit tool_use block for completed tool calls. We do this on
+          // output_item.done rather than piece-by-piece so the tool_use
+          // block has the full input at emission time (cleaner for the
+          // outer claude.ts agent loop, which expects complete inputs).
+          const buf = toolCallBuffers.get(outputIndex)
+          if (!buf) continue
+
+          const reg = getCodexRegistrationByNativeName(buf.name)
+          const implId = reg?.implId ?? buf.name
+
+          // Parse args. Function calls are JSON; custom tool calls are
+          // raw text (apply_patch is the canonical example). We preserve
+          // the raw text by wrapping it in a { patch: text } shape for
+          // apply_patch specifically — matching the native schema.
+          const decoded = buf.isCustom ? undefined : decodeToolArguments(buf.args)
+          let input: Record<string, unknown>
+          if (buf.isCustom) {
+            input = buf.name === 'apply_patch'
+              ? { patch: buf.args }
+              : { input: buf.args }
+          } else {
+            // Native built-ins retain their existing projection handling. MCP
+            // values must not lose meaningful nulls before shared validation.
+            input = reg && !decoded!.status ? stripNullToolArguments(decoded!.input) : decoded!.input
+          }
+
+          // Pass through the lane's adaptInput — apply_patch validates
+          // the patch; others may rename fields.
+          const repairedToolCall = repairCodexToolCall(
+            implId,
+            reg && !decoded?.status ? reg.adaptInput(input) : input,
+          )
+
+          const anthropicToolUseId = buf.callId.startsWith('toolu_')
+            ? buf.callId
+            : `toolu_codex_${buf.callId}`
+
+          // Tool-use blocks MUST emit the three-event sequence so
+          // claude.ts's accumulator picks up the args: content_block_start
+          // with empty input + input_json_delta carrying the JSON string
+          // + content_block_stop. Embedding `input` inline on start
+          // leaves the accumulator at '' and every tool sees `{}`.
+          yield {
+            type: 'content_block_start',
+            index: buf.anthropicIndex,
+            content_block: {
+              type: 'tool_use',
+              id: anthropicToolUseId,
+              name: repairedToolCall.toolName,
+              input: {},
+              ...(decoded && toolDecodeFields(decoded)),
+              ...takeReasoning(),
+            },
+          }
+          yield {
+            type: 'content_block_delta',
+            index: buf.anthropicIndex,
+            delta: {
+              type: 'input_json_delta',
+              partial_json: JSON.stringify(repairedToolCall.input ?? {}),
+            },
+          }
+          yield { type: 'content_block_stop', index: buf.anthropicIndex }
+          toolCallBuffers.delete(outputIndex)
+          continue
+        }
+
+        if (ev.type === 'response.completed') {
+          const usage = (ev as any).response?.usage
+          if (usage) {
+            const metrics = extractCodexUsageMetrics(usage)
+            inputTokens = metrics.inputTokens ?? inputTokens
+            outputTokens = metrics.outputTokens ?? outputTokens
+            cachedInputTokens = metrics.cacheReadTokens || cachedInputTokens
+            cacheWriteTokens = metrics.cacheWriteTokens || cacheWriteTokens
+            reasoningTokens = metrics.reasoningTokens || reasoningTokens
+          }
+          break
+        }
+
+        // The Responses API ends a capped generation with `response.incomplete`
+        // (incomplete_details.reason === 'max_output_tokens') rather than
+        // `response.completed`. Without this the turn looked like a clean
+        // finish. Any tool call still buffered here was never emitted — this
+        // lane only flushes a call on `output_item.done` — so there is
+        // nothing half-built to drop, just a stop reason to report.
+        if (ev.type === 'response.incomplete') {
+          const resp = (ev as any).response
+          const usage = resp?.usage
+          if (usage) {
+            const metrics = extractCodexUsageMetrics(usage)
+            inputTokens = metrics.inputTokens ?? inputTokens
+            outputTokens = metrics.outputTokens ?? outputTokens
+            cachedInputTokens = metrics.cacheReadTokens || cachedInputTokens
+            cacheWriteTokens = metrics.cacheWriteTokens || cacheWriteTokens
+            reasoningTokens = metrics.reasoningTokens || reasoningTokens
+          }
+          // Trust the event itself: a reason we do not recognize (a content
+          // filter, say) is still an incomplete response, but only an output
+          // cap should drive the max_tokens recovery path.
+          outputCapTruncated = isOutputCapTruncation(
+            resp?.incomplete_details?.reason ?? 'max_output_tokens',
+          )
+          break
+        }
+
+        if (ev.type === 'response.failed' || ev.type === 'error') {
+          const failure = codexStreamFailure(ev)
+          // A tool-schema rejection can also arrive as a stream event rather
+          // than the HTTP response; it goes to the same backstop.
+          if (
+            failure.code === 'invalid_function_parameters'
+            || /Invalid schema for function '/.test(failure.message)
+          ) {
+            throw new CodexApiError(400, JSON.stringify({ error: failure }))
+          }
+          const errMessage = failure.message || 'Responses API failed'
+          if (!messageStartEmitted) {
+            const mst = emitMessageStart()
+            if (mst) yield mst
+          }
+          // Surface the error as a text block so the user sees why.
+          const idx = nextBlockIndex++
+          yield {
+            type: 'content_block_start',
+            index: idx,
+            content_block: { type: 'text', text: '' },
+          }
+          yield {
+            type: 'content_block_delta',
+            index: idx,
+            delta: { type: 'text_delta', text: `Codex API error: ${errMessage}` },
+          }
+          yield { type: 'content_block_stop', index: idx }
+          break
+        }
+      }
+    } catch (err: any) {
+      if (!messageStartEmitted && isRetryableProviderError(err)) {
+        throw err
+      }
+      // OpenAI refused one MCP/custom tool's schema. Leave that tool out of
+      // the next request; while nothing was emitted, the shared controller
+      // retries this turn without it.
+      const rejection = isAbortError(err, signal) ? null : parseCodexToolSchemaRejection(err)
+      const removed = rejection
+        ? quarantineRejectedCodexTool(rejection, request.tools, declarations.externalNames)
+        : null
+      if (removed && !messageStartEmitted) {
+        throw createRetryableConnectionError(
+          `OpenAI rejected the tool schema of ${removed}; retrying without that tool`,
+          err,
+        )
+      }
+      if (
+        !messageStartEmitted
+        && !isAbortError(err, signal)
+        && isRetryableNetworkError(err)
+      ) {
+        throw createRetryableConnectionError('Codex API connection error', err)
+      }
+      if (err?.name === 'AbortError' || signal.aborted) {
+        if (!messageStartEmitted) {
+          const mst = emitMessageStart()
+          if (mst) yield mst
+        }
+        // Keep the prompt_cache_key intact on abort. codex-rs does the
+        // same — the cache key is conversation-scoped, not turn-scoped.
+        // Rotating it here would cold-start the cache on the retry.
+        yield {
+          type: 'message_delta',
+          delta: { stop_reason: 'end_turn' },
+          usage: {
+            output_tokens: outputTokens,
+            // OpenAI's input_tokens is total (fresh + cached). Anthropic
+            // semantic expects fresh-only here; cached lives on its own
+            // field. Subtract so cost / context-meter don't double-count.
+            input_tokens: Math.max(0, inputTokens - cachedInputTokens - cacheWriteTokens),
+            ...(cachedInputTokens > 0 && {
+              cache_read_input_tokens: cachedInputTokens,
+            }),
+            ...(cacheWriteTokens > 0 && { cache_creation_input_tokens: cacheWriteTokens }),
+          },
+        }
+        yield { type: 'message_stop' }
+        return {
+          input_tokens: Math.max(0, inputTokens - cachedInputTokens - cacheWriteTokens),
+          output_tokens: outputTokens,
+          cache_read_tokens: cachedInputTokens,
+          cache_write_tokens: cacheWriteTokens,
+          thinking_tokens: reasoningTokens,
+        }
+      }
+      if (!messageStartEmitted) {
+        const mst = emitMessageStart()
+        if (mst) yield mst
+      }
+      const idx = nextBlockIndex++
+      yield {
+        type: 'content_block_start',
+        index: idx,
+        content_block: { type: 'text', text: '' },
+      }
+      // Prompt-too-long errors must surface unwrapped so reactive-compact
+      // recognizes them via the "Prompt is too long" prefix.
+      const isPTL = (err as { isPromptTooLong?: boolean } | null)?.isPromptTooLong === true
+      const errText = isPTL
+        ? (err?.message ?? String(err))
+        : `Codex API error: ${err?.message ?? String(err)}`
+      yield {
+        type: 'content_block_delta',
+        index: idx,
+        delta: { type: 'text_delta', text: errText },
+      }
+      yield { type: 'content_block_stop', index: idx }
+      yield {
+        type: 'message_delta',
+        delta: { stop_reason: 'end_turn' },
+        usage: {
+          output_tokens: outputTokens,
+          // OpenAI's input_tokens is total (fresh + cached). Anthropic
+          // semantic expects fresh-only here; cached lives on its own
+          // field. Subtract so cost / context-meter don't double-count.
+          input_tokens: Math.max(0, inputTokens - cachedInputTokens - cacheWriteTokens),
+          ...(cachedInputTokens > 0 && {
+            cache_read_input_tokens: cachedInputTokens,
+          }),
+          ...(cacheWriteTokens > 0 && { cache_creation_input_tokens: cacheWriteTokens }),
+        },
+      }
+      yield { type: 'message_stop' }
+      return {
+        input_tokens: Math.max(0, inputTokens - cachedInputTokens - cacheWriteTokens),
+        output_tokens: outputTokens,
+        cache_read_tokens: cachedInputTokens,
+        cache_write_tokens: cacheWriteTokens,
+        thinking_tokens: reasoningTokens,
+      }
+    }
+
+    // Ensure message_start was emitted for empty-response edge case.
+    if (!messageStartEmitted) {
+      const mst = emitMessageStart()
+      if (mst) yield mst
+    }
+
+    // Close any still-open non-tool blocks (safety net).
+    for (const [, open] of openBlocks) {
+      if (open.kind !== 'tool_use') {
+        yield { type: 'content_block_stop', index: open.anthropicIndex }
+      }
+    }
+
+    const stopReason = laneStopReason({
+      truncated: outputCapTruncated,
+      hadToolUse: emittedAnyToolUse,
+    })
+
+    yield {
+      type: 'message_delta',
+      delta: { stop_reason: stopReason },
+      usage: {
+        output_tokens: outputTokens,
+        // OpenAI's input_tokens is total (fresh + cached). Anthropic
+        // semantic expects fresh-only here; cached lives on its own
+        // field. Subtract so cost / context-meter don't double-count.
+        input_tokens: Math.max(0, inputTokens - cachedInputTokens - cacheWriteTokens),
+        ...(cachedInputTokens > 0 && {
+          cache_read_input_tokens: cachedInputTokens,
+        }),
+        ...(cacheWriteTokens > 0 && { cache_creation_input_tokens: cacheWriteTokens }),
+      },
+    }
+    yield { type: 'message_stop' }
+
+    return {
+      input_tokens: Math.max(0, inputTokens - cachedInputTokens - cacheWriteTokens),
+      output_tokens: outputTokens,
+      cache_read_tokens: cachedInputTokens,
+      cache_write_tokens: cacheWriteTokens,
+      thinking_tokens: reasoningTokens,
+    }
+  }
+
+  // ── Lane-owns-loop (Phase-2, not wired yet) ─────────────────────
+
+  async *run(_context: LaneRunContext): AsyncGenerator<AnthropicStreamEvent, LaneRunResult> {
+    // Future Phase-2 work. For now the bridge calls streamAsProvider directly
+    // and claude.ts owns the turn-orchestration loop.
+    throw new Error('CodexLane.run (lane-owns-loop) is not wired yet — use streamAsProvider via LaneBackedProvider.')
+  }
+
+  async listModels(): Promise<ModelInfo[]> {
+    return OPENAI_CODEX_MODELS.map(model => ({ ...model, tags: model.tags && [...model.tags] }))
+  }
+
+  resolveModel(model: string): string {
+    return model
+  }
+
+  smallFastModel(): string {
+    // The same model tier aliases resolve to on this lane (agentAliasFallback).
+    return OPENAI_AGENT_MODEL
+  }
+
+  isHealthy(): boolean {
+    return this._healthy
+  }
+
+  setHealthy(healthy: boolean): void {
+    this._healthy = healthy
+  }
+
+  dispose(): void {
+    codexApi.clearChain()
+    toolOrderSnapshots.clear()
+  }
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────
+
+export interface CodexUsageMetrics {
+  inputTokens?: number
+  outputTokens?: number
+  cacheReadTokens: number
+  cacheWriteTokens: number
+  reasoningTokens: number
+}
+
+export function extractCodexUsageMetrics(usage: unknown): CodexUsageMetrics {
+  const u = isRecord(usage) ? usage as CodexUsage & Record<string, unknown> : {}
+  const inputDetails = isRecord(u.input_tokens_details) ? u.input_tokens_details : {}
+  const promptDetails = isRecord(u.prompt_tokens_details) ? u.prompt_tokens_details : {}
+  const outputDetails = isRecord(u.output_tokens_details) ? u.output_tokens_details : {}
+  const completionDetails = isRecord(u.completion_tokens_details) ? u.completion_tokens_details : {}
+
+  const inputTokens = firstFiniteNumber(u.input_tokens, u.prompt_tokens)
+  const outputTokens = firstFiniteNumber(u.output_tokens, u.completion_tokens)
+
+  const explicitRead = firstFiniteNumber(
+    u.cache_read_input_tokens,
+    u.cache_read_tokens,
+    u.cache_hit_tokens,
+  )
+  const explicitWrite = firstFiniteNumber(
+    u.cache_creation_input_tokens,
+    u.cache_write_input_tokens,
+    u.cache_write_tokens,
+    inputDetails.cache_write_tokens,
+    promptDetails.cache_write_tokens,
+  )
+  const cachedTotal = firstFiniteNumber(
+    inputDetails.cached_tokens,
+    promptDetails.cached_tokens,
+    u.cached_tokens,
+    u.cached_input_tokens,
+    u.prompt_cache_hit_tokens,
+  )
+
+  const cacheWriteTokens = Math.max(0, explicitWrite ?? 0)
+  const cacheReadTokens = Math.max(
+    0,
+    explicitRead ?? (cachedTotal !== undefined
+      ? cachedTotal - cacheWriteTokens
+      : 0),
+  )
+
+  return {
+    inputTokens,
+    outputTokens,
+    cacheReadTokens,
+    cacheWriteTokens,
+    reasoningTokens: firstFiniteNumber(
+      outputDetails.reasoning_tokens,
+      completionDetails.reasoning_tokens,
+      u.reasoning_tokens,
+    ) ?? 0,
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null
+}
+
+/**
+ * The error a `response.failed` or `error` stream event carries. The first
+ * nests it under `response.error`; the second under `error` or at the top.
+ */
+function codexStreamFailure(ev: unknown): { message: string; code?: unknown; param?: unknown } {
+  const event = isRecord(ev) ? ev : {}
+  const response = isRecord(event.response) ? event.response : {}
+  const error = isRecord(response.error) ? response.error : isRecord(event.error) ? event.error : event
+  return {
+    message: typeof error.message === 'string' ? error.message : '',
+    ...(error.code !== undefined && { code: error.code }),
+    ...(error.param !== undefined && { param: error.param }),
+  }
+}
+
+function firstFiniteNumber(...values: unknown[]): number | undefined {
+  for (const value of values) {
+    if (typeof value === 'number' && Number.isFinite(value)) return value
+  }
+  return undefined
+}
+
+export function resolveReasoning(
+  _thinking: LaneProviderCallParams['thinking'] | undefined,
+  model: string,
+  effortValue?: LaneProviderCallParams['effortValue'],
+  requestSummary = true,
+): CodexReasoningConfig | undefined {
+  const effort = resolveOpenAIReasoningEffort(model, effortValue)
+  if (effort) return { effort, summary: 'auto' }
+  return requestSummary && modelSupportsReasoning(model) ? { summary: 'auto' } : undefined
+}
+
+// Walk the conversation history and map each assistant tool_use.id to a
+// call_id we'll use in the Responses API function_call_output items. The
+// Anthropic tool_use.id is of the form `toolu_codex_<callId>` (set by
+// this lane when it emitted the tool_use); strip the prefix to recover
+// the original callId. Fall back to the id itself for history items
+// from other lanes.
+function buildToolUseIdToCallIdMap(
+  messages: import('../../services/api/providers/base_provider.js').ProviderMessage[],
+): Map<string, string> {
+  const map = new Map<string, string>()
+  for (const msg of messages) {
+    if (typeof msg.content === 'string') continue
+    for (const block of msg.content) {
+      if (block.type === 'tool_use' && block.id) {
+        const callId = block.id.startsWith('toolu_codex_')
+          ? block.id.slice('toolu_codex_'.length)
+          : block.id
+        map.set(block.id, callId)
+      }
+    }
+  }
+  return map
+}
+
+export function convertHistoryToCodex(
+  messages: import('../../services/api/providers/base_provider.js').ProviderMessage[],
+  toolUseIdToCallId: Map<string, string>,
+  replayModel?: string,
+): CodexInputItem[] {
+  const out: CodexInputItem[] = []
+  const replayedReasoning = new Set<string>()
+  // Build a name lookup for tool_result → function_call_output name.
+  const callIdToName = new Map<string, string>()
+
+  for (const msg of messages) {
+    if (typeof msg.content === 'string') {
+      const contentPart: CodexContentPart = msg.role === 'assistant'
+        ? { type: 'output_text', text: msg.content }
+        : { type: 'input_text', text: msg.content }
+      out.push({ type: 'message', role: msg.role, content: [contentPart] })
+      continue
+    }
+
+    // Split the content blocks into message parts and tool-call items —
+    // Responses API expects tool_use / function_call_output at the
+    // top-level input array, not nested inside a message item.
+    const textParts: CodexContentPart[] = []
+    const tailItems: CodexInputItem[] = []
+    // Images pulled out of tool results. `function_call_output.output` is a
+    // plain string, so the bytes ride along in a user message emitted right
+    // after the outputs (the Responses input array is an ordered item list).
+    const trailingImageParts: CodexContentPart[] = []
+
+    for (const block of msg.content) {
+      switch (block.type) {
+        case 'text':
+          if (block.text) {
+            textParts.push(msg.role === 'assistant'
+              ? { type: 'output_text', text: block.text }
+              : { type: 'input_text', text: block.text })
+          }
+          break
+        case 'tool_use': {
+          if (!block.id || !block.name) break
+          const callId = toolUseIdToCallId.get(block.id) ?? block.id
+          // Assistant-emitted tool call. Look up the native name from the
+          // registry (block.name is the shared impl id).
+          const reg = CODEX_TOOL_REGISTRY.find(r => r.implId === block.name)
+          const nativeName = reg?.nativeName ?? block.name
+          callIdToName.set(callId, nativeName)
+          if (nativeName === 'apply_patch') {
+            // Custom tool — payload is a raw string (the patch body).
+            const rawPatch = (block.input as any)?.patch ?? ''
+            tailItems.push({
+              type: 'custom_tool_call',
+              call_id: callId,
+              name: nativeName,
+              input: typeof rawPatch === 'string' ? rawPatch : JSON.stringify(rawPatch),
+            })
+          } else {
+            // Function tool — arguments are JSON-encoded.
+            const nativeInput = reg ? inverseAdapt(reg.nativeName, block.input ?? {}) : (block.input ?? {})
+            tailItems.push({
+              type: 'function_call',
+              call_id: callId,
+              name: nativeName,
+              arguments: JSON.stringify(nativeInput),
+            })
+          }
+          break
+        }
+        case 'tool_result': {
+          const id = block.tool_use_id ?? ''
+          const callId = toolUseIdToCallId.get(id) ?? id
+          const isCustom = callIdToName.get(callId) === 'apply_patch'
+          const split = splitCodexToolResultContent(block.content)
+          const output = split.output
+          trailingImageParts.push(...split.images)
+          tailItems.push(
+            isCustom
+              ? { type: 'custom_tool_call_output', call_id: callId, output }
+              : { type: 'function_call_output', call_id: callId, output },
+          )
+          break
+        }
+        case 'thinking':
+          // Reasoning is model-internal. Replaying visible summaries bloats
+          // the next prompt and shifts the cached prefix; native Responses
+          // clients only round-trip encrypted reasoning items.
+          break
+        case 'image': {
+          // Responses carries images as an `input_image` part on a user
+          // message; assistant items only accept `output_text`, so an image
+          // on an assistant turn (shouldn't happen) is skipped rather than
+          // sent in an invalid shape.
+          if (msg.role === 'assistant') break
+          const part = imageBlockToCodexImagePart(block)
+          textParts.push(part ?? { type: 'input_text', text: unsendableCodexMedia(block) })
+          break
+        }
+        default:
+          // Anthropic `document` blocks (PDF attachments) aren't in
+          // ProviderContentBlock's union but do reach the lane, and the
+          // Responses API needs an uploaded file id rather than inline
+          // bytes — say so instead of dropping them silently.
+          if ((block as { type: string }).type === 'document') {
+            const part: CodexContentPart = msg.role === 'assistant'
+              ? { type: 'output_text', text: unsendableCodexMedia(block) }
+              : { type: 'input_text', text: unsendableCodexMedia(block) }
+            textParts.push(part)
+          }
+          break
+      }
+    }
+
+    if (textParts.length > 0) {
+      out.push({ type: 'message', role: msg.role, content: textParts })
+    }
+    if (msg.role === 'assistant') {
+      out.push(...codexReasoningForBlocks(msg.content, replayModel, replayedReasoning))
+    }
+    out.push(...tailItems)
+    if (trailingImageParts.length > 0) {
+      out.push({ type: 'message', role: 'user', content: trailingImageParts })
+    }
+  }
+
+  return out
+}
+
+/**
+ * Map an Anthropic image block onto a Responses `input_image` part. Base64
+ * sources become a data URL, http(s) sources pass through unchanged, and
+ * anything else returns null so the caller can emit a text marker instead.
+ */
+function imageBlockToCodexImagePart(block: unknown): CodexContentPart | null {
+  const src = (
+    block as { source?: { data?: string; media_type?: string; url?: string } } | null
+  )?.source
+  if (!src) return null
+  if (typeof src.data === 'string' && src.data.length > 0) {
+    const mime = src.media_type ?? 'image/png'
+    return { type: 'input_image', image_url: `data:${mime};base64,${src.data}` }
+  }
+  if (typeof src.url === 'string' && src.url.length > 0) {
+    return { type: 'input_image', image_url: src.url }
+  }
+  return null
+}
+
+/**
+ * Deterministic marker for media this lane can't forward. Never the bytes.
+ * Codex DOES carry images, so the reasons here are narrower than the generic
+ * "this lane cannot receive attachments" default.
+ */
+function unsendableCodexMedia(block: unknown): string {
+  const isDocument = (block as { type?: string } | null)?.type === 'document'
+  return describeUnsendableMedia(
+    block,
+    isDocument
+      // Responses takes PDFs as an uploaded file id, not inline bytes.
+      ? 'this lane forwards images only'
+      : 'unsupported image source',
+  )
+}
+
+/**
+ * Split a tool_result's content into the string that goes in
+ * `function_call_output.output` and the image parts that ride along in the
+ * user message emitted right after it.
+ *
+ * The previous stringifier JSON.stringify-ed image blocks, which dumped the
+ * whole base64 payload into the prompt as text: thousands of wasted tokens
+ * per screenshot, replayed on every later turn, and nothing the model could
+ * actually see (so it described an image it never received).
+ */
+function splitCodexToolResultContent(
+  content: unknown,
+): { output: string; images: CodexContentPart[] } {
+  if (typeof content === 'string') return { output: content, images: [] }
+  if (!Array.isArray(content)) {
+    return { output: JSON.stringify(content ?? ''), images: [] }
+  }
+  const parts: string[] = []
+  const images: CodexContentPart[] = []
+  for (const b of content as any[]) {
+    if (!b || typeof b !== 'object') continue
+    if ('text' in b && typeof b.text === 'string') {
+      parts.push(b.text)
+      continue
+    }
+    if (b.type === 'image' || b.type === 'document') {
+      const part = b.type === 'image' ? imageBlockToCodexImagePart(b) : null
+      if (part) {
+        images.push(part)
+        parts.push('[image attached below]')
+      } else {
+        parts.push(unsendableCodexMedia(b))
+      }
+      continue
+    }
+    parts.push(JSON.stringify(b))
+  }
+  return { output: parts.join('\n'), images }
+}
+
+// Inverse of each native adaptInput. Most are identity; a couple diverge.
+function inverseAdapt(nativeName: string, input: Record<string, unknown>): Record<string, unknown> {
+  switch (nativeName) {
+    case 'read_file':
+      return input // Codex's read_file shape matches shared Read exactly.
+    case 'search_code': {
+      const out: Record<string, unknown> = { pattern: input.pattern }
+      if (input.path != null) out.path = input.path
+      if (input.glob != null) out.include = input.glob
+      if (input.include_ignored != null) out.include_ignored = input.include_ignored
+      if (input.output_mode != null) out.output_mode = input.output_mode
+      return out
+    }
+    default:
+      return input
+  }
+}
+
+export function stripNullToolArguments(input: unknown): Record<string, unknown> {
+  const stripped = stripNullToolArgumentValue(input)
+  return isRecord(stripped) && !Array.isArray(stripped) ? stripped : {}
+}
+
+function stripNullToolArgumentValue(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value
+      .map(item => stripNullToolArgumentValue(item))
+      .filter(item => item !== undefined)
+  }
+  if (!isRecord(value)) return value === null ? undefined : value
+
+  const out: Record<string, unknown> = {}
+  for (const [key, child] of Object.entries(value)) {
+    const stripped = stripNullToolArgumentValue(child)
+    if (stripped !== undefined) out[key] = stripped
+  }
+  return out
+}
+
+export function repairCodexToolInput(
+  toolName: string,
+  input: Record<string, unknown>,
+): Record<string, unknown> {
+  return repairCodexToolCall(toolName, input).input
+}
+
+export interface RepairedCodexToolCall {
+  toolName: string
+  input: Record<string, unknown>
+}
+
+/**
+ * Intentional pass-through. This once rewrote AFT tool calls, whose native
+ * Codex shape differed from the Anthropic-format one the loop emits. Those
+ * tools were pruned, and nothing else needs repairing, so the hook stays as an
+ * identity function rather than being deleted: the seam is where a future
+ * native-name mismatch would be fixed, and removing it would only move that
+ * work to whoever hits the next one. It is NOT a validation or safety net --
+ * schema conformance comes from Tau's validation of every call against the
+ * tool's full schema and from the STRICT PARAMETERS hint, not from here.
+ */
+export function repairCodexToolCall(
+  toolName: string,
+  input: Record<string, unknown>,
+): RepairedCodexToolCall {
+  return { toolName, input }
+}
+
+function hasMeaningfulValue(value: unknown): boolean {
+  if (value === undefined || value === null) return false
+  if (Array.isArray(value)) return value.length > 0
+  return true
+}
+
+function targetsContainFilePath(value: unknown): boolean {
+  const targets = Array.isArray(value) ? value : [value]
+  return targets.some(target => isRecord(target) && hasMeaningfulValue(target.filePath))
+}
+
+/**
+ * A tool's input schema as this lane sends it: the tool's own contract with
+ * local `$ref`s inlined, metadata left out and malformed keywords repaired
+ * (see tool_schema.ts). Also what the STRICT PARAMETERS hint reads.
+ */
+export function sanitizeCodexToolParametersForOpenAI(schema: unknown): Record<string, unknown> {
+  return toCodexToolParameters(schema)
+}
+
+interface CodexToolDeclarations {
+  tools: CodexToolSpec[]
+  /** Tools outside the native registry: the only ones a rejection may leave out. */
+  externalNames: Set<string>
+}
+
+// Build Responses API tools from the caller-provided Anthropic-format
+// tool list. Tools that match the native registry get the native schema;
+// unknown tools (MCP, custom) pass through as function tools with the
+// caller's schema.
+export function buildCodexToolsFromRequest(
+  tools: import('../../services/api/providers/base_provider.js').ProviderTool[],
+): CodexResponsesRequest['tools'] {
+  const { tools: out } = buildCodexToolDeclarations(tools)
+  return out.length > 0 ? out : undefined
+}
+
+// Every function tool goes out the way native Codex sends all of its tools:
+// the tool's own schema with `strict: false`, so optional fields stay
+// optional and nothing is guessed (see tool_schema.ts). Tau validates every
+// call against the tool's full schema before running it.
+function buildCodexToolDeclarations(
+  tools: import('../../services/api/providers/base_provider.js').ProviderTool[],
+): CodexToolDeclarations {
+  const out: CodexToolSpec[] = []
+  const externalNames = new Set<string>()
+  for (const tool of tools) {
+    const reg = getCodexRegistrationForTool(tool.name)
+    if (reg) {
+      if (reg.nativeName === 'apply_patch') {
+        // Freeform tools can't take `strict: true`; they aren't JSON.
+        // apply_patch's Lark grammar is the enforcement mechanism.
+        out.push({
+          type: 'custom',
+          name: 'apply_patch',
+          description: reg.nativeDescription,
+          format: { type: 'text' },
+        })
+      } else {
+        const parameters = toCodexToolParameters(reg.nativeSchema)
+        out.push({
+          type: 'function',
+          name: reg.nativeName,
+          description: appendStrictParamsHint(reg.nativeDescription, parameters),
+          parameters,
+          strict: false,
+        })
+      }
+      continue
+    }
+
+    // Unknown tool (MCP / custom / Tau tools outside the registry).
+    const parameters = toCodexToolParameters(tool.input_schema ?? { type: 'object', properties: {} })
+    const spec: CodexToolSpec = {
+      type: 'function',
+      name: tool.name,
+      description: appendStrictParamsHint(tool.description ?? '', parameters),
+      parameters,
+      strict: false,
+    }
+    if (isQuarantinedCodexTool(spec)) continue
+    out.push(spec)
+    externalNames.add(tool.name)
+  }
+  return { tools: out, externalNames }
+}
+
+// ─── Stable tool order per conversation ──────────────────────────
+//
+// The tool block sits in the cached prompt prefix. Tau lists tools in sorted
+// order, so an MCP server that connects mid-conversation (claude.ai
+// connectors often do) had its tools inserted in the middle of the list, and
+// every later tool and the whole conversation after the block went uncached.
+// Each conversation (cache key) remembers the order its tools were first sent
+// in: a new tool is appended, and a tool keeps its first declaration until
+// its parameters change. Every request on the key shares that order, so a
+// helper forked from the conversation (a prompt suggestion, a compaction)
+// resends the same tool block, and a request with fewer tools (a server that
+// dropped, a side query) leaves the others' order alone. Same idea as the
+// OpenRouter lane's per-conversation tool snapshot.
+
+const TOOL_ORDER_SNAPSHOT_LIMIT = 256
+const toolOrderSnapshots = new Map<string, Map<string, CodexToolSpec>>()
+
+function codexToolContract(spec: CodexToolSpec): string {
+  return JSON.stringify(spec.type === 'function' ? [spec.type, spec.parameters, spec.strict] : [spec.type, spec.format])
+}
+
+export function freezeCodexToolOrder(key: string, tools: CodexToolSpec[]): CodexToolSpec[] {
+  const snapshot = toolOrderSnapshots.get(key) ?? new Map<string, CodexToolSpec>()
+  // Most recently used last, so eviction drops idle conversations first.
+  toolOrderSnapshots.delete(key)
+  toolOrderSnapshots.set(key, snapshot)
+  while (toolOrderSnapshots.size > TOOL_ORDER_SNAPSHOT_LIMIT) {
+    const oldest = toolOrderSnapshots.keys().next().value
+    if (oldest === undefined || oldest === key) break
+    toolOrderSnapshots.delete(oldest)
+  }
+  const present = new Set<string>()
+  for (const tool of tools) {
+    present.add(tool.name)
+    const saved = snapshot.get(tool.name)
+    // Updating an existing key keeps its position in the Map.
+    if (!saved || codexToolContract(tool) !== codexToolContract(saved)) snapshot.set(tool.name, tool)
+  }
+  // A tool missing from this request is not sent (never restored just to keep
+  // a cached prefix) but keeps its slot for when it comes back.
+  return [...snapshot.values()].filter(tool => present.has(tool.name))
+}
+
+// ─── Rejected-schema backstop ────────────────────────────────────
+//
+// Last line of defence behind the schema cleanup: if OpenAI still rejects a
+// tool's declaration (a rule it adds later, a shape no test anticipated),
+// that tool is left out and the turn retried, instead of every turn failing.
+// Keyed by the exact declaration bytes, so a server that changes its schema
+// is offered again. Process-lifetime and only ever grows, so the tool block
+// changes once per rejection and then stays byte-stable for the prompt cache.
+// Native registry tools are never left out: a rejection there is a Tau bug and
+// must surface.
+
+/** Tool name → hash of the declaration left out of requests. */
+const quarantinedTools = new Map<string, string>()
+
+function codexToolHash(spec: CodexToolSpec): string {
+  return createHash('sha256').update(JSON.stringify(spec)).digest('hex').slice(0, 16)
+}
+
+function isQuarantinedCodexTool(spec: CodexToolSpec): boolean {
+  return quarantinedTools.size > 0 && quarantinedTools.get(spec.name) === codexToolHash(spec)
+}
+
+export interface CodexToolSchemaRejection {
+  toolName?: string
+  toolIndex?: number
+  message: string
+}
+
+/**
+ * The tool a 400 names as having invalid parameters, whether the rejection
+ * came back as the HTTP response or, from another validator on the same
+ * backend, as an error event inside the stream (both measured).
+ */
+export function parseCodexToolSchemaRejection(err: unknown): CodexToolSchemaRejection | null {
+  const status = (err as { status?: unknown } | null)?.status
+  const body = (err as { body?: unknown } | null)?.body
+  if (status !== 400 || typeof body !== 'string') return null
+  let message = body
+  let code: unknown
+  let param: unknown
+  try {
+    const parsed = JSON.parse(body) as Record<string, unknown>
+    const error = (isRecord(parsed.error) ? parsed.error : parsed) as Record<string, unknown>
+    if (typeof error.message === 'string') message = error.message
+    code = error.code
+    param = error.param
+  } catch {
+    // Not JSON: match on the raw text below.
+  }
+  const toolName = /Invalid schema for function '([^']+)'/.exec(message)?.[1]
+  const index = typeof param === 'string' ? /^tools\[(\d+)\]/.exec(param)?.[1] : undefined
+  if (!toolName && !(code === 'invalid_function_parameters' && index !== undefined)) return null
+  return {
+    ...(toolName !== undefined && { toolName }),
+    ...(index !== undefined && { toolIndex: Number(index) }),
+    message,
+  }
+}
+
+/**
+ * Leave the rejected tool out of the next request (the retry included).
+ * Returns its name, or null when the tool is a native one or was already left
+ * out, in which case the error surfaces as it is.
+ */
+function quarantineRejectedCodexTool(
+  rejection: CodexToolSchemaRejection,
+  requestTools: CodexToolSpec[] | undefined,
+  externalNames: Set<string>,
+): string | null {
+  const tools = requestTools ?? []
+  const spec = rejection.toolName !== undefined
+    ? tools.find(tool => tool.name === rejection.toolName)
+    : tools[rejection.toolIndex ?? -1]
+  if (!spec || !externalNames.has(spec.name)) return null
+  const hash = codexToolHash(spec)
+  if (quarantinedTools.get(spec.name) === hash) return null
+  quarantinedTools.set(spec.name, hash)
+  logForDebugging(
+    `[codex-lane] OpenAI rejected the schema of ${spec.name}; leaving it out for this process. `
+    + `Server said: ${rejection.message.replace(/\s+/g, ' ').slice(0, 600)}`,
+    { level: 'warn' },
+  )
+  return spec.name
+}
+
+/** Test-only: forget every recorded rejection and tool order. */
+export function _resetCodexToolRejectionsForTest(): void {
+  quarantinedTools.clear()
+  toolOrderSnapshots.clear()
+}
+
+// ─── System-prompt stable / volatile split ───────────────────────
+//
+// Codex's `instructions` field gets hashed into the OpenAI prompt-cache
+// prefix exactly like the leading `input` items do. When env / git /
+// memory bytes leak into `instructions` they shift the prefix hash
+// turn-to-turn, which is the dominant cause of "cache hits but is
+// unstable" with heavy tool-call sessions or model swaps.
+//
+// claude.ts only inserts the explicit `__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__`
+// marker when `shouldUseGlobalCacheScope()` is true (firstParty only),
+// so the codex lane has to handle the no-marker case too. The fallback
+// regex set is the same one battle-tested in
+// `src/services/api/providers/gemini_provider.ts:splitSystemInstruction`
+// — it keys off the env block, current date, git status, and recent
+// commits/branch sections that claudex's prompt builder always emits at
+// the tail when a marker is absent.
+
+const CODEX_DYNAMIC_BOUNDARY = '__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__'
+
+const CODEX_VOLATILE_PATTERNS: readonly RegExp[] = [
+  /<env>[\s\S]*?<\/env>/,                 // computeEnvInfo block
+  /# Environment\b[\s\S]*?(?=\n#|$)/,    // computeSimpleEnvInfo block
+  /# currentDate\n[^\n]+/,                 // "Today's date is …"
+  /# gitStatus\b[\s\S]*?(?=\n#|$)/,       // claude.ts gitStatus section
+  /gitStatus:[\s\S]*?(?=\n\n|\n#|$)/,    // alt key form
+  /Current branch:[\s\S]*?(?=\n\n|\n#|$)/, // recent commits + branch
+]
+
+export function splitCodexSystemForCache(text: string): {
+  stable: string
+  volatile: string
+} {
+  if (!text) return { stable: '', volatile: '' }
+
+  // Primary path: explicit boundary marker (firstParty rollouts).
+  const markerIdx = text.indexOf(CODEX_DYNAMIC_BOUNDARY)
+  if (markerIdx >= 0) {
+    return {
+      stable: text.slice(0, markerIdx).replace(/\s+$/, ''),
+      volatile: text.slice(markerIdx + CODEX_DYNAMIC_BOUNDARY.length).replace(/^\s+/, ''),
+    }
+  }
+
+  // Fallback: pull known volatile chunks out of the tail. We only treat
+  // a match as volatile if it lands in the last 30% of the text — the
+  // dynamic sections are always appended at the end of the system
+  // prompt, and we don't want to accidentally strip a tool description
+  // that happens to contain the word "Environment".
+  const cutoff = Math.floor(text.length * 0.7)
+  const matches: Array<{ start: number; end: number; text: string }> = []
+  for (const pattern of CODEX_VOLATILE_PATTERNS) {
+    const m = text.match(pattern)
+    if (m && m.index != null && m.index >= cutoff) {
+      matches.push({ start: m.index, end: m.index + m[0].length, text: m[0] })
+    }
+  }
+  if (matches.length === 0) return { stable: text, volatile: '' }
+
+  // Carve from the earliest match's start to end of text. Anything
+  // between matches stays attached to the volatile tail — even if it
+  // doesn't itself match a known pattern, it's downstream of dynamic
+  // content and therefore can't be stable.
+  matches.sort((a, b) => a.start - b.start)
+  const cut = matches[0]!.start
+  return {
+    stable: text.slice(0, cut).replace(/\s+$/, ''),
+    volatile: text.slice(cut).replace(/^\s+/, ''),
+  }
+}
+
+// ─── Singleton ───────────────────────────────────────────────────
+
+export const codexLane = new CodexLane()

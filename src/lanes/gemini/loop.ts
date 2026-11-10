@@ -1,0 +1,2035 @@
+/**
+ * Gemini Lane — Native Agent Loop + Provider-Shim Entry
+ *
+ * Two entry points:
+ *
+ *   1. streamAsProvider(params) — single-turn, provider-shim-compatible.
+ *      Used by src/lanes/provider-bridge.ts. claude.ts owns the outer
+ *      turn-orchestration loop; the lane handles one native API call
+ *      per invocation.
+ *
+ *   2. run(context) — future lane-owns-loop mode. Not currently wired;
+ *      scaffold preserved for the Phase-2 migration where each lane owns
+ *      its full agent loop (per the architecture plan).
+ *
+ * Both paths speak Gemini's native REST API directly:
+ *   - POST /v1beta/models/{model}:streamGenerateContent?alt=sse
+ *   - Native functionDeclarations, not Anthropic tools schema
+ *   - Native thinkingConfig with thinkingBudget: -1 (dynamic)
+ *   - Native safetySettings (all OFF)
+ *   - Native cache (cachedContent field when available)
+ *
+ * References:
+ *   - google-gemini/gemini-cli packages/core/src/core/geminiChat.ts
+ *   - google-gemini/gemini-cli packages/core/src/agent/event-translator.ts
+ */
+
+import {
+  TOOL_DECODE_STATUS_KEY,
+  decodeToolArguments,
+  decodeStatusOf,
+  describeDecodeFailure,
+  type ToolDecodeStatus,
+} from '../../services/mcp/decodeStatus.js'
+import { createHash, randomUUID } from 'crypto'
+import type {
+  AnthropicStreamEvent,
+  ProviderTool,
+} from '../../services/api/providers/base_provider.js'
+import { logForDebugging } from '../../utils/debug.js'
+import { isAntigravityRetryHandled } from './antigravity_retry.js'
+import type {
+  Lane,
+  LaneRunContext,
+  LaneRunResult,
+  LaneProviderCallParams,
+  NormalizedUsage,
+} from '../types.js'
+import type { ModelInfo } from '../../services/api/providers/base_provider.js'
+import {
+  getRegistrationByNativeName,
+  buildGeminiFunctionDeclarations,
+  GEMINI_TOOL_REGISTRY,
+  linesFromReadRange,
+} from './tools.js'
+import {
+  appendAntigravityCacheDebugRow,
+  applyAntigravityPrefixPad,
+  guardAntigravityCommitWindow,
+  recordAntigravityCacheRead,
+  trackAntigravityCacheRequest,
+  writeAntigravityCacheDebugEntry,
+  type AntigravityCacheRequestContext,
+} from './antigravity_cache.js'
+import {
+  cancelAntigravityClaudeKeepAlive,
+  scheduleAntigravityClaudeKeepAlive,
+} from './antigravity_claude_keepalive.js'
+import {
+  freezeSessionVolatileText,
+  volatileFreezeKey,
+} from '../shared/volatile_freeze.js'
+import {
+  createRetryableConnectionError,
+  isAbortError,
+  isRetryableProviderError,
+} from '../../services/api/transport_error.js'
+import {
+  geminiApi,
+  isGeminiRetryableNetworkError,
+  TAU_QUERY_SOURCE_FIELD,
+  TAU_STABLE_SESSION_ID_FIELD,
+} from './api.js'
+import { getOrCreateCacheWithUsage, invalidateCache } from '../../services/api/providers/gemini_cache.js'
+import {
+  ANTIGRAVITY_MODEL_IDS,
+  describeAntigravityEntitlementGap,
+  isAntigravityGeminiModel,
+  resolveAntigravityWireModel,
+} from '../../services/api/providers/gemini_code_assist.js'
+import {
+  sanitizeSchemaForLane,
+  appendStrictParamsHint,
+  GEMINI_TOOL_USAGE_RULES,
+} from '../shared/mcp_bridge.js'
+import { geminiSafeToolName } from '../shared/gemini_schema.js'
+import { isOutputCapTruncation, laneStopReason } from '../shared/truncation.js'
+import { parseAntigravityClaudeTier } from '../../utils/model/antigravityClaudeTiers.js'
+import { selectGeminiToolsForRequest } from './lazy_tools.js'
+import {
+  resolveThinkingBudget as resolveGeminiThinkingBudget,
+  resolveThinkingConfig as resolveGeminiThinkingConfig,
+} from './thinking.js'
+
+// ─── Constants ───────────────────────────────────────────────────
+
+const MAX_TURNS = 100
+
+function uncachedInputTokens(promptTokens: number, cacheReadTokens: number): number {
+  return Math.max(0, promptTokens - cacheReadTokens)
+}
+
+// ─── Gemini Native Message Types ─────────────────────────────────
+
+interface GeminiContent {
+  role: 'user' | 'model'
+  parts: GeminiPart[]
+}
+
+type GeminiPart =
+  | { text: string }
+  | { functionCall: { id?: string; name: string; args: Record<string, unknown> }; thoughtSignature?: string }
+  | { functionResponse: { id?: string; name: string; response: { content: string } } }
+  | { thought: boolean; text: string }
+  | { inlineData: { mimeType: string; data: string } }
+
+// ─── The Lane Implementation ─────────────────────────────────────
+
+export class GeminiLane implements Lane {
+  readonly name = 'gemini'
+  readonly displayName = 'Google Gemini (Native)'
+
+  private _healthy = true
+
+  supportsModel(model: string): boolean {
+    const m = model.toLowerCase()
+    return m.startsWith('gemini-') || m.startsWith('gemma-')
+  }
+
+  // ── Provider-shim-compatible single-turn entry ──────────────────
+
+  async *streamAsProvider(
+    params: LaneProviderCallParams,
+  ): AsyncGenerator<AnthropicStreamEvent, NormalizedUsage> {
+    const {
+      model,
+      messages,
+      system,
+      tools,
+      max_tokens,
+      thinking,
+      signal,
+      sessionId,
+      providerHint,
+      querySource,
+    } = params
+
+    // Normalize system → plain string.
+    const systemText =
+      typeof system === 'string'
+        ? system
+        : (system ?? []).map(b => b.text).join('\n\n')
+
+    // Cache discipline: split stable (cache-eligible) from volatile
+    // (per-turn) sections at the Tau `__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__`
+    // marker. Everything before the marker is stable prefix (tools list,
+    // agent persona, instructions); everything after is volatile
+    // (git status, env, memory) and must live INSIDE the conversation
+    // as a leading user message — not in systemInstruction when we're
+    // using cachedContents — so the cache key stays byte-identical
+    // across turns. If the caller passed flat text without the marker,
+    // we fall back to treating the whole thing as stable (no regression).
+    const split = splitSystemAtBoundary(systemText)
+    const isAntigravityModel = ANTIGRAVITY_MODEL_IDS.has(model.toLowerCase())
+    const isAntigravityRequest = providerHint === 'antigravity' || isAntigravityModel
+    const isAntigravityGemini =
+      isAntigravityModel && isAntigravityGeminiModel(model)
+    const isAntigravityClaude = isAntigravityModel && !isAntigravityGemini
+    // Snapshot semantics for EVERY request on this lane, not just Antigravity
+    // Gemini: the API-key and Code Assist paths run Gemini's implicit cache,
+    // which hashes contents[] just like Antigravity's, and Claude resold
+    // through Antigravity anchors its prefix cache on the same leading block.
+    // A fresh volatile block each turn rewrites byte 0 of the conversation
+    // for all of them. See volatile_freeze.ts.
+    // Antigravity Gemini: key the frozen volatile by conversation LINEAGE
+    // (the sessionless fallback = hash of the first user message) instead of
+    // the caller's session id. Context-cloning side queries (tool-use
+    // summaries, away summaries) and full-context agents carry the main
+    // conversation verbatim but arrive under their own synthetic session ids;
+    // per-session keys made each of them freeze a FRESH volatile block,
+    // rewriting byte 0 of an otherwise identical prompt and forking a whole
+    // second cache lineage (live 2026-07-03: a summary side query re-paid
+    // ~38k tokens it would have read from the main session's entries).
+    // Lineage keying hands every clone the main conversation's exact frozen
+    // bytes; standalone agents hash their own first message as before.
+    const volatileText = freezeSessionVolatileText(
+      volatileFreezeKey('gemini', model, isAntigravityGemini ? undefined : sessionId, messages, split.volatileText),
+      split.volatileText,
+    )
+
+    // Build id→native-name map across the whole conversation so
+    // tool_result blocks can find their original Gemini function name.
+    const toolUseIdToNative = buildToolUseIdToNativeMap(messages)
+
+    // Convert Anthropic-format messages → Gemini native contents.
+    // If we have volatile content, inject it as a leading user message —
+    // FIXED position with frozen bytes (see above), so every implicit cache
+    // reads it as part of the stable prefix instead of a per-turn rewrite.
+    const contents = convertHistoryToGemini(messages, toolUseIdToNative)
+    if (volatileText) {
+      contents.unshift({
+        role: 'user',
+        parts: [{ text: volatileText }],
+      })
+    }
+
+    // Build function declarations: prefer the native schema from our
+    // registry for tools that match; pass through provider-shaped tools
+    // for anything we don't recognize (MCP tools, custom tools).
+    const requestTools = selectGeminiToolsForRequest(tools, messages, {
+      model,
+      providerHint,
+      sessionId,
+    })
+    const schemaFamily = geminiSchemaFamily(model)
+    const laneTools = buildLaneFunctionDeclarations(requestTools, schemaFamily)
+    const functionDeclarations = laneTools.declarations
+
+    // Keep real system/tool/history prefixes stable. Agents below the
+    // implicit-cache minimum get a fixed inert pad so their second request
+    // reads the first one's entry; everything else is padded only with
+    // TAU_ANTIGRAVITY_MAX_CACHE=1 (see applyAntigravityPrefixPad). Claude on
+    // Antigravity remains exempt from Gemini padding and recovery.
+    const stableText = isAntigravityGemini
+      ? applyAntigravityPrefixPad(
+        split.stableText,
+        JSON.stringify(functionDeclarations).length,
+        querySource,
+      )
+      : split.stableText
+
+    if (process.env.TAU_CACHE_DEBUG && isAntigravityGemini) {
+      console.error(`[tau-prompt] systemChars=${split.stableText.length} volatileChars=${(split.volatileText ?? '').length} toolsChars=${JSON.stringify(functionDeclarations).length} nTools=${functionDeclarations.length}`)
+    }
+
+    // Map thinkingBudget from Anthropic-format thinking param.
+    const thinkingBudget = resolveGeminiThinkingBudget(thinking)
+
+    // Try to place the stable portion of the request (system + tools) into
+    // Google's cachedContents API. On a hit, the model sees cache_read
+    // input tokens at ~25% of the normal rate — meaningful win when the
+    // same system+tools are re-used across turns of a session.
+    //
+    // Cache is API-key-path only today (OAuth proxy doesn't expose it).
+    // Use ONLY the stable slot for the cache body — volatile content
+    // rides the leading user message (see contents.unshift above) so the
+    // cache-key hash stays identical across turns.
+    const cacheSystemInstruction = { parts: [{ text: stableText }] }
+    const cacheTools = functionDeclarations.length > 0 ? [{ functionDeclarations }] : undefined
+
+    let cacheName: string | null = null
+    let cacheWriteTokens = 0
+    if (geminiApi.supportsServerCache(model)) {
+      const apiKey = geminiApi.getApiKey()
+      if (apiKey) {
+        try {
+          const cache = await getOrCreateCacheWithUsage({
+            model,
+            baseUrl: geminiApi.cacheBaseUrl,
+            apiKey,
+            systemInstruction: cacheSystemInstruction,
+            tools: cacheTools,
+          })
+          cacheName = cache?.cacheName ?? null
+          cacheWriteTokens = cache?.createdTokens ?? 0
+        } catch {
+          cacheName = null
+          cacheWriteTokens = 0
+        }
+      }
+    }
+
+    // When we ARE using a cache, the systemInstruction is already inside
+    // the cache body — don't duplicate it inline. When we're NOT caching,
+    // send the stable slot inline as systemInstruction; the volatile
+    // slot is already in the leading user message above.
+    const request = buildGeminiRequest({
+      model,
+      contents,
+      systemText: stableText,
+      functionDeclarations,
+      maxOutputTokens: max_tokens,
+      thinkingBudget,
+      thinking,
+      cacheName,
+    })
+    const cacheContext: AntigravityCacheRequestContext | undefined = isAntigravityGemini
+      ? { model, sessionId, querySource, requestId: randomUUID() }
+      : undefined
+    if (cacheContext) trackAntigravityCacheRequest(request, cacheContext)
+    if (isAntigravityRequest) {
+      // A stable body session ID and the cache-debug trace shape/observe the
+      // call without affecting latency, so they
+      // apply to every Antigravity request — Gemini and Claude alike.
+      request[TAU_STABLE_SESSION_ID_FIELD] = stableAntigravitySessionId(sessionId, messages)
+      // Lets host selection tell a one-shot /report from a conversation turn,
+      // so only the report may reorder hosts away from a warm cache pool.
+      if (querySource) request[TAU_QUERY_SOURCE_FIELD] = querySource
+      if (process.env.TAU_CACHE_DEBUG) {
+        writeAntigravityCacheDebugEntry(model, request, sessionId, cacheContext)
+      }
+    }
+    if (isAntigravityGemini) {
+      // Session-start commit-window guard: the 2nd/3rd requests of a session
+      // go FULL COLD when they fire before the first write commits (~8-22s
+      // async) — live-measured, each miss re-pays the whole ~20-30k prompt.
+      // Holds only over-minimum prompts, at most twice per session, and
+      // latches off on the first observed hit, so steady-state turns are
+      // never delayed. Subsumes the opt-in maxCache agent pacing (padded
+      // agent prompts pass the size gate). Gemini-only: Claude-on-Antigravity
+      // uses a low-minimum cache that never needs this.
+      const heldFrom = Date.now()
+      await guardAntigravityCommitWindow(
+        sessionId,
+        signal,
+        JSON.stringify(request).length,
+        querySource,
+        model,
+      )
+      if (cacheContext) cacheContext.pacingMs = Date.now() - heldFrom
+    }
+
+    // Track usage across the stream.
+    let promptTokens = 0
+    let inputTokens = 0
+    let outputTokens = 0
+    let thinkingTokens = 0
+    let cacheReadTokens = 0
+    // Proto3 JSON omits a zero count, so a response that never carried
+    // cachedContentTokenCount is an inferred zero, not an explicit one.
+    let cacheFieldSeen = false
+
+    // Stream state per turn.
+    const messageId = `gemini-${Date.now()}`
+    let thinkingText = ''
+    let responseText = ''
+    let blockIndex = 0
+    // Output-cap truncation: see ../shared/truncation.ts.
+    let outputCapTruncated = false
+    // Claude's refusals arrive through Antigravity as a SAFETY finish with no
+    // content; reported as a refusal so the user sees why the turn is empty.
+    let safetyStop = false
+    let inBlock: 'thinking' | 'text' | null = null
+    let messageStartEmitted = false
+    const toolCalls: Array<{
+      implId: string
+      nativeName: string
+      input: Record<string, unknown>
+      anthropicToolUseId: string
+      nativeArgs: Record<string, unknown>
+      thoughtSignature?: string
+    }> = []
+
+    // Accumulator for a streaming function call. Gemini splits function
+    // calls across SSE chunks: the first chunk carries the name with
+    // (often empty) args, and later chunks carry more args with an empty
+    // name as continuation deltas. Emitting a tool_use per chunk produces
+    // the `{}` → "Received input: {}" tool-integrity bug that bit us when
+    // the server decided to split. We accumulate until the call is known
+    // complete — when a new named call starts, text/thinking resumes, or
+    // the stream ends — then emit one atomic tool_use block.
+    //
+    // args can come through as either an object (proto-json Struct) or a
+    // JSON string (some serialization paths), so we buffer both: object
+    // fragments get merged; string fragments get concatenated and parsed
+    // at commit time. This mirrors the string/object fork in gemini-cli's
+    // parseToolArguments().
+    let currentCall: {
+      nativeName: string
+      args: Record<string, unknown>
+      argsString: string
+      hasArgs: boolean
+      hasStringArgs: boolean
+      invalidArgs?: ToolDecodeStatus
+      thoughtSignature?: string
+      blockIndex: number
+      anthropicToolUseId: string
+      anthropicToolUseIdFromServer: boolean
+    } | null = null
+
+    function mergeArgsIntoCurrent(raw: unknown): void {
+      if (!currentCall) return
+      if (raw === undefined) return // A name/id-only continuation is not an argument fragment.
+      currentCall.hasArgs = true
+      if (typeof raw === 'string') {
+        currentCall.hasStringArgs = true
+        currentCall.argsString += raw
+        return
+      }
+      if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+        Object.assign(currentCall.args, raw as Record<string, unknown>)
+      } else {
+        currentCall.invalidArgs = { category: 'invalid_root' }
+      }
+    }
+
+    function finalizeCurrentArgs(): {
+      args: Record<string, unknown>
+      decodeFailure?: ToolDecodeStatus
+    } {
+      if (!currentCall) return { args: {} }
+      const merged: Record<string, unknown> = { ...currentCall.args }
+      const decoded = decodeToolArguments(currentCall.hasStringArgs
+        ? currentCall.argsString
+        : currentCall.hasArgs ? merged : undefined)
+      const decodeFailure = currentCall.invalidArgs ?? decoded.status
+      return {
+        args: decodeFailure ? merged : { ...merged, ...decoded.input },
+        decodeFailure,
+      }
+    }
+
+    // Emit the accumulated tool call as the THREE-event sequence the
+    // Anthropic Messages streaming IR requires for tool_use blocks:
+    //   1. content_block_start with EMPTY input: {}
+    //   2. content_block_delta with input_json_delta.partial_json
+    //      carrying the full args as a JSON string
+    //   3. content_block_stop
+    //
+    // The downstream consumer (claude.ts / query.ts) accumulates the
+    // partial_json string across deltas and JSON.parse()s it at stop.
+    // If we emit content_block_start with input pre-filled (and no
+    // input_json_delta), the accumulator stays empty — the final input
+    // the shared tool layer sees is `{}` and EVERY tool call reports
+    // its required params missing. That is exactly the regression the
+    // legacy gemini_to_anthropic adapter's structure avoided.
+    function* commitCurrentCall(): Generator<AnthropicStreamEvent, void> {
+      if (!currentCall) return
+      const { args: nativeArgs, decodeFailure } = finalizeCurrentArgs()
+      const reg = getRegistrationByNativeName(currentCall.nativeName)
+      // MCP tools whose names had to be aliased for Gemini map back to the
+      // real tool name so the dispatcher resolves them.
+      const implId = reg?.implId
+        ?? laneTools.originalNames.get(currentCall.nativeName)
+        ?? currentCall.nativeName
+      const adaptedInput = reg && !decodeFailure ? reg.adaptInput(nativeArgs) : nativeArgs
+
+      toolCalls.push({
+        implId,
+        nativeName: currentCall.nativeName,
+        input: adaptedInput,
+        anthropicToolUseId: currentCall.anthropicToolUseId,
+        nativeArgs,
+        thoughtSignature: currentCall.thoughtSignature,
+      })
+
+      yield {
+        type: 'content_block_start',
+        index: currentCall.blockIndex,
+        content_block: {
+          type: 'tool_use',
+          id: currentCall.anthropicToolUseId,
+          name: implId,
+          input: {}, // placeholder — real args arrive via input_json_delta
+          // Decode failure rides on the block, beside the thought signature,
+          // because `input` is replaced by native adaptation.
+          ...(decodeFailure && {
+            [TOOL_DECODE_STATUS_KEY]: decodeFailure,
+          }),
+          // Stash the thought signature so we can thread it back on the
+          // next turn (Antigravity + thinking-enabled models need this
+          // for multi-turn reasoning coherence).
+          ...(currentCall.thoughtSignature && {
+            _gemini_thought_signature: currentCall.thoughtSignature,
+          }),
+        },
+      }
+      yield {
+        type: 'content_block_delta',
+        index: currentCall.blockIndex,
+        delta: {
+          type: 'input_json_delta',
+          partial_json: JSON.stringify(adaptedInput ?? {}),
+        },
+      }
+      yield { type: 'content_block_stop', index: currentCall.blockIndex }
+      currentCall = null
+    }
+
+    // Defer message_start until the first chunk arrives so we can fold
+    // cache-hit and input-token numbers into the initial usage block —
+    // Anthropic's AnthropicMessage.usage carries cache_read_input_tokens
+    // only on the initial message_start, so emitting it blank first loses
+    // the data. Mirrors the gemini_to_anthropic legacy adapter pattern.
+    const emitMessageStart = () => {
+      if (messageStartEmitted) return
+      messageStartEmitted = true
+      const cacheUsage = {
+        ...(cacheReadTokens > 0 && {
+          cache_read_input_tokens: cacheReadTokens,
+        }),
+        ...(cacheWriteTokens > 0 && {
+          cache_creation_input_tokens: cacheWriteTokens,
+        }),
+      }
+      return {
+        type: 'message_start' as const,
+        message: {
+          id: messageId,
+          type: 'message' as const,
+          role: 'assistant' as const,
+          content: [],
+          model,
+          stop_reason: null,
+          stop_sequence: null,
+          usage: {
+            input_tokens: inputTokens,
+            output_tokens: 0,
+            ...cacheUsage,
+          },
+        },
+      }
+    }
+
+    // A new main-thread turn replaces any cache refresher, whatever the model.
+    if (querySource === 'repl_main_thread') cancelAntigravityClaudeKeepAlive()
+
+    try {
+      const stream = geminiApi.streamGenerateContent(request, signal)
+
+      for await (const chunk of stream) {
+        if (signal.aborted) break
+
+        // Fold usage FIRST so message_start (emitted on first chunk) sees
+        // the correct cache-hit numbers before any blocks flow.
+        if (chunk.usageMetadata) {
+          const u = chunk.usageMetadata
+          promptTokens = u.promptTokenCount ?? promptTokens
+          outputTokens = u.candidatesTokenCount ?? outputTokens
+          thinkingTokens = u.thoughtsTokenCount ?? thinkingTokens
+          cacheReadTokens = u.cachedContentTokenCount ?? cacheReadTokens
+          if (u.cachedContentTokenCount !== undefined) cacheFieldSeen = true
+          inputTokens = uncachedInputTokens(promptTokens, cacheReadTokens)
+        }
+
+        if (!messageStartEmitted) {
+          const ev = emitMessageStart()
+          if (ev) yield ev
+        }
+
+        for (const candidate of chunk.candidates ?? []) {
+          // Gemini reports MAX_TOKENS here when the response hit the output
+          // ceiling. The legacy gemini_to_anthropic adapter mapped it to
+          // stop_reason 'max_tokens'; the native lane must too.
+          if (isOutputCapTruncation(candidate.finishReason)) outputCapTruncated = true
+          if (isAntigravityClaude && isSafetyFinish(candidate.finishReason)) safetyStop = true
+          for (const part of (candidate.content?.parts ?? []) as any[]) {
+            // ── Thinking part ──
+            if (part.thought === true && typeof part.text === 'string') {
+              // A text/thinking part ends any tool-call accumulation.
+              if (currentCall) {
+                yield* commitCurrentCall()
+              }
+              if (inBlock === 'text') {
+                yield { type: 'content_block_stop', index: blockIndex }
+                blockIndex++
+                inBlock = null
+                responseText = ''
+              }
+              if (inBlock !== 'thinking') {
+                yield {
+                  type: 'content_block_start',
+                  index: blockIndex,
+                  content_block: { type: 'thinking', thinking: '' },
+                }
+                inBlock = 'thinking'
+              }
+              thinkingText += part.text
+              yield {
+                type: 'content_block_delta',
+                index: blockIndex,
+                delta: { type: 'thinking_delta', thinking: part.text },
+              }
+              continue
+            }
+
+            // ── Text part ──
+            if (typeof part.text === 'string' && part.thought !== true) {
+              if (currentCall) {
+                yield* commitCurrentCall()
+              }
+              if (inBlock === 'thinking') {
+                yield { type: 'content_block_stop', index: blockIndex }
+                blockIndex++
+                inBlock = null
+                thinkingText = ''
+              }
+              if (inBlock !== 'text') {
+                yield {
+                  type: 'content_block_start',
+                  index: blockIndex,
+                  content_block: { type: 'text', text: '' },
+                }
+                inBlock = 'text'
+              }
+              responseText += part.text
+              yield {
+                type: 'content_block_delta',
+                index: blockIndex,
+                delta: { type: 'text_delta', text: part.text },
+              }
+              continue
+            }
+
+            // ── Function call part ──
+            //
+            // Gemini can split one logical tool call across multiple SSE
+            // chunks. The first carries the name (and usually empty or
+            // partial args); the rest carry more args with an empty name
+            // as continuation deltas. CLIProxyAPI calls out the same
+            // quirk in gemini_claude_response.go: "Handle streaming split/
+            // delta where name might be empty in subsequent chunks." We
+            // accumulate here and commit below (at a state transition or
+            // stream end) so the downstream tool_use block always carries
+            // the complete input.
+            if (part.functionCall) {
+              const fc = part.functionCall as {
+                id?: string
+                name?: string
+                args?: unknown
+              }
+              // thoughtSignature lives at Part level (sibling of functionCall),
+              // not inside functionCall. Server emits camelCase on the
+              // generativelanguage response; Code Assist emits snake_case.
+              const thoughtSignature =
+                (part as { thoughtSignature?: string; thought_signature?: string }).thoughtSignature
+                ?? (part as { thought_signature?: string }).thought_signature
+
+              const name = typeof fc.name === 'string' ? fc.name : ''
+
+              if (name === '' && currentCall) {
+                // Continuation of the in-progress call — merge more args.
+                mergeArgsIntoCurrent(fc.args)
+                if (thoughtSignature && !currentCall.thoughtSignature) {
+                  currentCall.thoughtSignature = thoughtSignature
+                }
+                // Late-arriving id (Antigravity → Claude occasionally splits
+                // the id across chunks) — backfill onto the in-progress call.
+                if (typeof fc.id === 'string' && fc.id && !currentCall.anthropicToolUseIdFromServer) {
+                  currentCall.anthropicToolUseId = fc.id
+                  currentCall.anthropicToolUseIdFromServer = true
+                }
+                continue
+              }
+
+              // New named call — commit any pending, close open text/
+              // thinking block, and start fresh.
+              if (currentCall) {
+                yield* commitCurrentCall()
+              }
+              if (inBlock !== null) {
+                yield { type: 'content_block_stop', index: blockIndex }
+                blockIndex++
+                inBlock = null
+                responseText = ''
+                thinkingText = ''
+              }
+
+              // Prefer the server-supplied id (Antigravity/Claude emits
+              // `functionCall.id` carrying Claude's original tool_use.id —
+              // preserving it keeps the id round-trip intact so the next
+              // turn's tool_result references an id Claude actually issued).
+              // Fall back to a synthetic toolu_gem_<uuid> when absent — that
+              // covers pure Gemini, which never emits ids.
+              const serverId = typeof fc.id === 'string' && fc.id ? fc.id : null
+              const anthropicToolUseId = serverId ?? `toolu_gem_${randomUUID()}`
+              currentCall = {
+                nativeName: name,
+                args: {},
+                argsString: '',
+                hasArgs: false,
+                hasStringArgs: false,
+                thoughtSignature,
+                blockIndex,
+                anthropicToolUseId,
+                anthropicToolUseIdFromServer: serverId !== null,
+              }
+              blockIndex++
+              mergeArgsIntoCurrent(fc.args)
+              continue
+            }
+          }
+        }
+      }
+    } catch (err: any) {
+      // Antigravity owns its complete, bounded recovery budget. Preserve the
+      // terminal marker even after output so outer layers cannot regenerate
+      // the request or turn the failure into ordinary assistant text.
+      if (isAntigravityRetryHandled(err)) {
+        currentCall = null
+        throw err
+      }
+      // If the server says the cached content doesn't exist (404 or
+      // specific string), invalidate so the next call builds fresh.
+      if (
+        cacheName
+        && err
+        && typeof err.body === 'string'
+        && (err.status === 404 || /cachedContent/i.test(err.body))
+      ) {
+        invalidateCache(cacheName)
+      }
+      // The API client already exhausted its bounded same-provider retry and
+      // account rotation. No output has been committed at this point, so the
+      // shared controller can safely retry the identical cached request.
+      if (!messageStartEmitted && isRetryableProviderError(err)) {
+        currentCall = null
+        throw err
+      }
+      // The backend rejected an MCP/custom tool's schema. Nothing was
+      // emitted yet, so leave that tool out and let the shared controller
+      // retry: the retry rebuilds the declarations without it, and the
+      // retry notice tells the user which tool was skipped.
+      if (!messageStartEmitted && !isAbortError(err, signal)) {
+        const skipped = quarantineRejectedDeclarations(err, laneTools, schemaFamily)
+        if (skipped.length > 0) {
+          currentCall = null
+          const providerName = isAntigravityRequest ? 'Antigravity' : 'Gemini'
+          throw createRetryableConnectionError(
+            `${providerName} rejected the tool schema of ${skipped.join(', ')}; retrying without ${skipped.length === 1 ? 'that tool' : 'those tools'}`,
+            err,
+          )
+        }
+      }
+      if (
+        !messageStartEmitted
+        && !isAbortError(err, signal)
+        && isGeminiRetryableNetworkError(err)
+      ) {
+        // The API client has exhausted its bounded same-request backoff. Do
+        // not persist that transport failure as an assistant turn: the shared
+        // retry controller can repeat the identical request while preserving
+        // prompt bytes and any provider-specific stable session affinity.
+        currentCall = null
+        const providerName = isAntigravityRequest ? 'Antigravity' : 'Gemini'
+        throw createRetryableConnectionError(
+          `${providerName} API connection error (model: ${model})`,
+          err,
+        )
+      }
+      // Make sure message_start is emitted so downstream assembly works.
+      if (!messageStartEmitted) {
+        const ev = emitMessageStart()
+        if (ev) yield ev
+      }
+      if (err?.name === 'AbortError' || signal.aborted) {
+        // Drop any in-flight tool call accumulator — its args are
+        // incomplete, so emitting it would give the model a garbage
+        // tool_use block on the next turn. The turn ends here.
+        currentCall = null
+        // Close any open block and signal abort.
+        if (inBlock !== null) {
+          yield { type: 'content_block_stop', index: blockIndex }
+        }
+        yield {
+          type: 'message_delta',
+          delta: { stop_reason: 'end_turn' },
+          usage: {
+            output_tokens: outputTokens,
+            input_tokens: inputTokens,
+            ...(cacheReadTokens > 0 && {
+              cache_read_input_tokens: cacheReadTokens,
+            }),
+            ...(cacheWriteTokens > 0 && {
+              cache_creation_input_tokens: cacheWriteTokens,
+            }),
+          },
+        }
+        yield { type: 'message_stop' }
+        return {
+          input_tokens: inputTokens,
+          output_tokens: outputTokens,
+          cache_read_tokens: cacheReadTokens,
+          cache_write_tokens: cacheWriteTokens,
+          thinking_tokens: thinkingTokens,
+        }
+      }
+      // Non-abort errors: same rationale as abort — an incomplete tool
+      // call shouldn't surface. Drop the accumulator before surfacing
+      // the error text block.
+      currentCall = null
+      // Surface other errors as a text block + end.
+      if (inBlock !== null) {
+        yield { type: 'content_block_stop', index: blockIndex }
+        blockIndex++
+      }
+      yield {
+        type: 'content_block_start',
+        index: blockIndex,
+        content_block: { type: 'text', text: '' },
+      }
+      // Prompt-too-long errors must surface with the Claude-Code signal
+      // prefix un-wrapped so query.ts reactive compact recognizes them
+      // via isPromptTooLongMessage(msg). GeminiApiError.message already
+      // starts with "Prompt is too long (Gemini N)" in that case.
+      const isPTL = (err as { isPromptTooLong?: boolean } | null)?.isPromptTooLong === true
+
+      // Auth-stale 403 that survived the one-shot re-onboard retry means
+      // the token itself is bad (account lost Antigravity access, scopes
+      // were revoked, or refresh expired). A raw "Gemini API error 403:
+      // The caller does not have permission" isn't actionable — replace
+      // with a concrete next-step message so the user knows to run /provider.
+      const errKind = (err as { kind?: string } | null)?.kind
+      // A 400 is the request's shape, not the account: never answer it with
+      // login / switch-model advice (it used to fall under non-retryable).
+      const isRequestRejected = err?.status === 400 && errKind !== 'validation-required'
+      const isTerminalAuth = errKind === 'auth-stale'
+        || errKind === 'non-retryable'
+        || (err?.status === 401 || err?.status === 403)
+      const isQuotaOrCapacity = errKind === 'retryable-quota'
+        || errKind === 'terminal-quota'
+        || err?.status === 429
+      const errText = isPTL
+        ? (err?.message ?? String(err))
+        : isRequestRejected
+          ? buildRequestRejectedMessage(err, model, laneTools)
+          : isTerminalAuth
+            ? buildAuthErrorMessage(err, model)
+            : isQuotaOrCapacity
+              ? buildQuotaErrorMessage(err, model)
+              : `\n\nGemini API error (model: ${model}): ${err?.message ?? String(err)}`
+      yield {
+        type: 'content_block_delta',
+        index: blockIndex,
+        delta: { type: 'text_delta', text: errText },
+      }
+      yield { type: 'content_block_stop', index: blockIndex }
+      yield {
+        type: 'message_delta',
+        delta: { stop_reason: 'end_turn' },
+        usage: {
+          output_tokens: outputTokens,
+          input_tokens: inputTokens,
+          ...(cacheReadTokens > 0 && {
+            cache_read_input_tokens: cacheReadTokens,
+          }),
+          ...(cacheWriteTokens > 0 && {
+            cache_creation_input_tokens: cacheWriteTokens,
+          }),
+        },
+      }
+      yield { type: 'message_stop' }
+      return {
+        input_tokens: inputTokens,
+        output_tokens: outputTokens,
+        cache_read_tokens: cacheReadTokens,
+        cache_write_tokens: cacheWriteTokens,
+        thinking_tokens: thinkingTokens,
+      }
+    }
+
+    // Cache usage is authoritative only after the stream completes. Initial
+    // metadata often has promptTokenCount but omits cachedContentTokenCount.
+    // Folding that provisional zero into the guard used up its cold-recovery
+    // budget on successful hits. Aborted/failed streams must not arm it either.
+    if (cacheContext && !signal.aborted) {
+      recordAntigravityCacheRead(
+        sessionId,
+        cacheReadTokens,
+        promptTokens,
+        querySource,
+        cacheContext,
+        cacheFieldSeen ? 'explicit' : 'omitted',
+      )
+    }
+
+    // Make sure message_start was emitted (edge case: empty response).
+    if (!messageStartEmitted) {
+      const ev = emitMessageStart()
+      if (ev) yield ev
+    }
+
+    // Commit any pending tool call — the stream ended without a state
+    // transition to force emission. This is the common case when a
+    // response is just one tool call: all the chunks are functionCall
+    // parts and the only trigger to commit is end-of-stream.
+    if (currentCall) {
+      // A call still uncommitted at MAX_TOKENS was being written when the
+      // response was cut off, so its args are a fragment. Discard it instead
+      // of committing a half-built call — see ../shared/truncation.ts. Any
+      // call followed by more output was already committed above, so this
+      // only ever drops the one that was genuinely in flight.
+      if (outputCapTruncated) currentCall = null
+      else yield* commitCurrentCall()
+    }
+
+    // Close final open block.
+    if (inBlock !== null) {
+      yield { type: 'content_block_stop', index: blockIndex }
+    }
+
+    // Decide stop reason: truncation first, then whether we emitted tool_use
+    // blocks (the model wants to run tools) or the model finished its turn.
+    const stopReason = safetyStop && toolCalls.length === 0
+      ? 'refusal'
+      : laneStopReason({
+        truncated: outputCapTruncated,
+        hadToolUse: toolCalls.length > 0,
+      })
+
+    if (isAntigravityClaude && querySource === 'repl_main_thread' && !signal.aborted) {
+      scheduleAntigravityClaudeKeepAlive(cacheRefresher(request), {
+        // A switch to another provider leaves this prompt behind. Required
+        // lazily: the provider module pulls the config graph into lane tests.
+        shouldContinue: () => {
+          // eslint-disable-next-line @typescript-eslint/no-require-imports
+          const providers = require('../../utils/model/providers.js') as typeof import('../../utils/model/providers.js')
+          return providers.getAPIProvider() === 'antigravity'
+        },
+      })
+    }
+
+    yield {
+      type: 'message_delta',
+      delta: { stop_reason: stopReason },
+      // Fold end-of-stream usage into message_delta. Gemini delivers
+      // usageMetadata only in the final chunk, so message_start was emitted
+      // with zeros. updateUsage (claude.ts) picks these up via its > 0 guard
+      // — without this, cache_read_input_tokens always displays as 0 on the
+      // CLI / Google-account path even when Gemini reports a cache hit.
+      usage: {
+        output_tokens: outputTokens,
+        input_tokens: inputTokens,
+        ...(cacheReadTokens > 0 && {
+          cache_read_input_tokens: cacheReadTokens,
+        }),
+        ...(cacheWriteTokens > 0 && {
+          cache_creation_input_tokens: cacheWriteTokens,
+        }),
+      },
+    }
+    yield { type: 'message_stop' }
+
+    return {
+      input_tokens: inputTokens,
+      output_tokens: outputTokens,
+      cache_read_tokens: cacheReadTokens,
+      cache_write_tokens: cacheWriteTokens,
+      thinking_tokens: thinkingTokens,
+    }
+  }
+
+  // ── Lane-owns-loop mode (future Phase-2 migration) ─────────────
+
+  async *run(context: LaneRunContext): AsyncGenerator<AnthropicStreamEvent, LaneRunResult> {
+    // Lane-owns-loop isn't wired into the query pipeline yet. For now this
+    // delegates to streamAsProvider so the interface stays usable if called.
+    const { model, messages, systemParts, mcpTools, signal, maxTokens } = context
+
+    // Synthesize a system string from SystemPromptParts.
+    const systemText = assembleSystemFromParts(systemParts)
+
+    // Aggregate lane-native tool defs + MCP tools in provider-tool shape.
+    const allTools = [
+      ...GEMINI_TOOL_REGISTRY.map(r => ({
+        name: r.implId,
+        description: r.nativeDescription,
+        input_schema: r.nativeSchema,
+      })),
+      ...mcpTools,
+    ]
+
+    const totalUsage: NormalizedUsage = {
+      input_tokens: 0,
+      output_tokens: 0,
+      cache_read_tokens: 0,
+      cache_write_tokens: 0,
+      thinking_tokens: 0,
+    }
+
+    let currentMessages = messages
+    let turnCount = 0
+
+    while (turnCount < MAX_TURNS) {
+      if (signal.aborted) return { stopReason: 'aborted', usage: totalUsage }
+      turnCount++
+
+      const callsByIndex = new Map<number, {
+        id: string; name: string; input: Record<string, unknown>
+        inputJson: string; status?: ToolDecodeStatus
+        completed: boolean
+      }>()
+
+      const gen = this.streamAsProvider({
+        model,
+        messages: currentMessages,
+        system: systemText,
+        tools: allTools,
+        max_tokens: maxTokens,
+        signal,
+      })
+
+      // Forward events while collecting tool_use blocks for execution.
+      let done = false
+      let stopReason: 'end_turn' | 'tool_use' = 'end_turn'
+      while (!done) {
+        const next = await gen.next()
+        if (next.done) {
+          const u = next.value
+          totalUsage.input_tokens += u.input_tokens
+          totalUsage.output_tokens += u.output_tokens
+          totalUsage.cache_read_tokens += u.cache_read_tokens
+          totalUsage.cache_write_tokens += u.cache_write_tokens
+          totalUsage.thinking_tokens += u.thinking_tokens
+          done = true
+          break
+        }
+        const ev = next.value
+        yield ev
+        if (
+          ev.type === 'content_block_start'
+          && ev.content_block?.type === 'tool_use'
+          && ev.content_block.id
+          && ev.content_block.name
+        ) {
+          callsByIndex.set(ev.index!, {
+            id: ev.content_block.id,
+            name: ev.content_block.name,
+            input: {},
+            inputJson: '',
+            status: decodeStatusOf(ev.content_block),
+            completed: false,
+          })
+        }
+        if (ev.type === 'content_block_delta' && ev.delta?.type === 'input_json_delta') {
+          const call = callsByIndex.get(ev.index!)
+          if (call) call.inputJson += ev.delta.partial_json ?? ''
+        }
+        if (ev.type === 'content_block_stop') {
+          const call = callsByIndex.get(ev.index!)
+          if (call) call.completed = true
+        }
+        if (ev.type === 'message_delta' && ev.delta?.stop_reason === 'tool_use') {
+          stopReason = 'tool_use'
+        }
+      }
+
+      if (signal.aborted) return { stopReason: 'aborted', usage: totalUsage }
+      const collectedToolUses = [...callsByIndex.values()].filter(call => call.completed).map(call => {
+        const decoded = decodeToolArguments(call.inputJson)
+        return { ...call, input: decoded.input, status: call.status ?? decoded.status }
+      })
+      if (stopReason !== 'tool_use' || collectedToolUses.length === 0) {
+        return { stopReason: 'end_turn', usage: totalUsage }
+      }
+
+      // Execute tools via the shared layer and feed results back.
+      const toolResultBlocks = await Promise.all(
+        collectedToolUses.map(async tu => {
+          try {
+            if (tu.status) throw new Error(describeDecodeFailure(tu.name, tu.status))
+            const result = await context.executeTool(tu.name, tu.input)
+            return {
+              type: 'tool_result' as const,
+              tool_use_id: tu.id,
+              content: typeof result.content === 'string'
+                ? result.content
+                : JSON.stringify(result.content),
+              is_error: result.isError,
+            }
+          } catch (e: any) {
+            return {
+              type: 'tool_result' as const,
+              tool_use_id: tu.id,
+              content: `Error: ${e?.message ?? String(e)}`,
+              is_error: true,
+            }
+          }
+        }),
+      )
+
+      currentMessages = [
+        ...currentMessages,
+        {
+          role: 'assistant',
+          content: collectedToolUses.map(tu => ({
+            type: 'tool_use',
+            id: tu.id,
+            name: tu.name,
+            input: tu.input,
+          })),
+        },
+        { role: 'user', content: toolResultBlocks },
+      ]
+    }
+
+    return { stopReason: 'max_turns', usage: totalUsage }
+  }
+
+  async listModels(providerFilter?: string): Promise<ModelInfo[]> {
+    return geminiApi.listModels(providerFilter)
+  }
+
+  resolveModel(model: string): string {
+    return model
+  }
+
+  smallFastModel(): string {
+    // CLI-OAuth flash-lite is the cheapest Gemini model we can reach
+    // on any auth path. API-key users could pay for the same via the
+    // Studio endpoint; OAuth users get it free on the Code Assist pool.
+    return 'gemini-2.5-flash-lite'
+  }
+
+  isHealthy(): boolean {
+    return this._healthy
+  }
+
+  setHealthy(healthy: boolean): void {
+    this._healthy = healthy
+  }
+
+  dispose(): void {
+    // No resources to release yet. When we add cachedContent lifetime
+    // management we'll clean up here.
+  }
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────
+
+/**
+ * @deprecated Used by the lane-owns-loop `run()` scaffold only. The
+ * real path (`streamAsProvider`) already receives a pre-assembled
+ * `system` string from `query.ts`. When `run()` is wired end-to-end
+ * in Phase 2 of the redesign this flattens the split only for lanes
+ * that can't carry a separate cache surface; Gemini proper should
+ * instead call `assembleGeminiSystemPrompt` and place `stable` in
+ * `systemInstruction` / cachedContents, `volatile` inline as the
+ * leading user message.
+ */
+function assembleSystemFromParts(parts: {
+  memory?: string
+  environment?: string
+  gitStatus?: string
+  toolsAddendum?: string
+  mcpIntro?: string
+  skillsContext?: string
+  customInstructions?: string
+}): string {
+  const sections: string[] = []
+  if (parts.customInstructions) sections.push(parts.customInstructions)
+  if (parts.toolsAddendum) sections.push(parts.toolsAddendum)
+  if (parts.mcpIntro) sections.push(parts.mcpIntro)
+  if (parts.skillsContext) sections.push(`Skills:\n${parts.skillsContext}`)
+  if (parts.memory) sections.push(`Context:\n${parts.memory}`)
+  if (parts.environment) sections.push(parts.environment)
+  if (parts.gitStatus) sections.push(`Git status:\n${parts.gitStatus}`)
+  return sections.join('\n\n')
+}
+
+// Build a map of tool_use_id → native tool name by scanning the history
+// for tool_use blocks. Some blocks emit an implId as their name, others may
+// already carry the native name. We record both candidates keyed by id.
+function buildToolUseIdToNativeMap(
+  messages: import('../../services/api/providers/base_provider.js').ProviderMessage[],
+): Map<string, string> {
+  const map = new Map<string, string>()
+  for (const msg of messages) {
+    if (typeof msg.content === 'string') continue
+    for (const block of msg.content) {
+      if (block.type === 'tool_use' && block.id && block.name) {
+        // Resolve the block's name → native name. If name is an implId, look
+        // up the first native registration; otherwise it is an MCP/custom
+        // tool and uses the same wire name as its declaration.
+        const native = implIdToNative(block.name) ?? geminiSafeToolName(block.name)
+        map.set(block.id, native)
+      }
+    }
+  }
+  return map
+}
+
+// ─── History Conversion ──────────────────────────────────────────
+//
+// Anthropic-IR ProviderMessage[] → Gemini native GeminiContent[].
+// Handles the shared-impl-name ↔ native-name mapping transparently.
+
+function convertHistoryToGemini(
+  messages: import('../../services/api/providers/base_provider.js').ProviderMessage[],
+  toolUseIdToNative: Map<string, string>,
+): GeminiContent[] {
+  const contents: GeminiContent[] = []
+
+  for (const msg of messages) {
+    const role: 'user' | 'model' = msg.role === 'assistant' ? 'model' : 'user'
+    const parts: GeminiPart[] = []
+
+    if (typeof msg.content === 'string') {
+      if (msg.content.length > 0) parts.push({ text: msg.content })
+    } else {
+      for (const block of msg.content) {
+        switch (block.type) {
+          case 'text':
+            if (block.text) parts.push({ text: block.text })
+            break
+          case 'tool_use':
+            if (block.name) {
+              const nativeName = implIdToNative(block.name) ?? geminiSafeToolName(block.name)
+              const nativeInput = implToNativeInput(block.name, block.input ?? {})
+              // thoughtSignature lives on the Part (sibling of functionCall),
+              // NOT inside functionCall — the proto has it at Part level.
+              // Only emit when we captured a real one from the prior turn;
+              // the server rejects placeholder/synthetic values.
+              // Carry block.id on functionCall.id — Antigravity's Gemini→
+              // Anthropic bridge uses it to populate tool_use.id on the
+              // request it forwards to Claude. Without it Claude rejects
+              // with "messages.N.content.M.tool_use.id: Field required".
+              const fc: GeminiPart = {
+                functionCall: {
+                  ...(block.id ? { id: block.id } : {}),
+                  name: nativeName,
+                  args: nativeInput,
+                },
+                ...(block._gemini_thought_signature && {
+                  thoughtSignature: block._gemini_thought_signature,
+                }),
+              }
+              parts.push(fc)
+            }
+            break
+          case 'tool_result': {
+            const id = block.tool_use_id ?? ''
+            const nativeName = (id && toolUseIdToNative.get(id)) ?? 'unknown'
+            // Split content into text (→ functionResponse.content) and
+            // image parts (→ sibling inlineData Parts). Gemini natively
+            // handles multimodal function responses via adjacent
+            // inlineData parts — stringifying base64 images into a text
+            // JSON blob would dump raw bytes into the model's context.
+            const { text, images } = splitToolResultContent(block.content)
+            // Carry tool_use_id on functionResponse.id so Antigravity can
+            // round-trip Claude's tool_use_id → tool_result matching.
+            parts.push({
+              functionResponse: {
+                ...(id ? { id } : {}),
+                name: nativeName,
+                response: { content: text },
+              },
+            })
+            for (const img of images) {
+              parts.push({ inlineData: img })
+            }
+            break
+          }
+          case 'thinking':
+            if (block.thinking) parts.push({ thought: true, text: block.thinking })
+            break
+          case 'image': {
+            // Pasted screenshots arrive as an Anthropic image block on the
+            // user message. The tool-result path already maps these to
+            // inlineData; without this case they were dropped, leaving the
+            // `[Image #N]` marker in the text with nothing behind it.
+            const inline = imageBlockToInlineData(block)
+            if (inline) parts.push({ inlineData: inline })
+            else parts.push({ text: '[image not sent: unsupported image source]' })
+            break
+          }
+          default: {
+            // Anthropic `document` blocks (PDF attachments) aren't in
+            // ProviderContentBlock's union but do reach the lane. Gemini can
+            // take PDFs as inlineData, but only under a request-size budget
+            // this converter doesn't own — say so rather than drop silently.
+            if ((block as { type: string }).type === 'document') {
+              // Gemini can take PDFs as inlineData, but only under a
+              // request-size budget this converter does not own. Say so
+              // rather than dropping it silently. No OCR on this lane.
+              const mime = (block as { source?: { media_type?: string } }).source?.media_type
+                ?? 'application/pdf'
+              parts.push({ text: `[document not sent (${mime}): this lane forwards images only]` })
+            }
+            break
+          }
+        }
+      }
+    }
+
+    if (parts.length > 0) contents.push({ role, parts })
+  }
+
+  return contents
+}
+
+/** Test-only handle on the Anthropic-IR → Gemini `contents` conversion. */
+export function _convertHistoryToGeminiForTest(
+  messages: import('../../services/api/providers/base_provider.js').ProviderMessage[],
+  toolUseIdToNative: Map<string, string> = new Map(),
+): GeminiContent[] {
+  return convertHistoryToGemini(messages, toolUseIdToNative)
+}
+
+function stableAntigravitySessionId(
+  sessionId: string | undefined,
+  messages: import('../../services/api/providers/base_provider.js').ProviderMessage[],
+): string {
+  const source = sessionId?.trim() || firstUserTextFromMessages(messages)
+  return stableNegativeHash(source || JSON.stringify(messages.map(msg => msg.role)))
+}
+
+function firstUserTextFromMessages(
+  messages: import('../../services/api/providers/base_provider.js').ProviderMessage[],
+): string {
+  for (const msg of messages) {
+    if (msg.role !== 'user') continue
+    if (typeof msg.content === 'string') return msg.content
+    const text = msg.content
+      .map(block => block.type === 'text' ? block.text ?? '' : '')
+      .filter(Boolean)
+      .join('\n')
+    if (text) return text
+  }
+  return ''
+}
+
+function stableNegativeHash(text: string): string {
+  let hash = 0
+  for (const ch of text) {
+    hash = ((hash << 5) - hash + ch.charCodeAt(0)) | 0
+  }
+  return `-${Math.abs(hash).toString()}`
+}
+
+/**
+ * Map an Anthropic image block onto a Gemini `inlineData` part.
+ *
+ * Mirrors the mapping inside splitToolResultContent (the tool-result path,
+ * which already worked); kept as a separate helper so that path stays
+ * byte-for-byte untouched. Returns null for URL-only sources — Gemini does
+ * not fetch remote images, so the caller emits a marker instead.
+ */
+function imageBlockToInlineData(
+  block: unknown,
+): { mimeType: string; data: string } | null {
+  const src = (
+    block as { source?: { data?: string; media_type?: string; mediaType?: string } } | null
+  )?.source
+  if (!src || typeof src.data !== 'string' || src.data.length === 0) return null
+  return {
+    mimeType: src.media_type ?? src.mediaType ?? 'image/png',
+    data: src.data,
+  }
+}
+
+/**
+ * Split a tool_result block's content into text + image parts.
+ *
+ * Gemini accepts `inlineData` parts alongside `functionResponse` in the
+ * same user turn; that is the native way to hand an image back to the
+ * model. The legacy stringifier dumped image blocks into JSON, which
+ * meant base64 bytes hit the model as text tokens (useless + expensive).
+ *
+ * Input shapes:
+ *   - string                                              → all text
+ *   - Array<{type:'text',text}|{type:'image',source:{...}}>
+ *   - Array of bare `{text}` blocks (legacy)
+ */
+function splitToolResultContent(content: unknown): {
+  text: string
+  images: Array<{ mimeType: string; data: string }>
+} {
+  if (typeof content === 'string') {
+    return { text: content, images: [] }
+  }
+  if (!Array.isArray(content)) {
+    return { text: JSON.stringify(content ?? ''), images: [] }
+  }
+  const texts: string[] = []
+  const images: Array<{ mimeType: string; data: string }> = []
+  for (const b of content as any[]) {
+    if (!b || typeof b !== 'object') continue
+    if (b.type === 'text' && typeof b.text === 'string') {
+      texts.push(b.text)
+      continue
+    }
+    if (b.type === 'image' && b.source && typeof b.source === 'object') {
+      // Anthropic image source shape: { type: 'base64', media_type, data }
+      // Map into Gemini inlineData: { mimeType, data }. Bail on URL-only
+      // sources (Gemini doesn't fetch); stringify so the user sees something.
+      const src = b.source as {
+        type?: string
+        media_type?: string
+        mediaType?: string
+        data?: string
+        url?: string
+      }
+      const mimeType = src.media_type ?? src.mediaType ?? 'image/png'
+      if (typeof src.data === 'string' && src.data.length > 0) {
+        images.push({ mimeType, data: src.data })
+        continue
+      }
+      if (src.url) {
+        texts.push(`[image url: ${src.url}]`)
+        continue
+      }
+      texts.push(`[image attached: ${mimeType}]`)
+      continue
+    }
+    // Bare {text} legacy block or unknown shape.
+    if (typeof b.text === 'string') {
+      texts.push(b.text)
+      continue
+    }
+    texts.push(JSON.stringify(b))
+  }
+  return { text: texts.join('\n'), images }
+}
+
+// Map a shared impl id → native Gemini tool name (first match wins).
+// Returns undefined for unknown impls (MCP tools etc — caller treats the
+// name as already-native).
+const _implToNative = new Map<string, string>()
+function _ensureImplMap(): void {
+  if (_implToNative.size > 0) return
+  for (const reg of GEMINI_TOOL_REGISTRY) {
+    if (!_implToNative.has(reg.implId)) {
+      _implToNative.set(reg.implId, reg.nativeName)
+    }
+  }
+}
+function implIdToNative(implOrNative: string): string | undefined {
+  _ensureImplMap()
+  if (_implToNative.has(implOrNative)) return _implToNative.get(implOrNative)
+  // If it's already a native name, return as-is.
+  const reg = getRegistrationByNativeName(implOrNative)
+  if (reg) return reg.nativeName
+  return undefined
+}
+
+// Translate shared-impl input → native Gemini input shape, running it
+// through adaptInput's inverse where available. For most tools the shape
+// is nearly identical, but some (Read offset+limit ↔ start_line+end_line)
+// differ and we do the best-effort inverse here.
+function implToNativeInput(
+  implOrNative: string,
+  input: Record<string, unknown>,
+): Record<string, unknown> {
+  // If the caller already sent native-name input, pass through.
+  const byNative = getRegistrationByNativeName(implOrNative)
+  if (byNative) return input
+
+  // Find by impl id.
+  const reg = GEMINI_TOOL_REGISTRY.find(r => r.implId === implOrNative)
+  if (!reg) return input
+
+  // Specific inverse adapters for divergent shapes.
+  switch (reg.nativeName) {
+    case 'read_file': {
+      const out: Record<string, unknown> = { file_path: input.file_path }
+      if (input.include_source_maps != null) out.include_source_maps = input.include_source_maps
+      if (input.skeleton != null) out.skeleton = input.skeleton
+      return Object.assign(out, linesFromReadRange(input.offset, input.limit))
+    }
+    case 'replace': {
+      return {
+        file_path: input.file_path,
+        old_string: input.old_string,
+        new_string: input.new_string,
+        ...(input.replace_all != null && { allow_multiple: input.replace_all }),
+      }
+    }
+    case 'grep_search': {
+      const out: Record<string, unknown> = { pattern: input.pattern }
+      if (input.path != null) out.dir_path = input.path
+      if (input.glob != null) out.include_pattern = input.glob
+      if (input.head_limit != null) out.total_max_matches = input.head_limit
+      if (input.output_mode === 'files_with_matches') out.names_only = true
+      if (input.include_ignored != null) out.include_ignored = input.include_ignored
+      return out
+    }
+    default:
+      return input
+  }
+}
+
+type LaneFunctionDeclaration = { name: string; description: string; parameters: Record<string, unknown> }
+
+interface LaneToolDeclarations {
+  declarations: LaneFunctionDeclaration[]
+  /** Wire names of MCP / custom tools — the only ones that can be quarantined. */
+  externalNames: Set<string>
+  /** Wire name → original tool name, for names that had to be aliased. */
+  originalNames: Map<string, string>
+}
+
+/**
+ * Which validator a request meets: Claude resold through Antigravity is
+ * checked by Anthropic's rules, everything else by Gemini's, so a tool one
+ * rejects can still be offered to the other.
+ */
+type GeminiSchemaFamily = 'gemini' | 'claude'
+
+function geminiSchemaFamily(model: string): GeminiSchemaFamily {
+  return model.toLowerCase().includes('claude') ? 'claude' : 'gemini'
+}
+
+// ─── Rejected-tool quarantine ────────────────────────────────────
+//
+// Last line of defence behind the schema converter: if the backend still
+// rejects an MCP/custom tool's declaration (a rule it adds later, a shape
+// no test anticipated), that one tool is left out and the request retried,
+// instead of every turn failing. Keyed by the exact declaration bytes, so
+// a server that fixes its schema is offered again. Process-lifetime and
+// only ever grows, so the tool block changes once per rejection and then
+// stays byte-stable for the prompt cache. Built-in tools are never
+// quarantined — a rejection there is a Tau bug and must surface.
+
+const quarantinedDeclarations = new Map<string, string>()
+
+function declarationHash(decl: LaneFunctionDeclaration): string {
+  return createHash('sha256').update(JSON.stringify(decl)).digest('hex').slice(0, 16)
+}
+
+function isQuarantinedDeclaration(family: GeminiSchemaFamily, decl: LaneFunctionDeclaration): boolean {
+  if (quarantinedDeclarations.size === 0) return false
+  return quarantinedDeclarations.get(`${family}|${decl.name}`) === declarationHash(decl)
+}
+
+/** Indices of `tools[0].functionDeclarations` a 400 names (Gemini or Anthropic wording). */
+function rejectedDeclarationIndices(errorText: string): number[] {
+  const indices = new Set<number>()
+  for (const m of errorText.matchAll(/function_declarations\[(\d+)\]/g)) indices.add(Number(m[1]))
+  // Claude via Antigravity: "tools.24.custom.input_schema: Field required".
+  for (const m of errorText.matchAll(/\btools\.(\d+)\./g)) indices.add(Number(m[1]))
+  return [...indices].sort((a, b) => a - b)
+}
+
+function geminiErrorText(err: any): string {
+  return `${typeof err?.body === 'string' ? err.body : ''}\n${err?.message ?? ''}`
+}
+
+/**
+ * Quarantine the MCP/custom declarations a 400 names. Returns the wire names
+ * newly quarantined; empty when the error is not a tool-schema rejection or
+ * only names built-in tools.
+ */
+function quarantineRejectedDeclarations(
+  err: any,
+  tools: LaneToolDeclarations,
+  family: GeminiSchemaFamily,
+): string[] {
+  if (err?.status !== 400) return []
+  const text = geminiErrorText(err)
+  const newlyQuarantined: string[] = []
+  for (const index of rejectedDeclarationIndices(text)) {
+    const decl = tools.declarations[index]
+    if (!decl || !tools.externalNames.has(decl.name)) continue
+    const key = `${family}|${decl.name}`
+    const hash = declarationHash(decl)
+    if (quarantinedDeclarations.get(key) === hash) continue
+    quarantinedDeclarations.set(key, hash)
+    newlyQuarantined.push(decl.name)
+  }
+  if (newlyQuarantined.length > 0) {
+    logForDebugging(
+      `[gemini-lane] ${family} backend rejected tool schema(s) ${newlyQuarantined.join(', ')}; `
+      + `leaving them out for this process. Server said: ${text.replace(/\s+/g, ' ').slice(0, 600)}`,
+      { level: 'warn' },
+    )
+  }
+  return newlyQuarantined
+}
+
+/** Test-only: reset the rejected-tool quarantine. */
+export function _resetGeminiToolQuarantineForTest(): void {
+  quarantinedDeclarations.clear()
+}
+
+// Build function declarations from the active tool list passed in by the
+// caller. Tools matching our native registry use the native schema the
+// model was trained on; unknown tools (MCP, custom) are converted by the
+// Gemini schema converter and sent under a wire name both Antigravity
+// validators accept (identical to the original for every valid name).
+// Quarantined tools are left out, and a repeated wire name keeps only its
+// first declaration (Claude via Antigravity rejects duplicates).
+function buildLaneFunctionDeclarations(
+  tools: ProviderTool[],
+  family: GeminiSchemaFamily,
+): LaneToolDeclarations {
+  const result: LaneToolDeclarations = {
+    declarations: [],
+    externalNames: new Set(),
+    originalNames: new Map(),
+  }
+  const seen = new Set<string>()
+  const push = (decl: LaneFunctionDeclaration): boolean => {
+    if (seen.has(decl.name)) return false
+    seen.add(decl.name)
+    result.declarations.push(decl)
+    return true
+  }
+
+  for (const tool of tools) {
+    // Try to match by impl id first (how claude.ts names tools).
+    const byImpl = GEMINI_TOOL_REGISTRY.find(r => r.implId === tool.name)
+    if (byImpl) {
+      push({
+        name: byImpl.nativeName,
+        description: appendStrictParamsHint(byImpl.nativeDescription, byImpl.nativeSchema),
+        parameters: byImpl.nativeSchema,
+      })
+      continue
+    }
+
+    // Maybe the caller already gave us a native name.
+    const byNative = getRegistrationByNativeName(tool.name)
+    if (byNative) {
+      push({
+        name: byNative.nativeName,
+        description: appendStrictParamsHint(byNative.nativeDescription, byNative.nativeSchema),
+        parameters: byNative.nativeSchema,
+      })
+      continue
+    }
+
+    // Unknown tool — forward with its provider-shaped schema, routed
+    // through the shared MCP bridge sanitizer for the 'gemini' profile.
+    // Also append the STRICT PARAMETERS hint so Flash models see the
+    // field-level requirement plainly in the description — Flash is
+    // prone to emitting empty-args tool calls when the hint is absent.
+    const parameters = sanitizeSchemaForLane(
+      tool.input_schema ?? { type: 'object', properties: {} },
+      'gemini',
+    )
+    const decl: LaneFunctionDeclaration = {
+      name: geminiSafeToolName(tool.name),
+      description: appendStrictParamsHint(tool.description ?? '', parameters),
+      parameters,
+    }
+    if (isQuarantinedDeclaration(family, decl)) continue
+    if (!push(decl)) continue
+    result.externalNames.add(decl.name)
+    if (decl.name !== tool.name) result.originalNames.set(decl.name, tool.name)
+  }
+
+  return result
+}
+
+// ─── Antigravity Claude: refusals and cache refresh ──────────────
+
+const SAFETY_FINISH_REASONS = new Set([
+  'SAFETY',
+  'PROHIBITED_CONTENT',
+  'BLOCKLIST',
+  'SPII',
+  'RECITATION',
+])
+
+function isSafetyFinish(reason: unknown): boolean {
+  return typeof reason === 'string' && SAFETY_FINISH_REASONS.has(reason.toUpperCase())
+}
+
+/**
+ * A one-token copy of `request`. Re-reading the prompt it cached restarts the
+ * entry's 5-minute TTL (see antigravity_claude_keepalive.ts).
+ */
+function cacheRefresher(
+  request: Record<string, unknown>,
+): (signal: AbortSignal) => Promise<void> {
+  const ping = structuredClone(request)
+  ping.generationConfig = {
+    ...(ping.generationConfig as Record<string, unknown> | undefined),
+    maxOutputTokens: 1,
+  }
+  return async signal => {
+    let usage: Record<string, unknown> | undefined
+    for await (const chunk of geminiApi.streamGenerateContent(structuredClone(ping), signal)) {
+      usage = (chunk as { usageMetadata?: Record<string, unknown> }).usageMetadata ?? usage
+    }
+    if (process.env.TAU_CACHE_DEBUG) {
+      appendAntigravityCacheDebugRow({
+        ts: new Date().toISOString(),
+        kind: 'keepalive',
+        model: ping.model,
+        promptTokenCount: usage?.promptTokenCount,
+        cachedContentTokenCount: usage?.cachedContentTokenCount ?? 0,
+      })
+    }
+  }
+}
+
+// ─── Request Builder ─────────────────────────────────────────────
+
+interface GeminiRequestConfig {
+  model: string
+  contents: GeminiContent[]
+  systemText: string
+  functionDeclarations: LaneFunctionDeclaration[]
+  maxOutputTokens: number
+  thinkingBudget: number
+  thinking?: LaneProviderCallParams['thinking']
+  /** Server-side cache name from cachedContents API (if hit). */
+  cacheName?: string | null
+}
+
+function buildGeminiRequest(config: GeminiRequestConfig): Record<string, unknown> {
+  const {
+    model,
+    contents,
+    systemText,
+    functionDeclarations,
+    maxOutputTokens,
+    thinkingBudget,
+    thinking,
+    cacheName,
+  } = config
+
+  const hasTools = functionDeclarations.length > 0
+  // When tools are present, prepend the TOOL_USAGE_RULES preamble to the
+  // system instruction so the model treats the schema as authoritative
+  // and stops emitting empty-args tool calls. Byte cost is ~400; big
+  // quality win on Flash-class models that ignore the schema otherwise.
+  const systemTextWithRules = hasTools
+    ? `${GEMINI_TOOL_USAGE_RULES}\n${systemText}`
+    : systemText
+
+  // Antigravity pro/flash models (gemini-3.x family) expose a LEVEL-based
+  // thinking API (low/medium/high) rather than the legacy budget-int API.
+  // If we send `thinkingBudget: -1` (dynamic) on these, the server defaults
+  // to "high" thinking — which is why `-pro-low` was previously taking
+  // just as long as `-pro-high`. Translate model name suffix → thinking
+  // level to honor the user's choice.
+  //
+  //   gemini-3.1-pro-high → thinkingLevel: "high"
+  //   gemini-3.1-pro-low  → thinkingLevel: "low"
+  //   gemini-3-flash      → thinkingLevel: "low"   (flash default)
+  //   (other -flash, -lite preview, 2.5 family)   → thinkingBudget (legacy)
+  const thinkingConfig = resolveGeminiThinkingConfig(model, thinkingBudget, thinking)
+
+  const request: Record<string, unknown> = {
+    model,
+    contents,
+    generationConfig: {
+      maxOutputTokens,
+      topP: 0.95,
+      topK: 64,
+      thinkingConfig,
+    },
+    // Safety categories OFF — matches gemini-cli and CLIProxyAPI defaults so
+    // the model behaves the same way it does in its home environment.
+    safetySettings: [
+      { category: 'HARM_CATEGORY_HARASSMENT', threshold: 'OFF' },
+      { category: 'HARM_CATEGORY_HATE_SPEECH', threshold: 'OFF' },
+      { category: 'HARM_CATEGORY_SEXUALLY_EXPLICIT', threshold: 'OFF' },
+      { category: 'HARM_CATEGORY_DANGEROUS_CONTENT', threshold: 'OFF' },
+      { category: 'HARM_CATEGORY_CIVIC_INTEGRITY', threshold: 'BLOCK_NONE' },
+    ],
+  }
+
+  // Cache is mutually exclusive with inline system + tools — when the
+  // cachedContents API holds the stable portion, reference it and omit
+  // the duplicated fields. Otherwise send them inline every turn.
+  if (cacheName) {
+    request.cachedContent = cacheName
+  } else {
+    request.systemInstruction = { parts: [{ text: systemTextWithRules }] }
+    if (hasTools) {
+      request.tools = [{ functionDeclarations }]
+      // Server-side schema enforcement — Gemini rejects calls that don't
+      // match the declared schema BEFORE streaming them back, so empty-
+      // args hallucinations don't reach us (and don't burn tool-result
+      // retry cycles). This is the single most effective knob against
+      // the Flash empty-args problem the legacy adapter fought.
+      request.toolConfig = {
+        functionCallingConfig: { mode: 'VALIDATED' },
+      }
+    }
+  }
+
+  return request
+}
+
+// ─── Request-rejected (400) message formatting ───────────────────
+//
+// A 400 means the backend refused the request's shape before any model
+// ran. Show the whole server text (the auth wording cut it to 180 chars
+// and blamed the login) and name the tool when the error points at one.
+
+function googleErrorMessage(body: string): string | undefined {
+  try {
+    const parsed = JSON.parse(body)
+    const entry = Array.isArray(parsed) ? parsed[0] : parsed
+    const message = entry?.error?.message
+    return typeof message === 'string' && message.trim() ? message.trim() : undefined
+  } catch {
+    return undefined
+  }
+}
+
+function buildRequestRejectedMessage(err: any, model: string, tools: LaneToolDeclarations): string {
+  const body = typeof err?.body === 'string' ? err.body : ''
+  const detail = (googleErrorMessage(body) ?? (body || err?.message || String(err))).trim()
+  const shown = detail.length > 1500 ? `${detail.slice(0, 1500)}...` : detail
+  const named = [...new Set(
+    rejectedDeclarationIndices(geminiErrorText(err))
+      .map(index => tools.declarations[index]?.name)
+      .filter((name): name is string => typeof name === 'string'),
+  )]
+  const lines = [
+    '',
+    '',
+    `Gemini 400: the request was rejected before it reached the model (model: ${model}).`,
+    '',
+    `Server said: ${shown}`,
+    '',
+  ]
+  if (named.length > 0) lines.push(`The rejected schema belongs to: ${named.join(', ')}.`)
+  lines.push('This is a request-format problem, not a login, quota or model-access problem.')
+  return lines.join('\n')
+}
+
+// ─── Auth-error message formatting ───────────────────────────────
+//
+// A raw "Gemini API error 403: The caller does not have permission"
+// isn't actionable for the user. When the error is classified as
+// auth-stale / non-retryable / 401 / 403 we rewrite it into a message
+// that tells the user exactly what to do — and points at the right
+// remediation surface (Antigravity account page for Antigravity
+// models, /provider for OAuth refresh, /login for a fresh auth).
+
+// Antigravity-only model ids — these route through the Antigravity
+// quota pool and 403 if the user only has the Gemini-CLI OAuth token.
+// Kept in sync with the routing catalog in gemini_code_assist.ts.
+const ANTIGRAVITY_ONLY_MODEL_IDS = ANTIGRAVITY_MODEL_IDS
+
+function buildAuthErrorMessage(err: any, model?: string): string {
+  const status = err?.status
+  const statusPrefix = status ? `Gemini ${status} ` : 'Gemini '
+  const detail = (err?.body && typeof err.body === 'string')
+    ? err.body.slice(0, 180).replace(/\s+/g, ' ').trim()
+    : (err?.message ?? String(err))
+  const normalizedModel = model?.toLowerCase()
+  const isAntigravityOnly = !!normalizedModel && ANTIGRAVITY_ONLY_MODEL_IDS.has(normalizedModel)
+  const wireModel = isAntigravityOnly && model ? resolveAntigravityWireModel(model) : null
+  const modelLine = model ? `Model attempted: ${model}` : null
+  const wireModelLine = wireModel && wireModel !== model ? `Antigravity wire model: ${wireModel}` : null
+
+  // Antigravity-only models must stay on the Antigravity executor. Status
+  // determines whether the likely problem is OAuth/account access or an
+  // endpoint/wire-model rejection.
+
+  // Detect the Google "ghost project" 403 pattern. Per gemini-cli
+  // issues #24747 / #25189 / #25609, Google AI Pro/Ultra subscribers
+  // sometimes get an inaccessible cloudaicompanionProject auto-bound
+  // to their account; every Code Assist call then 403s. The only
+  // reliable client-side mitigation is a manual project override via
+  // GOOGLE_CLOUD_PROJECT.
+  const looksLikeGhostProject =
+    status === 403
+    && /cloudaicompanion|caller does not have permission|PERMISSION_DENIED/i.test(
+      typeof err?.body === 'string' ? err.body : String(err?.message ?? ''),
+    )
+
+  const lines = [
+    '',
+    '',
+    `${statusPrefix}request failed before it reached the model.`,
+    '',
+    ...(modelLine ? [modelLine, ''] : []),
+    ...(wireModelLine ? [wireModelLine, ''] : []),
+    `Server said: ${detail}`,
+    '',
+  ]
+
+  // A plan without the Claude 5.5 ids gets 404 for them from the daily host.
+  const planGap = isAntigravityOnly && status === 404 && model && parseAntigravityClaudeTier(model)
+    ? describeAntigravityEntitlementGap(model)
+    : null
+
+  if (planGap) {
+    lines.push(
+      planGap,
+      '',
+      'What to do: pick another model with `/model`, or run `/login antigravity` with a Pro or Ultra account.',
+    )
+  } else if (isAntigravityOnly) {
+    if (status === 404) {
+      lines.push(
+        'This model only routes through the Antigravity quota pool.',
+        'A 404 here means the Antigravity backend rejected the endpoint or wire model before generation started.',
+        'Tau sends Gemini 3.5 Flash through the model keys returned by Antigravity quota discovery and keeps the selected thinking level.',
+        'If this continues, run `/login antigravity` to refresh the Antigravity account or pick another model temporarily.',
+      )
+    } else {
+      lines.push(
+        'This model only routes through the Antigravity quota pool.',
+        'Make sure the Antigravity account is connected and has access:',
+        '  1. Run `/login antigravity` to refresh the Antigravity flow, or',
+        '  2. Pick a different Pro model (gemini-3.1-pro-preview,',
+        '     gemini-3-pro-preview, gemini-2.5-pro) which routes through',
+        '     the Gemini CLI executor.',
+      )
+    }
+  } else if (looksLikeGhostProject) {
+    lines.push(
+      'This is the known "ghost cloudaicompanionProject" 403 that hits',
+      'Google AI Pro/Ultra subscribers (gemini-cli issues #24747, #25189,',
+      '#25609). Google\'s backend auto-binds an inaccessible project ID',
+      'to the account. The only reliable client-side fixes:',
+      '  1. Set `GOOGLE_CLOUD_PROJECT=<your-project-id>` (or',
+      '     `GEMINI_CLOUD_PROJECT`) and restart Tau — Tau will',
+      '     skip the auto-discovered project and use yours instead.',
+      '     (Grab a project id from console.cloud.google.com on the same',
+      '     Google account you logged in with.)',
+      '  2. If `/models` is also missing your Pro models, set',
+      '     `GEMINI_SHOW_PRO_MODELS=true` to force-show them — Google\'s',
+      '     entitlement endpoints don\'t always reflect AI Pro subscriptions.',
+      '  3. Run `/provider` and reconnect — sometimes the next loadCodeAssist',
+      '     returns a working project on retry.',
+      '  4. As a last resort, switch to API key (set GEMINI_API_KEY and',
+      '     GEMINI_SHOW_API_KEY_LOGIN=true), which uses a different endpoint.',
+    )
+  } else {
+    lines.push(
+      'What to do:',
+      '  1. Run `/provider` to refresh your Gemini OAuth token, or',
+      '  2. Run `/login` and re-authorize the Google account, or',
+      '  3. Open https://antigravity.google.com/ to confirm the account still has access.',
+      '',
+      'If you have multiple Google accounts enrolled, the lane will',
+      'automatically rotate to the next healthy account on the next request.',
+    )
+  }
+
+  return lines.join('\n')
+}
+
+function buildQuotaErrorMessage(err: any, model?: string): string {
+  const status = err?.status
+  const details = err?.classification?.details
+  const serverMessage = typeof details?.message === 'string'
+    ? details.message
+    : extractGoogleErrorMessage(err?.body)
+      ?? (err?.message ?? String(err))
+  const retryAfterMs = typeof err?.retryAfterMs === 'number' ? err.retryAfterMs : undefined
+  const retryLine = retryAfterMs && retryAfterMs > 0
+    ? `Retry after: about ${Math.ceil(retryAfterMs / 1000)} seconds`
+    : null
+  const modelLine = model ? `Model attempted: ${model}` : null
+  const isAntigravityModel = !!model && ANTIGRAVITY_ONLY_MODEL_IDS.has(model.toLowerCase())
+
+  // An unentitled model returns the same 429 as real throttling, so say which
+  // one this is before offering throttling advice the user cannot act on.
+  const entitlementGap = model ? describeAntigravityEntitlementGap(model) : null
+
+  const lines = entitlementGap
+    ? [
+      '',
+      '',
+      entitlementGap,
+      '',
+      ...(modelLine ? [modelLine, ''] : []),
+      `Server said: ${serverMessage}`,
+      '',
+      'What to do: pick an entitled model with `/model`.',
+      '',
+    ]
+    : [
+      '',
+      '',
+      `${isAntigravityModel ? 'Antigravity' : 'Gemini'} request was throttled or capacity-limited${status ? ` (HTTP ${status})` : ''}.`,
+      '',
+      ...(modelLine ? [modelLine, ''] : []),
+      `Server said: ${serverMessage}`,
+      ...(retryLine ? ['', retryLine] : []),
+      '',
+    ]
+
+  if (entitlementGap) return lines.join('\n')
+
+  if (isAntigravityModel) {
+    lines.push(
+      'Tau retried this request and, when possible, marked the selected account/model family for rotation.',
+      'This can happen even when the usage page shows remaining quota, because the backend can throttle an endpoint or request window separately.',
+      'What to do:',
+      '  1. Wait for the Antigravity request window or backend capacity to recover, or',
+      '  2. Add/switch another Antigravity account with `/login antigravity`, or',
+      '  3. Pick a non-Antigravity model for now, such as gemini-3.1-pro-preview, gemini-3-pro-preview, or gemini-2.5-pro.',
+    )
+  } else {
+    lines.push(
+      'What to do:',
+      '  1. Wait for quota/capacity to recover, or',
+      '  2. Switch model/account/provider and retry.',
+    )
+  }
+
+  return lines.join('\n')
+}
+
+function extractGoogleErrorMessage(body: unknown): string | null {
+  if (typeof body !== 'string' || !body) return null
+  try {
+    const parsed = JSON.parse(body) as { error?: { message?: unknown }; message?: unknown }
+    const message = parsed.error?.message ?? parsed.message
+    return typeof message === 'string' ? message : null
+  } catch {
+    return null
+  }
+}
+
+// ─── System-prompt stable/volatile split ─────────────────────────
+//
+// Tau emits `__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__` as a separator
+// between cacheable (stable) and per-turn (volatile) content. When the
+// caller forwards a flat system string to the lane, we split on that
+// marker so our `cachedContents` body sees only stable bytes and the
+// cache key survives turn-to-turn. Falling back: if no marker found,
+// treat the whole thing as stable — matches previous behavior, no
+// regression for callers that haven't adopted the marker.
+
+const DYNAMIC_BOUNDARY = '__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__'
+
+function splitSystemAtBoundary(text: string): {
+  stableText: string
+  volatileText: string
+} {
+  if (!text) return { stableText: '', volatileText: '' }
+  const idx = text.indexOf(DYNAMIC_BOUNDARY)
+  if (idx < 0) return { stableText: text, volatileText: '' }
+  return {
+    stableText: text.slice(0, idx).replace(/\s+$/, ''),
+    volatileText: text.slice(idx + DYNAMIC_BOUNDARY.length).replace(/^\s+/, ''),
+  }
+}
+
+// ─── Singleton Export ────────────────────────────────────────────
+
+export const geminiLane = new GeminiLane()

@@ -1,0 +1,282 @@
+import { z } from 'zod/v4'
+import type { ValidationResult } from '../../Tool.js'
+import { buildTool, type ToolDef } from '../../Tool.js'
+import { getCwd } from '../../utils/cwd.js'
+import { isENOENT } from '../../utils/errors.js'
+import {
+  FILE_NOT_FOUND_CWD_NOTE,
+  suggestPathUnderCwd,
+} from '../../utils/file.js'
+import { getFsImplementation } from '../../utils/fsOperations.js'
+import { formatIgnoredNote, glob } from '../../utils/glob.js'
+import { lazySchema } from '../../utils/lazySchema.js'
+import { expandPath, toRelativePath } from '../../utils/path.js'
+import { checkReadPermissionForTool } from '../../utils/permissions/filesystem.js'
+import type { PermissionDecision } from '../../utils/permissions/PermissionResult.js'
+import { matchWildcardPattern } from '../../utils/permissions/shellRuleMatching.js'
+import { semanticBoolean } from '../../utils/semanticBoolean.js'
+import { DESCRIPTION, GLOB_TOOL_NAME } from './prompt.js'
+import {
+  getToolUseSummary,
+  renderToolResultMessage,
+  renderToolUseErrorMessage,
+  renderToolUseMessage,
+  userFacingName,
+} from './UI.js'
+
+const inputSchema = lazySchema(() =>
+  z.strictObject({
+    pattern: z.string().describe('File glob pattern'),
+    path: z
+      .string()
+      .optional()
+      .describe(
+        'Search directory; omit for cwd',
+      ),
+    include_ignored: semanticBoolean(z.boolean().optional()).describe(
+      'Also list files excluded by .gitignore/.ignore rules; default false',
+    ),
+  }),
+)
+type InputSchema = ReturnType<typeof inputSchema>
+
+const outputSchema = lazySchema(() =>
+  z.object({
+    durationMs: z
+      .number()
+      .describe('Time taken to execute the search in milliseconds'),
+    numFiles: z.number().describe('Total number of files found'),
+    filenames: z
+      .array(z.string())
+      .describe('Array of file paths that match the pattern'),
+    truncated: z
+      .boolean()
+      .describe('Whether results were truncated (limited to 100 files)'),
+    total: z
+      .number()
+      .optional()
+      .describe('Total matches found before truncation'),
+    shownEntries: z
+      .number()
+      .optional()
+      .describe('Distinct top-level entries represented in the returned page'),
+    totalEntries: z
+      .number()
+      .optional()
+      .describe('Distinct top-level entries across all matches'),
+    ignored: z
+      .object({
+        count: z.number().nullable(),
+        places: z.array(z.object({ path: z.string(), count: z.number() })),
+        morePlaces: z.number(),
+      })
+      .optional()
+      .describe(
+        'Matches left out because ignore files exclude them, and where they are',
+      ),
+  }),
+)
+type OutputSchema = ReturnType<typeof outputSchema>
+
+export type Output = z.infer<OutputSchema>
+
+/**
+ * Footer for a truncated glob result.
+ *
+ * Results come back ripgrep `--sort=modified`, which is OLDEST first, and the
+ * page is a plain head of that order. So an over-cap page is the oldest slice
+ * of the tree and routinely comes from a single directory: an unpacked archive
+ * or an npm install restores old mtimes and sorts straight to the front. A bare
+ * "results are truncated" lets the model read that page as a representative
+ * sample of the whole tree and conclude the project is whatever that one folder
+ * holds. Report how concentrated the page actually is, and say which knob fixes
+ * it. Falls back to the original wording when the spread is unknown or the page
+ * already covers every top-level entry.
+ */
+export function formatGlobTruncationNotice(output: {
+  numFiles: number
+  total?: number
+  shownEntries?: number
+  totalEntries?: number
+}): string {
+  const shown =
+    output.total !== undefined
+      ? `Showing ${output.numFiles} of ${output.total} matches`
+      : `Showing ${output.numFiles} matches`
+  const { shownEntries, totalEntries } = output
+  if (
+    shownEntries !== undefined &&
+    totalEntries !== undefined &&
+    totalEntries > shownEntries
+  ) {
+    const from =
+      shownEntries === 1
+        ? 'all from 1 top-level entry'
+        : `from only ${shownEntries} top-level entries`
+    return (
+      `(${shown}, ${from}, but ${totalEntries} top-level entries matched. ` +
+      'Results are ordered oldest-modified first, so this page is NOT a ' +
+      'representative sample of the tree. Pass `path` to search one entry, ' +
+      'or use a more specific pattern.)'
+    )
+  }
+  return `(${shown}. Consider using a more specific path or pattern.)`
+}
+
+export const GlobTool = buildTool({
+  name: GLOB_TOOL_NAME,
+  searchHint: 'find files by name pattern or wildcard',
+  maxResultSizeChars: 100_000,
+  async description() {
+    return DESCRIPTION
+  },
+  userFacingName,
+  getToolUseSummary,
+  getActivityDescription(input) {
+    const summary = getToolUseSummary(input)
+    return summary ? `Finding ${summary}` : 'Finding files'
+  },
+  get inputSchema(): InputSchema {
+    return inputSchema()
+  },
+  get outputSchema(): OutputSchema {
+    return outputSchema()
+  },
+  isConcurrencySafe() {
+    return true
+  },
+  isReadOnly() {
+    return true
+  },
+  toAutoClassifierInput(input) {
+    return input.pattern
+  },
+  isSearchOrReadCommand() {
+    return { isSearch: true, isRead: false }
+  },
+  getPath({ path }): string {
+    return path ? expandPath(path) : getCwd()
+  },
+  async preparePermissionMatcher({ pattern }) {
+    return rulePattern => matchWildcardPattern(rulePattern, pattern)
+  },
+  async validateInput({ path }): Promise<ValidationResult> {
+    // If path is provided, validate that it exists and is a directory
+    if (path) {
+      const fs = getFsImplementation()
+      const absolutePath = expandPath(path)
+
+      // SECURITY: Skip filesystem operations for UNC paths to prevent NTLM credential leaks.
+      if (absolutePath.startsWith('\\\\') || absolutePath.startsWith('//')) {
+        return { result: true }
+      }
+
+      let stats
+      try {
+        stats = await fs.stat(absolutePath)
+      } catch (e: unknown) {
+        if (isENOENT(e)) {
+          const cwdSuggestion = await suggestPathUnderCwd(absolutePath)
+          let message = `Directory does not exist: ${path}. ${FILE_NOT_FOUND_CWD_NOTE} ${getCwd()}.`
+          if (cwdSuggestion) {
+            message += ` Did you mean ${cwdSuggestion}?`
+          }
+          return {
+            result: false,
+            message,
+            errorCode: 1,
+          }
+        }
+        throw e
+      }
+
+      if (!stats.isDirectory()) {
+        return {
+          result: false,
+          message: `Path is not a directory: ${path}`,
+          errorCode: 2,
+        }
+      }
+    }
+
+    return { result: true }
+  },
+  async checkPermissions(input, context): Promise<PermissionDecision> {
+    const appState = context.getAppState()
+    return checkReadPermissionForTool(
+      GlobTool,
+      input,
+      appState.toolPermissionContext,
+    )
+  },
+  async prompt() {
+    return DESCRIPTION
+  },
+  renderToolUseMessage,
+  renderToolUseErrorMessage,
+  renderToolResultMessage,
+  // Reuses Grep's render (UI.tsx:65) — shows filenames.join. durationMs/
+  // numFiles are "Found 3 files in 12ms" chrome (under-count, fine).
+  extractSearchText({ filenames }) {
+    return filenames.join('\n')
+  },
+  async call(input, { abortController, getAppState, globLimits }) {
+    const start = Date.now()
+    const appState = getAppState()
+    const limit = globLimits?.maxResults ?? 100
+    const { files, truncated, total, shownEntries, totalEntries, ignored } =
+      await glob(
+        input.pattern,
+        GlobTool.getPath(input),
+        { limit, offset: 0 },
+        abortController.signal,
+        appState.toolPermissionContext,
+        { includeIgnored: input.include_ignored === true },
+      )
+    // Relativize paths under cwd to save tokens (same as GrepTool)
+    const filenames = files.map(toRelativePath)
+    const output: Output = {
+      filenames,
+      durationMs: Date.now() - start,
+      numFiles: filenames.length,
+      truncated,
+      total,
+      ...(shownEntries !== undefined && { shownEntries }),
+      ...(totalEntries !== undefined && { totalEntries }),
+      ...(ignored && {
+        ignored: {
+          ...ignored,
+          places: ignored.places.map(place => ({
+            ...place,
+            path: toRelativePath(place.path),
+          })),
+        },
+      }),
+    }
+    return {
+      data: output,
+    }
+  },
+  mapToolResultToToolResultBlockParam(output, toolUseID) {
+    // First line, so it survives when a large result is cut to a preview.
+    const ignoredNote = formatIgnoredNote(output.ignored)
+    if (output.filenames.length === 0) {
+      return {
+        tool_use_id: toolUseID,
+        type: 'tool_result',
+        content: ignoredNote
+          ? `No files found\n${ignoredNote}`
+          : 'No files found',
+      }
+    }
+    return {
+      tool_use_id: toolUseID,
+      type: 'tool_result',
+      content: [
+        ...(ignoredNote ? [ignoredNote] : []),
+        ...output.filenames,
+        ...(output.truncated ? [formatGlobTruncationNotice(output)] : []),
+      ].join('\n'),
+    }
+  },
+} satisfies ToolDef<InputSchema, Output>)

@@ -1,0 +1,3626 @@
+import { getOpenAISessionToken } from './auth/openai_oauth.js'
+import {
+  getClineOAuthToken,
+  getKiloCodeOAuthToken,
+  getValidCopilotOAuthToken,
+  getValidCursorOAuthToken,
+  getValidKiroOAuthToken,
+  refreshClineOAuth,
+} from './auth/oauth_services.js'
+import { getGeminiOAuthToken } from './auth/google_oauth.js'
+import { loadProviderKey } from './auth/api_key_manager.js'
+import { ANTIGRAVITY_OAUTH_STORAGE_KEY } from './auth/google_oauth.js'
+import { readStoredGoogleToken } from './auth/googleTokenPeek.js'
+import {
+  antigravityApiHeaders,
+  ensureCodeAssistReady,
+  fetchGeminiCliQuotaBuckets,
+  getGeminiTier,
+  peekCodeAssistProject,
+  type GeminiQuotaBucket,
+} from './providers/gemini_code_assist.js'
+import {
+  extractAntigravityModels,
+  hasAntigravity35FlashUsagePair,
+  parseAntigravityQuotaSummary,
+  parseAntigravityUsage,
+  type AntigravityUsageMetric,
+} from './antigravityUsageParser.js'
+import {
+  fireworksSummaryRange,
+  parseFireworksBillingSummary,
+  sumFireworksSpendSince,
+  type FireworksSpend,
+} from './fireworksBillingParser.js'
+import { fetchUtilization, type Utilization } from './usage.js'
+import {
+  filterLxdModelCatalog,
+  listLxdModelMeta,
+  recordLxdCatalog,
+  type LxdCatalogRow,
+} from '../../utils/model/lxdCatalog.js'
+import {
+  ANTIGRAVITY_TOKEN_MARGIN_MS,
+  REQUEST_ENDPOINTS_IN_ORDER,
+  loadStore,
+  peekAntigravityAccount,
+  refreshAccessToken,
+  saveStore,
+  selectActiveAntigravityAccount,
+  type AntigravityAccount,
+} from '../../lanes/shared/antigravity_auth.js'
+import {
+  getClaudeAIOAuthTokens,
+  getProviderBaseUrl,
+  getProviderApiKey,
+  getSubscriptionType,
+} from '../../utils/auth.js'
+import {
+  PROVIDER_DISPLAY_NAMES,
+  type APIProvider,
+} from '../../utils/model/providers.js'
+import {
+  ALIBABA_CN_BASE_URL,
+  ALIBABA_DEFAULT_BASE_URL,
+  alibabaRegionLabel,
+  listAlibabaModelMeta,
+  recordAlibabaLiveModels,
+} from '../../utils/model/alibabaCatalog.js'
+import type { ProviderWithUsageReporter } from './providerUsageCoverage.js'
+import {
+  checkXaiApiKey,
+  fetchXaiBilling,
+  getXaiManagementKey,
+  xaiKeyBlockReason,
+} from './xaiAccount.js'
+import { getXaiSessionSpend } from '../../lanes/openai-compat/xai_responses.js'
+import { checkMetaApiKey, META_BILLING_URL, META_USAGE_URL } from './metaAccount.js'
+import { getMetaSessionSpend } from '../../lanes/openai-compat/meta_responses.js'
+import { getProviderRateLimits } from './providerRateLimits.js'
+
+const TIMEOUT_MS = 8_000
+const CLINE_OAUTH_STORAGE = 'cline_oauth'
+const CLINE_REFRESH_BUFFER_MS = 5 * 60_000
+const DOCS = {
+  anthropic: 'https://platform.claude.com/docs/en/build-with-claude/usage-cost-api',
+  openai: 'https://platform.openai.com/docs/api-reference/usage/costs',
+  openrouter: 'https://openrouter.ai/docs/api-reference/credits/get-credits',
+  modelrouter: 'https://api.lxg2it.com/docs/api',
+  vercel: 'https://vercel.com/docs/ai-gateway/capabilities/usage',
+  requesty: 'https://docs.requesty.ai/api-reference/endpoint/manage-org-get',
+  deepseek: 'https://api-docs.deepseek.com/api/get-user-balance/',
+  mistral: 'https://docs.mistral.ai/api/endpoint/beta/observability/chat_completion_events',
+  glm: 'https://bigmodel.cn/finance/expensebill/list',
+  lxd: 'https://api.lxds.org/instructions',
+  mimo: 'https://xiaomimimo.com',
+  alibaba: 'https://www.alibabacloud.com/help/en/model-studio/billing-for-model-studio',
+  xai: 'https://docs.x.ai/developers/rest-api-reference/management/billing',
+  meta: 'https://dev.meta.ai/docs/pricing-rate-limits',
+  moonshot: 'https://platform.kimi.ai/docs/api/balance',
+  minimax: 'https://platform.minimax.io/docs/token-plan/faq',
+  cursor: 'https://docs.cursor.com/en/account/teams/admin-api',
+  copilot: 'https://docs.github.com/en/copilot/reference/copilot-usage-metrics/copilot-usage-metrics',
+} as const
+
+export type ProviderUsageStatus =
+  | 'ok'
+  | 'connected'
+  | 'not_configured'
+  | 'unsupported'
+  | 'error'
+
+export type UsageAuthMethod =
+  | 'oauth'
+  | 'api_key'
+  | 'admin_api_key'
+  | 'local'
+  | 'none'
+
+export type ProviderUsageId = APIProvider | 'codex'
+
+export type UsageMetric = {
+  label: string
+  usedPercent?: number
+  /**
+   * What is actually left, e.g. `$4.20 remaining`, for readings that measure
+   * a balance rather than a window. The status bar shows this in place of a
+   * percentage: a credit balance's used/granted ratio only ever climbs toward
+   * 100% and does not recover when the account is topped up, so it answers a
+   * different question than "can I keep working". /usage keeps its bar.
+   */
+  remaining?: string
+  summary?: string
+  detail?: string
+  resetsAt?: string | null
+  /**
+   * Model ids this window meters, where a provider bills per model rather than
+   * per account. The status bar needs the window for the model the session is
+   * actually running, and an id survives a vendor renaming its display label.
+   */
+  modelKeys?: readonly string[]
+}
+
+export type UsageLink = {
+  label: string
+  url: string
+  note?: string
+}
+
+export type ProviderUsageReport = {
+  provider: ProviderUsageId
+  name: string
+  status: ProviderUsageStatus
+  auth: UsageAuthMethod
+  source: string
+  summary: string
+  detail?: string
+  metrics?: UsageMetric[]
+  docsUrl?: string
+  links?: UsageLink[]
+}
+
+export type ProviderUsageSnapshot = {
+  refreshedAt: string
+  reports: ProviderUsageReport[]
+}
+
+type StoredOAuthBlob = {
+  accessToken?: string
+  refreshToken?: string
+  expiresAt?: number
+  meta?: Record<string, unknown>
+}
+
+type ClineAccountOrganization = {
+  active: boolean
+  memberId: string | null
+  name: string | null
+  organizationId: string | null
+}
+
+type ClineAccountSnapshot = {
+  userId: string
+  email: string | null
+  displayName: string | null
+  createdAt: string | null
+  personalBalance: number | null
+  organizationBalance: number | null
+  displayedBalance: number | null
+  organizations: ClineAccountOrganization[]
+  activeOrganization: ClineAccountOrganization | null
+}
+
+type Reporter = () => Promise<ProviderUsageReport>
+
+export async function fetchAllProviderUsage(): Promise<ProviderUsageSnapshot> {
+  const reports = await Promise.all(REPORTERS.map(runReporter))
+  return {
+    refreshedAt: new Date().toISOString(),
+    reports,
+  }
+}
+
+/**
+ * Keyed so a single provider can be refreshed on its own. /usage still runs
+ * every reporter, but the status bar only ever cares about the provider the
+ * session is actually on, and fetching the other eighteen to render one number
+ * would be pure waste.
+ */
+const REPORTERS_BY_PROVIDER: Record<ProviderWithUsageReporter, Reporter> = {
+  firstParty: reportAnthropic,
+  openai: reportOpenAI,
+  antigravity: reportAntigravity,
+  openrouter: reportOpenRouter,
+  vercel: reportVercel,
+  requesty: reportRequesty,
+  fireworks: reportFireworks,
+  deepseek: reportDeepSeek,
+  mistral: reportMistral,
+  glm: reportGLM,
+  lxd: reportLXD,
+  mimo: reportMimo,
+  alibaba: reportAlibaba,
+  xai: reportXai,
+  meta: reportMeta,
+  moonshot: reportMoonshot,
+  minimax: reportMiniMax,
+  ollama: reportOllama,
+  cline: reportCline,
+  copilot: reportCopilot,
+  kilocode: reportKiloCode,
+  kiro: reportKiro,
+}
+
+// Insertion order is the /usage display order, so the map stays the single
+// source of truth rather than a second list that can drift.
+const REPORTERS: Reporter[] = Object.values(REPORTERS_BY_PROVIDER)
+
+/**
+ * Usage for one provider, or null when no reporter covers it. Errors surface
+ * as a report with status 'error' exactly as they do in /usage, rather than
+ * throwing into a caller that only wants a number.
+ */
+/**
+ * Reporters that must not be reused behind a status bar repaint, and the
+ * read-only stand-ins that replace them there.
+ *
+ * A /usage reporter may write credentials, chase extra round trips, or blur a
+ * recoverable failure into a settled state. That is acceptable for a dialog a
+ * person opened on purpose, and not for something a keystroke can trigger.
+ */
+const STATUS_BAR_REPORTERS: Partial<Record<ProviderWithUsageReporter, Reporter>> = {
+  antigravity: reportAntigravityForStatusBar,
+}
+
+export async function fetchProviderUsageFor(
+  provider: ProviderUsageId,
+  options: { statusBar?: boolean } = {},
+): Promise<ProviderUsageReport | null> {
+  const key = provider as ProviderWithUsageReporter
+  const reporter =
+    (options.statusBar ? STATUS_BAR_REPORTERS[key] : undefined) ??
+    REPORTERS_BY_PROVIDER[key]
+  if (!reporter) return null
+  return runReporter(reporter)
+}
+
+async function runReporter(reporter: Reporter): Promise<ProviderUsageReport> {
+  try {
+    return await reporter()
+  } catch (error) {
+    const fallback = inferFallbackReport(reporter)
+    return {
+      ...fallback,
+      status: 'error',
+      summary: messageFromError(error),
+    }
+  }
+}
+
+function inferFallbackReport(reporter: Reporter): ProviderUsageReport {
+  const name = reporter.name.replace(/^report/, '').toLowerCase()
+  const provider = nameToProvider(name)
+  return baseReport(provider, 'error', 'none', 'Official API', 'Failed to fetch usage.')
+}
+
+function nameToProvider(name: string): ProviderUsageId {
+  switch (name) {
+    case 'anthropic': return 'firstParty'
+    case 'openai': return 'openai'
+    case 'gemini': return 'gemini'
+    case 'antigravity': return 'antigravity'
+    case 'openrouter': return 'openrouter'
+    case 'modelrouter': return 'modelrouter'
+    case 'vercel': return 'vercel'
+    case 'requesty': return 'requesty'
+    case 'fireworks': return 'fireworks'
+    case 'nim': return 'nim'
+    case 'deepseek': return 'deepseek'
+    case 'mistral': return 'mistral'
+    case 'lxd': return 'lxd'
+    case 'mimo': return 'mimo'
+    case 'alibaba': return 'alibaba'
+    case 'xai': return 'xai'
+    case 'meta': return 'meta'
+    case 'glm': return 'glm'
+    case 'moonshot': return 'moonshot'
+    case 'minimax': return 'minimax'
+    case 'ollama': return 'ollama'
+    case 'cline': return 'cline'
+    case 'copilot': return 'copilot'
+    case 'cursor': return 'cursor'
+    case 'iflow': return 'iflow'
+    case 'kilocode': return 'kilocode'
+    case 'kiro': return 'kiro'
+    case 'bedrock': return 'bedrock'
+    case 'vertex': return 'vertex'
+    case 'foundry': return 'foundry'
+    default: return 'codex'
+  }
+}
+
+async function reportAnthropic(): Promise<ProviderUsageReport> {
+  const metrics: UsageMetric[] = []
+  const details: string[] = []
+  const tokens = getClaudeAIOAuthTokens()
+  const subscriptionType = getSubscriptionType()
+
+  if (tokens) {
+    const utilization = await fetchUtilization().catch((error) => {
+      details.push(`Claude subscription usage unavailable: ${messageFromError(error)}`)
+      return null
+    })
+    metrics.push(...metricsFromAnthropicUtilization(utilization, subscriptionType))
+  }
+
+  const adminKey = getEnv('ANTHROPIC_ADMIN_API_KEY', 'ANTHROPIC_ADMIN_KEY')
+  if (adminKey) {
+    const apiCost = await fetchAnthropicAdminCost(adminKey)
+    metrics.push(apiCost.metric)
+    details.push(apiCost.summary)
+  }
+
+  if (metrics.length === 0) {
+    return {
+      ...baseReport(
+        'firstParty',
+        tokens ? 'connected' : 'not_configured',
+        tokens ? 'oauth' : 'none',
+        'Claude OAuth / Admin API',
+        tokens
+          ? 'Claude OAuth is connected, but no subscription usage bars were returned.'
+          : 'Sign in with Anthropic for Claude subscription usage.',
+      ),
+      detail: adminKey
+        ? details.join(' ')
+        : 'For Anthropic Console API costs, set ANTHROPIC_ADMIN_API_KEY.',
+      docsUrl: DOCS.anthropic,
+    }
+  }
+
+  return {
+    ...baseReport(
+      'firstParty',
+      'ok',
+      adminKey ? 'admin_api_key' : 'oauth',
+      adminKey ? 'Claude OAuth + Admin API' : 'Claude OAuth',
+      'Fetched Anthropic subscription and/or Console API usage.',
+    ),
+    detail: details.join(' ') || undefined,
+    metrics,
+    docsUrl: DOCS.anthropic,
+  }
+}
+
+async function reportOpenAI(): Promise<ProviderUsageReport> {
+  const metrics: UsageMetric[] = []
+  const details: string[] = []
+  const sessionToken = getOpenAISessionToken()
+  const adminKey = getEnv('OPENAI_ADMIN_KEY', 'OPENAI_ORG_ADMIN_KEY')
+  const configuredApiKey = getProviderApiKey('openai')
+
+  if (sessionToken) {
+    const codexData = await fetchJson('https://chatgpt.com/backend-api/wham/usage', {
+      headers: {
+        Authorization: `Bearer ${sessionToken}`,
+        Accept: 'application/json',
+      },
+    })
+    const codexMetrics = parseCodexUsage(codexData)
+    metrics.push(...codexMetrics)
+    details.push('ChatGPT/Codex quota fetched from the same backend used by Codex.')
+  }
+
+  if (adminKey) {
+    const openAICost = await fetchOpenAICosts(adminKey)
+    metrics.push(openAICost.metric)
+    details.push(openAICost.summary)
+  } else if (configuredApiKey) {
+    details.push('OpenAI API key is configured; org costs require OPENAI_ADMIN_KEY.')
+  }
+
+  if (metrics.length === 0) {
+    return {
+      ...baseReport(
+        'openai',
+        configuredApiKey || sessionToken ? 'connected' : 'not_configured',
+        sessionToken ? 'oauth' : configuredApiKey ? 'api_key' : 'none',
+        'ChatGPT usage / OpenAI org costs',
+        configuredApiKey || sessionToken
+          ? 'Connected, but no official usage meter is available with the current credential.'
+          : 'Connect OpenAI OAuth or set an API/admin key.',
+      ),
+      detail: details.join(' '),
+      docsUrl: DOCS.openai,
+    }
+  }
+
+  return {
+    ...baseReport(
+      'openai',
+      'ok',
+      adminKey ? 'admin_api_key' : 'oauth',
+      adminKey ? 'ChatGPT + OpenAI Admin API' : 'ChatGPT backend',
+      'Fetched OpenAI/Codex usage.',
+    ),
+    detail: details.join(' '),
+    metrics,
+    docsUrl: DOCS.openai,
+  }
+}
+
+async function reportGemini(): Promise<ProviderUsageReport> {
+  const accessToken = await getGeminiOAuthToken('cli')
+  if (!accessToken) {
+    return baseReport(
+      'gemini',
+      'not_configured',
+      'none',
+      'Google Code Assist',
+      'No Gemini OAuth is connected. Run `/login` to authorize the CLI flow.',
+    )
+  }
+
+  let projectId: string | null = null
+  try {
+    projectId = await ensureCodeAssistReady(accessToken, 'cli')
+  } catch (error) {
+    return {
+      ...baseReport(
+        'gemini',
+        'connected',
+        'oauth',
+        'Google Code Assist',
+        'Gemini is connected, but Code Assist onboarding failed.',
+      ),
+      detail: messageFromError(error),
+    }
+  }
+
+  if (!projectId) {
+    return baseReport(
+      'gemini',
+      'connected',
+      'oauth',
+      'Google Code Assist',
+      'Gemini is connected, but no Cloud project is bound to the account yet.',
+    )
+  }
+
+  const buckets = await fetchGeminiCliQuotaBuckets(accessToken, projectId)
+  if (!buckets || buckets.length === 0) {
+    return {
+      ...baseReport(
+        'gemini',
+        'connected',
+        'oauth',
+        'Google Code Assist',
+        'Gemini is connected, but the quota response did not include model usage.',
+      ),
+      detail: 'Free-tier accounts sometimes get an empty buckets array; the picker still routes to flash/lite.',
+    }
+  }
+
+  const metrics = parseGeminiCliQuota(buckets)
+  if (metrics.length === 0) {
+    return baseReport(
+      'gemini',
+      'connected',
+      'oauth',
+      'Google Code Assist',
+      'Gemini quota returned but no per-model usage was parseable.',
+    )
+  }
+
+  const tier = getGeminiTier('cli')
+  const tierNote = tier ? ` Tier: ${tier}.` : ''
+
+  return {
+    ...baseReport(
+      'gemini',
+      'ok',
+      'oauth',
+      'Google Code Assist',
+      'Fetched per-tier model quota from retrieveUserQuota.',
+    ),
+    detail: `Project: ${projectId}.${tierNote} Usage is calculated per tier from buckets[].remainingFraction.`,
+    metrics,
+  }
+}
+
+/**
+ * Group Code Assist quota buckets into tier-level rows (Pro / Flash /
+ * Flash Lite), mirroring gemini-cli's ModelQuotaDisplay grouping.
+ *
+ * For each tier we keep the bucket with the LOWEST `remainingFraction`
+ * — i.e. the most-used bucket in that tier. This matches gemini-cli's
+ * "show the binding-rate-limit row per tier" rule. Ungrouped models
+ * (no tier match) fall through under their raw modelId so users still
+ * see them.
+ */
+function parseGeminiCliQuota(buckets: GeminiQuotaBucket[]): UsageMetric[] {
+  const TIER_DISPLAY: Record<string, { label: string; order: number }> = {
+    pro:          { label: 'Pro',         order: 0 },
+    flash:        { label: 'Flash',       order: 1 },
+    'flash-lite': { label: 'Flash Lite',  order: 2 },
+  }
+
+  type Row = {
+    tier: string
+    label: string
+    order: number
+    remainingFraction: number
+    resetTime?: string
+  }
+
+  const grouped = new Map<string, Row>()
+  for (const bucket of buckets) {
+    const modelId = typeof bucket.modelId === 'string' ? bucket.modelId.trim() : ''
+    if (!modelId) continue
+    const remainingFraction = readNumber(bucket.remainingFraction)
+    if (remainingFraction === null) continue
+
+    const tier = classifyGeminiModelTier(modelId)
+    const meta = TIER_DISPLAY[tier]
+    const tierKey = meta ? tier : modelId
+    const label = meta?.label ?? modelId
+    const order = meta?.order ?? 99
+
+    const existing = grouped.get(tierKey)
+    if (!existing || remainingFraction < existing.remainingFraction) {
+      grouped.set(tierKey, {
+        tier: tierKey,
+        label,
+        order,
+        remainingFraction,
+        resetTime: validFutureIso(readString(bucket.resetTime)) ?? undefined,
+      })
+    }
+  }
+
+  return Array.from(grouped.values())
+    .sort((a, b) => a.order - b.order || a.label.localeCompare(b.label))
+    .map(row => ({
+      label: row.label,
+      usedPercent: clampPercent((1 - row.remainingFraction) * 100),
+      summary: `${Math.round(clampPercent(row.remainingFraction * 100))}% remaining`,
+      resetsAt: row.resetTime,
+    }))
+}
+
+/**
+ * Map a Gemini model id to one of the `pro` / `flash` / `flash-lite`
+ * tiers used by gemini-cli's quota display. Returns the raw modelId
+ * for anything that doesn't match (image gen, embeddings) so the
+ * picker still surfaces it ungrouped.
+ */
+function classifyGeminiModelTier(modelId: string): string {
+  const lower = modelId.toLowerCase()
+  // Order matters: flash-lite must beat flash; pro must beat flash on
+  // ids like `gemini-3-pro-preview` (no flash substring) but lose to
+  // flash-lite when the id literally contains both (none today, but
+  // cheap insurance against future drift).
+  if (lower.includes('flash-lite')) return 'flash-lite'
+  if (lower.includes('flash')) return 'flash'
+  if (lower.includes('pro')) return 'pro'
+  return modelId
+}
+
+async function reportAntigravity(): Promise<ProviderUsageReport> {
+  // Match GeminiApiClient's credential precedence. A previous multi-account
+  // login may still be on disk after /login selects a different OAuth account.
+  const hasOAuthCredential = !!loadProviderKey(ANTIGRAVITY_OAUTH_STORAGE_KEY)
+  const account = hasOAuthCredential ? null : await getAntigravityAccount()
+  const oauthToken = hasOAuthCredential ? await getGeminiOAuthToken('antigravity') : null
+  const accessToken = account?.accessToken ?? oauthToken
+
+  if (!accessToken) {
+    return baseReport(
+      'antigravity',
+      hasOAuthCredential ? 'error' : 'not_configured',
+      hasOAuthCredential ? 'oauth' : 'none',
+      'Google Code Assist',
+      hasOAuthCredential
+        ? 'The current Antigravity credential could not be refreshed.'
+        : 'No Antigravity account is connected.',
+    )
+  }
+
+  // Requests discover their project from this same token. Legacy account
+  // records can contain an obsolete or default project and are not authority.
+  const project = await ensureAntigravityProject(accessToken)
+  if (!project) {
+    return baseReport(
+      'antigravity',
+      'error',
+      'oauth',
+      'Google Code Assist',
+      'The current Antigravity account project could not be discovered.',
+    )
+  }
+  const accountLabel = account?.email
+    ?? await fetchGoogleOAuthEmail(accessToken)
+    ?? 'Antigravity OAuth'
+  const summaryMetrics = await fetchAntigravityQuotaSummaryMetrics(accessToken, project)
+  if (summaryMetrics) {
+    return {
+      ...baseReport(
+        'antigravity',
+        'ok',
+        'oauth',
+        'Google Code Assist',
+        'Fetched quota limits from Antigravity.',
+      ),
+      detail: `Account: ${accountLabel}. Each model group shares a weekly and a 5-hour limit, consumed in proportion to token cost.`,
+      metrics: summaryMetrics,
+    }
+  }
+  let data: unknown
+  try {
+    data = await fetchAntigravityAvailableModels(accessToken, project)
+  } catch (error) {
+    return {
+      ...baseReport(
+        'antigravity',
+        'connected',
+        'oauth',
+        'Google Code Assist',
+        'Antigravity is connected, but the quota request failed.',
+      ),
+      detail: messageFromError(error),
+    }
+  }
+  const metrics = parseAntigravityUsage(data)
+
+  if (metrics.length === 0) {
+    return {
+      ...baseReport(
+        'antigravity',
+        'connected',
+        'oauth',
+        'Google Code Assist',
+        'Antigravity is connected, but the quota response did not include model usage.',
+      ),
+      detail: `Account: ${accountLabel}`,
+    }
+  }
+
+  return {
+    ...baseReport(
+      'antigravity',
+      'ok',
+      'oauth',
+      'Google Code Assist',
+      'Fetched model quota remaining from Antigravity.',
+    ),
+    detail: `Account: ${accountLabel}. Usage is calculated per model from Antigravity quotaInfo.remainingFraction.`,
+    metrics,
+  }
+}
+
+/**
+ * A usable Antigravity token from either credential store, without renewing
+ * or writing anything, or null when neither can be read as-is.
+ *
+ * The /login OAuth blob takes precedence, exactly as it does for generation.
+ * The multi-account file is used only when no OAuth blob exists. An expired
+ * selected credential must not make quota silently refer to an older account.
+ *
+ * A project is required, not optional. Asked without one, the backend answers
+ * with the generic model list where every quota reads 100% remaining - so an
+ * unscoped call does not fail, it succeeds with zeros. Reporting a confident
+ * "0% used" against a nearly-spent account is worse than reporting nothing, so
+ * a missing project means wait rather than ask.
+ */
+function peekAntigravityCredential(): {
+  accessToken: string
+  projectId: string
+} | null {
+  const oauth = readStoredGoogleToken(loadProviderKey(ANTIGRAVITY_OAUTH_STORAGE_KEY))
+  let accessToken: string
+  if (oauth.kind !== 'none') {
+    if (oauth.kind !== 'ready') return null
+    accessToken = oauth.accessToken
+  } else {
+    const stored = peekAntigravityAccount()
+    if (stored.kind !== 'ready') return null
+    accessToken = stored.account.accessToken
+  }
+
+  const projectId = peekCodeAssistProject('antigravity', accessToken)
+  if (!projectId) return null
+
+  return { accessToken, projectId }
+}
+
+/**
+ * Base that last returned a COMPLETE Antigravity quota document, remembered
+ * for the credential. The search tries each configured base and
+ * only stops early on one particular response, so a cold status refresh can
+ * probe every base. Once a base is known to answer completely, one is
+ * enough - and cheap refreshes are what let the readout track a quota that
+ * moves while you work.
+ *
+ * "Completely" is load-bearing and was the bug: this used to be set by the
+ * status bar on the FIRST base that returned anything parseable, while /usage
+ * kept searching for the document carrying the real per-model rows. The two
+ * surfaces then read different documents from different endpoints and
+ * disagreed - live, /usage showed every Gemini row at 30% used while the bar
+ * showed 91%. Both paths now share the search below, so a difference between
+ * them is not expressible.
+ */
+let _antigravityQuotaBase: { accessToken: string; base: string } | null = null
+
+/**
+ * Where to ask for quota, in the order requests are actually served.
+ *
+ * Antigravity meters quota separately PER HOST: prod can answer 429
+ * RESOURCE_EXHAUSTED for every request shape while daily and autopush serve
+ * the same account with room to spare. So a quota readout is only about the
+ * account insofar as it names the host - ask the wrong one and the number is
+ * real, just about a host this session is not being served by.
+ *
+ * Which is why this is the request order rather than a list of its own: chat
+ * tries daily, then autopush, then prod, so the quota that describes the
+ * session is the one from the first host that answers. A separate list here
+ * had prod second and reported an exhausted host's 91% while /usage, which
+ * happened to start at daily, reported the live 30%.
+ */
+const ANTIGRAVITY_QUOTA_BASES = REQUEST_ENDPOINTS_IN_ORDER
+
+async function fetchAntigravityQuotaCheaply(
+  accessToken: string,
+  projectId: string,
+): Promise<unknown> {
+  // Same search and same acceptance test as /usage - the only thing "cheap"
+  // buys is trying the base that already answered completely first, which
+  // makes the common refresh a single request. It must never mean settling
+  // for a different, thinner document than the dialog reads.
+  const data = await fetchAntigravityAvailableModels(
+    accessToken,
+    projectId,
+    _antigravityQuotaBase?.accessToken === accessToken ? _antigravityQuotaBase.base : undefined,
+  )
+  if (!extractAntigravityModels(data)) {
+    throw new Error('no Antigravity quota response')
+  }
+  return data
+}
+
+/**
+ * Antigravity quota for the status bar: the same numbers, as a strict reader.
+ *
+ * reportAntigravity above is built for the /usage dialog and cannot be reused
+ * behind a repaint. It refreshes the OAuth token and rewrites the shared
+ * credential store, discovers the Code Assist project, and spends an extra
+ * round trip on an email address purely to label a dialog this caller is not
+ * drawing.
+ *
+ * This path does none of that. It reads a token that is already valid, makes
+ * the quota call, and stops. A spent token is reported as an error rather than
+ * as "not configured", because it is recoverable: the next real request
+ * refreshes it, and the bar picks the quota up on its following attempt. That
+ * distinction is what keeps a momentary gap from being cached as an absence.
+ */
+async function reportAntigravityForStatusBar(): Promise<ProviderUsageReport> {
+  const credential = peekAntigravityCredential()
+  if (!credential) {
+    // Never 'not_configured'. Antigravity keeps credentials in two places and
+    // a reader that refuses to refresh cannot prove either is truly empty, so
+    // claiming "no account" from what it can see risks telling a connected
+    // user they have no quota. An error keeps the segment silent and retries.
+    return baseReport(
+      'antigravity',
+      'error',
+      'oauth',
+      'Google Code Assist',
+      'No readable Antigravity credential; waiting for a request to refresh one.',
+    )
+  }
+
+  try {
+    const summaryMetrics = await fetchAntigravityQuotaSummaryMetrics(
+      credential.accessToken,
+      credential.projectId,
+    )
+    if (summaryMetrics) {
+      return {
+        ...baseReport(
+          'antigravity',
+          'ok',
+          'oauth',
+          'Google Code Assist',
+          'Quota limits from Antigravity.',
+        ),
+        metrics: summaryMetrics,
+      }
+    }
+    const data = await fetchAntigravityQuotaCheaply(
+      credential.accessToken,
+      credential.projectId,
+    )
+    const metrics = parseAntigravityUsage(data)
+    if (metrics.length === 0) {
+      // Antigravity does have a quota API, so an empty answer is far more
+      // likely a hiccup than a permanent property. Retrying beats claiming
+      // this account has no quota.
+      return baseReport(
+        'antigravity',
+        'error',
+        'oauth',
+        'Google Code Assist',
+        'Antigravity returned no model quota.',
+      )
+    }
+    return {
+      ...baseReport(
+        'antigravity',
+        'ok',
+        'oauth',
+        'Google Code Assist',
+        'Model quota from Antigravity.',
+      ),
+      metrics,
+    }
+  } catch (error) {
+    return baseReport(
+      'antigravity',
+      'error',
+      'oauth',
+      'Google Code Assist',
+      messageFromError(error),
+    )
+  }
+}
+
+async function reportOpenRouter(): Promise<ProviderUsageReport> {
+  const apiKey = getProviderApiKey('openrouter')
+  if (!apiKey) {
+    return {
+      ...baseReport(
+        'openrouter',
+        'not_configured',
+        'none',
+        'OpenRouter credits',
+        'No OpenRouter API key is configured.',
+      ),
+      docsUrl: DOCS.openrouter,
+    }
+  }
+
+  const data = await fetchJson('https://openrouter.ai/api/v1/credits', {
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      Accept: 'application/json',
+    },
+  })
+  const credits = parseOpenRouterCredits(data)
+  if (!credits) {
+    return {
+      ...baseReport(
+        'openrouter',
+        'error',
+        'api_key',
+        'OpenRouter credits',
+        'OpenRouter returned an unrecognized credits response.',
+      ),
+      docsUrl: DOCS.openrouter,
+    }
+  }
+
+  return {
+    ...baseReport(
+      'openrouter',
+      'ok',
+      'api_key',
+      'OpenRouter credits',
+      `${formatCurrency(credits.used, 'USD')} used, ${formatCurrency(credits.remaining, 'USD')} remaining.`,
+    ),
+    metrics: [{
+      label: 'Credits',
+      usedPercent: credits.total > 0 ? clampPercent(credits.used / credits.total * 100) : undefined,
+      remaining: `${formatCurrency(credits.remaining, 'USD')} remaining`,
+      summary: `${formatCurrency(credits.used, 'USD')} / ${formatCurrency(credits.total, 'USD')} used`,
+    }],
+    docsUrl: DOCS.openrouter,
+  }
+}
+
+async function reportModelRouter(): Promise<ProviderUsageReport> {
+  const apiKey = getProviderApiKey('modelrouter')
+  const links: UsageLink[] = [{
+    label: 'Model Router profile',
+    url: 'https://api.lxg2it.com/profile',
+  }]
+
+  if (!apiKey) {
+    return {
+      ...baseReport(
+        'modelrouter',
+        'not_configured',
+        'none',
+        'Model Router account credits',
+        'No Model Router API key is configured.',
+      ),
+      docsUrl: DOCS.modelrouter,
+      links,
+    }
+  }
+
+  const baseUrl = compatBaseUrl('modelrouter')
+  try {
+    await fetchJson(`${baseUrl}/models`, {
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        Accept: 'application/json',
+      },
+    })
+  } catch (error) {
+    return {
+      ...baseReport(
+        'modelrouter',
+        'error',
+        'api_key',
+        'Model Router API key',
+        'Model Router connectivity check failed.',
+      ),
+      detail: messageFromError(error),
+      docsUrl: DOCS.modelrouter,
+      links,
+    }
+  }
+
+  return {
+    ...baseReport(
+      'modelrouter',
+      'connected',
+      'api_key',
+      'Model Router API key',
+      'Model Router API key is configured and live model access is reachable.',
+    ),
+    detail: 'No public API-key usage or credits endpoint is documented for Model Router; account credits are available in the browser profile.',
+    docsUrl: DOCS.modelrouter,
+    links,
+  }
+}
+
+async function reportVercel(): Promise<ProviderUsageReport> {
+  const apiKey = getProviderApiKey('vercel')
+  const links: UsageLink[] = [{
+    label: 'AI Gateway dashboard',
+    url: 'https://vercel.com/dashboard/ai-gateway',
+  }]
+
+  if (!apiKey) {
+    return {
+      ...baseReport(
+        'vercel',
+        'not_configured',
+        'none',
+        'Vercel AI Gateway credits API',
+        'No Vercel AI Gateway API key is configured.',
+      ),
+      docsUrl: DOCS.vercel,
+      links,
+    }
+  }
+
+  const baseUrl = compatBaseUrl('vercel')
+  const data = await fetchJson(`${baseUrl}/credits`, {
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      Accept: 'application/json',
+    },
+  })
+  const credits = parseVercelCredits(data)
+  if (!credits) {
+    return {
+      ...baseReport(
+        'vercel',
+        'error',
+        'api_key',
+        'Vercel AI Gateway credits API',
+        'Vercel returned an unrecognized credits response.',
+      ),
+      docsUrl: DOCS.vercel,
+      links,
+    }
+  }
+
+  const total = credits.balance + credits.used
+  return {
+    ...baseReport(
+      'vercel',
+      'ok',
+      'api_key',
+      'Vercel AI Gateway credits API',
+      `${formatCurrency(credits.balance, 'USD')} remaining, ${formatCurrency(credits.used, 'USD')} used.`,
+    ),
+    metrics: [{
+      label: 'AI Gateway Credits',
+      usedPercent: total > 0 ? clampPercent(credits.used / total * 100) : undefined,
+      summary: `${formatCurrency(credits.used, 'USD')} / ${formatCurrency(total, 'USD')} used`,
+    }],
+    docsUrl: DOCS.vercel,
+    links,
+  }
+}
+
+async function reportRequesty(): Promise<ProviderUsageReport> {
+  const apiKey = getProviderApiKey('requesty')
+  const links: UsageLink[] = [{
+    label: 'Requesty analytics',
+    url: 'https://app.requesty.ai/analytics',
+  }]
+
+  if (!apiKey) {
+    return {
+      ...baseReport(
+        'requesty',
+        'not_configured',
+        'none',
+        'Requesty Management API',
+        'No Requesty API key is configured.',
+      ),
+      docsUrl: DOCS.requesty,
+      links,
+    }
+  }
+
+  const orgData = await fetchJson('https://api-v2.requesty.ai/v1/manage/org', {
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      Accept: 'application/json',
+    },
+  })
+  const org = parseRequestyOrg(orgData)
+  if (!org) {
+    return {
+      ...baseReport(
+        'requesty',
+        'error',
+        'api_key',
+        'Requesty Management API',
+        'Requesty returned an unrecognized organization response.',
+      ),
+      docsUrl: DOCS.requesty,
+      links,
+    }
+  }
+
+  const metrics: UsageMetric[] = [{
+    label: 'Organization balance',
+    summary: `${formatCurrency(org.balance, 'USD')} remaining`,
+  }]
+  const details: string[] = [`Organization: ${org.name}.`]
+
+  try {
+    const usageUrl = new URL('https://api-v2.requesty.ai/v1/manage/org/usage')
+    usageUrl.searchParams.set('start', monthStartIso())
+    usageUrl.searchParams.set('end', new Date().toISOString())
+    usageUrl.searchParams.set('resolution', 'month')
+    const usageData = await fetchJson(usageUrl.toString(), {
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        Accept: 'application/json',
+      },
+    })
+    const usage = parseRequestyUsage(usageData)
+    if (usage) {
+      const budget = getBudget('CLAUDEX_USAGE_REQUESTY_BUDGET_USD', 'REQUESTY_MONTHLY_BUDGET_USD')
+      metrics.push({
+        label: 'Month-to-date spend',
+        usedPercent: budget ? clampPercent(usage.cost / budget * 100) : undefined,
+        summary: budget
+          ? `${formatCurrency(usage.cost, 'USD')} / ${formatCurrency(budget, 'USD')} budget used`
+          : `${formatCurrency(usage.cost, 'USD')} spent`,
+        detail: [
+          usage.requests !== null ? `${formatNumber(usage.requests)} requests` : null,
+          usage.tokens !== null ? `${formatNumber(usage.tokens)} tokens` : null,
+        ].filter((part): part is string => part !== null).join(', ') || undefined,
+      })
+      details.push('Usage is month-to-date from the organization usage endpoint.')
+    } else {
+      details.push('Organization usage endpoint returned no parseable spend totals.')
+    }
+  } catch (usageError) {
+    details.push(`Organization usage unavailable: ${messageFromError(usageError)}.`)
+  }
+
+  return {
+    ...baseReport(
+      'requesty',
+      'ok',
+      'api_key',
+      'Requesty Management API',
+      `${formatCurrency(org.balance, 'USD')} organization balance.`,
+    ),
+    detail: details.join(' '),
+    metrics,
+    docsUrl: DOCS.requesty,
+    links,
+  }
+}
+
+type FireworksAccount = { id: string; createTime: string | null }
+
+// Cached once resolved — the account is stable for a key, and its create time
+// is what separates a true lifetime total from a clamped year. Only successful
+// lookups are cached so a transient failure can be retried on the next /usage.
+let _fireworksAccount: FireworksAccount | null = null
+
+async function resolveFireworksAccount(
+  headers: Record<string, string>,
+): Promise<FireworksAccount | null> {
+  const explicit = process.env.FIREWORKS_ACCOUNT_ID?.trim()
+  if (explicit) return { id: explicit.replace(/^accounts\//, ''), createTime: null }
+  if (_fireworksAccount) return _fireworksAccount
+  try {
+    // AIP-style List Accounts — returns the accounts this key can access.
+    const data = await fetchJson('https://api.fireworks.ai/v1/accounts', { headers })
+    const accounts = (data as {
+      accounts?: Array<{ name?: unknown; createTime?: unknown }>
+    })?.accounts
+    const account = Array.isArray(accounts) ? accounts[0] : undefined
+    if (typeof account?.name === 'string') {
+      _fireworksAccount = {
+        id: account.name.replace(/^accounts\//, ''),
+        createTime: typeof account.createTime === 'string' ? account.createTime : null,
+      }
+    }
+  } catch {
+    // Leave unresolved so the next refresh retries.
+  }
+  return _fireworksAccount
+}
+
+function fireworksSummaryUrl(
+  accountId: string,
+  startTime: string,
+  endTime: string,
+  granularity?: 'DAILY',
+): string {
+  const params = new URLSearchParams({ startTime, endTime })
+  if (granularity) params.set('granularity', granularity)
+  return `https://api.fireworks.ai/v1/accounts/${encodeURIComponent(accountId)}/billing/summary?${params}`
+}
+
+/**
+ * This month's spend to one decimal, from the quota list.
+ *
+ * `monthly-spend-usd` carries the same dollars the billing summary does, just
+ * rounded, and a key that billing refuses can still read quotas — an org
+ * member without the billing role, say. Worth the extra request only once the
+ * precise source has already failed.
+ */
+async function fireworksQuotaSpend(
+  accountId: string,
+  headers: Record<string, string>,
+): Promise<number | null> {
+  const data = await fetchJson(
+    `https://api.fireworks.ai/v1/accounts/${encodeURIComponent(accountId)}/quotas/monthly-spend-usd`,
+    { headers },
+  )
+  const usage = (data as { usage?: unknown })?.usage
+  return typeof usage === 'number' && Number.isFinite(usage) ? usage : null
+}
+
+/**
+ * Fireworks reports spend, never the prepaid balance.
+ *
+ * The quota list is what this card used to show, and on a serverless key it is
+ * eighteen rows of zeroes — deployed-model-count, every accelerator family,
+ * training slots — none of which a caller who only sends chat completions will
+ * ever move. `billing/summary` is where the money is, so the card carries
+ * dollars instead and the balance itself stays one click away; see
+ * fireworksBillingParser.ts for why the balance cannot be fetched.
+ */
+async function reportFireworks(): Promise<ProviderUsageReport> {
+  const apiKey = getProviderApiKey('fireworks')
+  const source = 'Fireworks billing'
+  const links: UsageLink[] = [{
+    label: 'Fireworks billing',
+    url: 'https://fireworks.ai/account/billing',
+    note: 'prepaid credit balance',
+  }]
+
+  if (!apiKey) {
+    return {
+      ...baseReport('fireworks', 'not_configured', 'none', source, 'No Fireworks API key is configured.'),
+      links,
+    }
+  }
+
+  const headers = {
+    Authorization: `Bearer ${apiKey}`,
+    Accept: 'application/json',
+  }
+
+  const account = await resolveFireworksAccount(headers)
+  if (!account) {
+    return {
+      ...baseReport(
+        'fireworks',
+        'connected',
+        'api_key',
+        source,
+        'Authenticated — could not resolve account id (set FIREWORKS_ACCOUNT_ID to surface spend).',
+      ),
+      links,
+    }
+  }
+
+  const range = fireworksSummaryRange(new Date(), account.createTime)
+  const caveat = 'Fireworks publishes spend, not the prepaid credit balance.'
+
+  let month: FireworksSpend
+  let lifetime: number
+  try {
+    const [monthData, lifetimeData] = await Promise.all([
+      fetchJson(
+        fireworksSummaryUrl(account.id, range.monthStart, range.end, 'DAILY'),
+        { headers },
+      ),
+      fetchJson(
+        fireworksSummaryUrl(account.id, range.lifetimeStart, range.end),
+        { headers },
+      ),
+    ])
+    month = parseFireworksBillingSummary(monthData)
+    lifetime = parseFireworksBillingSummary(lifetimeData).total
+  } catch (error) {
+    const rounded = await fireworksQuotaSpend(account.id, headers).catch(() => null)
+    if (rounded === null) throw error
+    return {
+      ...baseReport(
+        'fireworks',
+        'ok',
+        'api_key',
+        'Fireworks quotas',
+        `${formatCurrency(rounded, 'USD')} spent this month.`,
+      ),
+      detail: `${caveat} Billing detail unavailable: ${messageFromError(error)}.`,
+      metrics: [{
+        label: 'This month',
+        summary: `${formatCurrency(rounded, 'USD')} spent`,
+      }],
+      links,
+    }
+  }
+
+  const today = sumFireworksSpendSince(month, range.dayStart)
+
+  return {
+    ...baseReport(
+      'fireworks',
+      'ok',
+      'api_key',
+      source,
+      `${formatCurrency(month.total, 'USD')} spent this month.`,
+    ),
+    detail: caveat,
+    metrics: [
+      { label: 'This month', summary: `${formatCurrency(month.total, 'USD')} spent` },
+      {
+        label: 'Today',
+        summary: `${formatCurrency(today, 'USD')} spent`,
+        detail: 'UTC day — Fireworks bills the summary in UTC.',
+      },
+      {
+        label: range.lifetimeIsComplete ? 'All time' : 'Last 12 months',
+        summary: `${formatCurrency(lifetime, 'USD')} spent`,
+      },
+    ],
+    links,
+  }
+}
+
+async function reportDeepSeek(): Promise<ProviderUsageReport> {
+  const apiKey = getProviderApiKey('deepseek')
+  if (!apiKey) {
+    return {
+      ...baseReport(
+        'deepseek',
+        'not_configured',
+        'none',
+        'DeepSeek balance',
+        'No DeepSeek API key is configured.',
+      ),
+      docsUrl: DOCS.deepseek,
+    }
+  }
+
+  const data = await fetchJson('https://api.deepseek.com/user/balance', {
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      Accept: 'application/json',
+    },
+  })
+  const balances = parseDeepSeekBalances(data)
+  if (balances.length === 0) {
+    return {
+      ...baseReport(
+        'deepseek',
+        'error',
+        'api_key',
+        'DeepSeek balance',
+        'DeepSeek returned an unrecognized balance response.',
+      ),
+      docsUrl: DOCS.deepseek,
+    }
+  }
+
+  const metrics = balances.map((balance) => {
+    const budget = getBudget(`CLAUDEX_USAGE_DEEPSEEK_BUDGET_${balance.currency}`, 'DEEPSEEK_MONTHLY_BUDGET_USD')
+    const used = budget ? Math.max(0, budget - balance.total) : null
+    return {
+      label: `${balance.currency} balance`,
+      usedPercent: budget && used !== null ? clampPercent(used / budget * 100) : undefined,
+      summary: budget && used !== null
+        ? `${formatCurrency(used, balance.currency)} / ${formatCurrency(budget, balance.currency)} budget used`
+        : `${formatCurrency(balance.total, balance.currency)} remaining`,
+      detail: `${formatCurrency(balance.granted, balance.currency)} granted, ${formatCurrency(balance.toppedUp, balance.currency)} topped up`,
+    }
+  })
+
+  return {
+    ...baseReport(
+      'deepseek',
+      'ok',
+      'api_key',
+      'DeepSeek balance',
+      balances.map((balance) => `${formatCurrency(balance.total, balance.currency)} ${balance.currency} remaining`).join(', '),
+    ),
+    detail: 'Set CLAUDEX_USAGE_DEEPSEEK_BUDGET_USD to turn remaining balance into a percent-used bar.',
+    metrics,
+    docsUrl: DOCS.deepseek,
+  }
+}
+
+async function reportMistral(): Promise<ProviderUsageReport> {
+  const apiKey = getProviderApiKey('mistral')
+  const links: UsageLink[] = [
+    {
+      label: 'Mistral Admin',
+      url: 'https://admin.mistral.ai/',
+    },
+    {
+      label: 'Mistral limits',
+      url: 'https://admin.mistral.ai/plateforme/limits',
+    },
+  ]
+
+  if (!apiKey) {
+    return {
+      ...baseReport(
+        'mistral',
+        'not_configured',
+        'none',
+        'Mistral observability',
+        'No Mistral API key is configured.',
+      ),
+      docsUrl: DOCS.mistral,
+      links,
+    }
+  }
+
+  const baseUrl = getProviderBaseUrl('mistral').replace(/\/+$/, '')
+  try {
+    const data = await fetchMistralObservabilityUsage(apiKey, baseUrl)
+    const parsed = parseMistralObservabilityUsage(data)
+    if (parsed) {
+      return {
+        ...baseReport(
+          'mistral',
+          'ok',
+          'api_key',
+          'Mistral observability',
+          parsed.summary,
+        ),
+        detail: parsed.detail,
+        metrics: parsed.metrics,
+        docsUrl: DOCS.mistral,
+        links,
+      }
+    }
+
+    return {
+      ...baseReport(
+        'mistral',
+        'ok',
+        'api_key',
+        'Mistral observability',
+        'Mistral observability returned no recent chat completion usage.',
+      ),
+      detail: 'The API key is valid; recent usage may be empty or unavailable for this workspace.',
+      docsUrl: DOCS.mistral,
+      links,
+    }
+  } catch (observabilityError) {
+    try {
+      await fetchJson(`${baseUrl}/models`, {
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          Accept: 'application/json',
+        },
+      })
+      return {
+        ...baseReport(
+          'mistral',
+          'connected',
+          'api_key',
+          'Mistral API / Admin usage',
+          'Mistral API key is configured; live observability usage is unavailable for this workspace.',
+        ),
+        detail: `Observability request failed: ${messageFromError(observabilityError)}.`,
+        docsUrl: DOCS.mistral,
+        links,
+      }
+    } catch (modelsError) {
+      return {
+        ...baseReport(
+          'mistral',
+          'error',
+          'api_key',
+          'Mistral observability',
+          'Mistral usage request failed.',
+        ),
+        detail: `Observability: ${messageFromError(observabilityError)}. Models: ${messageFromError(modelsError)}.`,
+        docsUrl: DOCS.mistral,
+        links,
+      }
+    }
+  }
+}
+
+async function reportGLM(): Promise<ProviderUsageReport> {
+  const apiKey = getProviderApiKey('glm')
+  if (!apiKey) {
+    return {
+      ...baseReport(
+        'glm',
+        'not_configured',
+        'none',
+        'BigModel usage',
+        'No GLM API key is configured.',
+      ),
+      docsUrl: DOCS.glm,
+      links: [{
+        label: 'BigModel API keys',
+        url: 'https://open.bigmodel.cn/usercenter/apikeys',
+      }],
+    }
+  }
+
+  return {
+    ...baseReport(
+      'glm',
+      'connected',
+      'api_key',
+      'BigModel usage',
+      'GLM API key is configured.',
+    ),
+    detail: 'BigModel usage and balance are available in the BigModel console; no public balance API is documented.',
+    docsUrl: DOCS.glm,
+    links: [
+      {
+        label: 'BigModel API keys',
+        url: 'https://open.bigmodel.cn/usercenter/apikeys',
+      },
+      {
+        label: 'BigModel expense bill',
+        url: 'https://bigmodel.cn/finance/expensebill/list',
+      },
+    ],
+  }
+}
+
+/**
+ * LXD API (api.lxds.org).
+ *
+ * LXD bills in "Xen" credits and its dashboard exposes consumption through
+ * POST /user-stats — but that endpoint authenticates the browser account
+ * session, not an API key, so a key-holding CLI cannot read the balance.
+ * What IS public is the model catalog with per-model Xen pricing, so the
+ * report surfaces the live price board plus links to the dashboard, rather
+ * than pretending to a balance figure it cannot fetch.
+ */
+async function reportLXD(): Promise<ProviderUsageReport> {
+  const apiKey = getProviderApiKey('lxd')
+  const links: UsageLink[] = [
+    { label: 'LXD dashboard', url: 'https://api.lxds.org/instructions' },
+    { label: 'LXD account center', url: 'https://account.lxds.org' },
+  ]
+
+  if (!apiKey) {
+    return {
+      ...baseReport(
+        'lxd',
+        'not_configured',
+        'none',
+        'LXD usage',
+        'No LXD API key is configured.',
+      ),
+      docsUrl: DOCS.lxd,
+      links,
+    }
+  }
+
+  const metrics: UsageMetric[] = []
+  try {
+    const response = await fetch('https://api.lxds.org/v1/models', {
+      headers: { Authorization: `Bearer ${apiKey}` },
+      signal: AbortSignal.timeout(TIMEOUT_MS),
+    })
+    if (response.ok) {
+      const data = (await response.json()) as { data?: LxdCatalogRow[] }
+      const rows = filterLxdModelCatalog(data.data ?? [])
+      recordLxdCatalog(rows)
+      const priced = listLxdModelMeta()
+        .filter(m => m.xenPerMillion.prompt > 0 || m.xenPerMillion.completion > 0)
+        .sort((a, b) => a.xenPerMillion.prompt - b.xenPerMillion.prompt)
+      const free = listLxdModelMeta().filter(
+        m => m.xenPerMillion.prompt === 0 && m.xenPerMillion.completion === 0,
+      )
+      if (priced.length > 0) {
+        const cheapest = priced[0]!
+        metrics.push({
+          label: 'Cheapest model',
+          summary: `${cheapest.name} — ${cheapest.xenPerMillion.prompt} in / ${cheapest.xenPerMillion.completion} out Xen per 1M`,
+        })
+      }
+      metrics.push({
+        label: 'Chat models',
+        summary: `${priced.length} billed, ${free.length} free/event`,
+      })
+    }
+  } catch {
+    // Price board is a nicety — a connected report without it is still useful.
+  }
+
+  return {
+    ...baseReport(
+      'lxd',
+      'connected',
+      'api_key',
+      'LXD usage',
+      'LXD API key is configured.',
+    ),
+    detail:
+      'LXD bills in Xen credits (free plan 5/day, developer plan 120/day, '
+      + 'pay-as-you-go $1 = 4,000 Xen). Consumption and per-key quotas live '
+      + 'behind the dashboard account session, which an API key cannot read, '
+      + 'so open the dashboard for the live balance.',
+    ...(metrics.length > 0 && { metrics }),
+    docsUrl: DOCS.lxd,
+    links,
+  }
+}
+
+/**
+ * Xiaomi MiMo.
+ *
+ * MiMo publishes no balance or quota endpoint — the vendor integration this
+ * was modelled on marks usage explicitly unsupported — so this reports
+ * connection state and links to the console rather than inventing a metric
+ * it cannot actually read.
+ */
+async function reportMimo(): Promise<ProviderUsageReport> {
+  const apiKey = getProviderApiKey('mimo')
+  const links: UsageLink[] = [
+    { label: 'Xiaomi MiMo console', url: 'https://xiaomimimo.com' },
+  ]
+
+  if (!apiKey) {
+    return {
+      ...baseReport(
+        'mimo',
+        'not_configured',
+        'none',
+        'Xiaomi MiMo usage',
+        'No MiMo API key is configured.',
+      ),
+      docsUrl: DOCS.mimo,
+      links,
+    }
+  }
+
+  const baseUrl = getProviderBaseUrl('mimo')
+  const tokenPlan = /token-plan/i.test(baseUrl)
+  return {
+    ...baseReport(
+      'mimo',
+      'connected',
+      'api_key',
+      'Xiaomi MiMo usage',
+      `MiMo API key is configured (${tokenPlan ? 'Token Plan' : 'pay-as-you-go'} endpoint).`,
+    ),
+    detail:
+      'MiMo exposes no public balance or quota API, so consumption is only '
+      + 'visible in the MiMo console. Token Plan subscribers can point '
+      + 'MIMO_BASE_URL at token-plan-sgp (or token-plan-cn) .xiaomimimo.com/v1.',
+    docsUrl: DOCS.mimo,
+    links,
+  }
+}
+
+function formatUsdPrecise(value: number): string {
+  return value > 0 && value < 0.01 ? `$${value.toFixed(4)}` : formatCurrency(value, 'USD')
+}
+
+/**
+ * xAI. The API key can describe itself (GET /v1/api-key: name, team, blocked
+ * or disabled) but cannot read money. A management key — optional, added in
+ * /login xai or as XAI_MANAGEMENT_API_KEY — reads the team's prepaid balance,
+ * the postpaid invoice against its spending limit, and this month's spend per
+ * model. Every response also carries the exact cost of that request, summed
+ * here as what xAI billed this session.
+ */
+async function reportXai(): Promise<ProviderUsageReport> {
+  const apiKey = getProviderApiKey('xai')
+  const links: UsageLink[] = [
+    { label: 'xAI console usage', url: 'https://console.x.ai/team/default/usage' },
+    { label: 'xAI billing', url: 'https://console.x.ai/team/default/billing' },
+  ]
+  if (!apiKey) {
+    return {
+      ...baseReport('xai', 'not_configured', 'none', 'xAI API key', 'No xAI API key is configured. Run /login xai.'),
+      docsUrl: DOCS.xai,
+      links,
+    }
+  }
+
+  const check = await checkXaiApiKey(apiKey, getProviderBaseUrl('xai'))
+  if (!check.ok) {
+    return {
+      ...baseReport('xai', 'error', 'api_key', 'xAI API key', `xAI rejected the API key (${check.status}): ${check.message}`),
+      docsUrl: DOCS.xai,
+      links,
+    }
+  }
+
+  const info = check.info
+  const blocked = xaiKeyBlockReason(info)
+  const details: string[] = []
+  const keyLabel = [info.name, info.redactedKey].filter(Boolean).join(' · ')
+  if (keyLabel) details.push(`Key: ${keyLabel}`)
+  const session = getXaiSessionSpend()
+  if (session.requests > 0) {
+    details.push(`This session: ${formatUsdPrecise(session.usd)} billed by xAI over ${session.requests} request${session.requests === 1 ? '' : 's'}.`)
+  }
+
+  const managementKey = getXaiManagementKey()
+  if (!managementKey || !info.teamId) {
+    details.push('Add a management key (/login xai, or XAI_MANAGEMENT_API_KEY) to see the prepaid balance, this month\'s spend and the spending limit.')
+    return {
+      ...baseReport(
+        'xai',
+        blocked ? 'error' : 'connected',
+        'api_key',
+        'xAI API key',
+        blocked ? `The API key authenticates, but ${blocked}.` : 'API key active.',
+      ),
+      detail: details.join('\n'),
+      docsUrl: DOCS.xai,
+      links,
+    }
+  }
+
+  const billing = await fetchXaiBilling(managementKey, info.teamId)
+  const metrics: UsageMetric[] = []
+  const summary: string[] = []
+  if (billing.prepaidRemaining !== undefined) {
+    const remaining = `${formatCurrency(billing.prepaidRemaining, 'USD')} remaining`
+    metrics.push({ label: 'Prepaid credits', remaining, summary: remaining })
+    summary.push(`${formatCurrency(billing.prepaidRemaining, 'USD')} prepaid`)
+  }
+  const invoice = billing.invoice
+  if (invoice?.amountDue !== undefined) {
+    const limit = invoice.spendingLimit
+    metrics.push({
+      label: 'Postpaid this cycle',
+      usedPercent: limit ? clampPercent(invoice.amountDue / limit * 100) : undefined,
+      summary: limit
+        ? `${formatCurrency(invoice.amountDue, 'USD')} / ${formatCurrency(limit, 'USD')} spending limit`
+        : `${formatCurrency(invoice.amountDue, 'USD')} due`,
+    })
+  }
+  if (billing.monthToDate) {
+    const total = billing.monthToDate.reduce((sum, line) => sum + line.usd, 0)
+    metrics.push({
+      label: 'This month',
+      summary: `${formatUsdPrecise(total)} spent`,
+      ...(billing.monthToDate.length > 0 && {
+        detail: billing.monthToDate.slice(0, 4).map(line => `${line.label}: ${formatUsdPrecise(line.usd)}`).join(', '),
+      }),
+    })
+    summary.push(`${formatUsdPrecise(total)} spent this month`)
+  }
+  if (billing.errors.length > 0) details.push(`Not read: ${billing.errors.join('; ')}`)
+
+  return {
+    ...baseReport(
+      'xai',
+      blocked ? 'error' : metrics.length > 0 ? 'ok' : 'connected',
+      'admin_api_key',
+      'xAI billing (management key)',
+      blocked
+        ? `The API key authenticates, but ${blocked}.`
+        : summary.length > 0 ? `${summary.join(', ')}.` : 'API key active; billing returned nothing.',
+    ),
+    ...(details.length > 0 && { detail: details.join('\n') }),
+    ...(metrics.length > 0 && { metrics }),
+    docsUrl: DOCS.xai,
+    links,
+  }
+}
+
+/**
+ * Meta Model API. Meta documents no endpoint for a balance or for spend: the
+ * dashboard's Usage and Billing pages are the only place either is shown.
+ * What an API key can prove is that it authenticates (`GET /v1/models`
+ * answers 401 otherwise). Every response states its tokens, so this
+ * session's spend is priced here from Meta's published rates, and the team's
+ * rate-limit headroom comes from the last Meta response's `x-ratelimit-*`
+ * headers.
+ */
+async function reportMeta(): Promise<ProviderUsageReport> {
+  const apiKey = getProviderApiKey('meta')
+  const links: UsageLink[] = [
+    { label: 'Meta usage', url: META_USAGE_URL },
+    { label: 'Meta billing', url: META_BILLING_URL },
+  ]
+  if (!apiKey) {
+    return {
+      ...baseReport('meta', 'not_configured', 'none', 'Meta API key', 'No Meta API key is configured. Run /login meta.'),
+      docsUrl: DOCS.meta,
+      links,
+    }
+  }
+
+  const check = await checkMetaApiKey(apiKey, getProviderBaseUrl('meta'))
+  if (!check.ok) {
+    const summary = check.status === 401 || check.status === 403
+      ? `Meta rejected the API key (${check.status}): ${check.message}`
+      : check.status === 0
+        ? `Could not reach Meta: ${check.message}`
+        : `Meta's key check failed (${check.status}): ${check.message}`
+    return {
+      ...baseReport('meta', 'error', 'api_key', 'Meta API key', summary),
+      docsUrl: DOCS.meta,
+      links,
+    }
+  }
+
+  const details: string[] = []
+  const session = getMetaSessionSpend()
+  if (session.requests > 0) {
+    const unpriced = session.unpricedRequests > 0
+      ? ` (${session.unpricedRequests} on a model with no published price)`
+      : ''
+    details.push(
+      `This session: ${formatUsdPrecise(session.usd)} over ${session.requests} request${session.requests === 1 ? '' : 's'}, priced from Meta's published rates${unpriced}.`,
+    )
+  }
+  details.push('Meta publishes no balance or spend API; the Usage and Billing pages show both.')
+
+  const metrics: UsageMetric[] = []
+  const limits = getProviderRateLimits()
+  if (limits?.provider === 'meta') {
+    const windows = [['Rate limit: requests', limits.requests], ['Rate limit: tokens', limits.tokens]] as const
+    for (const [label, window] of windows) {
+      if (!window || window.limit === undefined || window.remaining === undefined || window.limit <= 0) continue
+      metrics.push({
+        label,
+        usedPercent: clampPercent((window.limit - window.remaining) / window.limit * 100),
+        summary: `${window.remaining.toLocaleString('en-US')} of ${window.limit.toLocaleString('en-US')} left`,
+      })
+    }
+  }
+
+  const models = check.modelIds.length
+  return {
+    ...baseReport(
+      'meta',
+      metrics.length > 0 ? 'ok' : 'connected',
+      'api_key',
+      'Meta API key',
+      `API key active${models > 0 ? `, ${models} model${models === 1 ? '' : 's'} available` : ''}.`,
+    ),
+    detail: details.join('\n'),
+    ...(metrics.length > 0 && { metrics }),
+    docsUrl: DOCS.meta,
+    links,
+  }
+}
+
+/**
+ * Alibaba Cloud Model Studio.
+ *
+ * Model Studio bills through Alibaba Cloud itself, and the billing surface —
+ * BSS OpenAPI — authenticates with an account AccessKey pair, not the
+ * DashScope key Tau holds. There is no balance or quota endpoint the API key
+ * can read, so inventing a number here would be inventing it.
+ *
+ * What the key CAN answer is `/models`, which is auth-gated. That makes this a
+ * real credential check rather than a restatement of what is in the config: it
+ * catches an expired key, and it catches the region mismatch that a Model
+ * Studio key makes easy — a key is bound to the region that issued it, so a
+ * Beijing key pointed at the international host fails here instead of on the
+ * user's first message.
+ */
+async function reportAlibaba(): Promise<ProviderUsageReport> {
+  const apiKey = getProviderApiKey('alibaba')
+  const links: UsageLink[] = [
+    {
+      label: 'Model Studio console',
+      url: 'https://modelstudio.console.alibabacloud.com/',
+    },
+    { label: 'Alibaba Cloud billing', url: 'https://billing.console.aliyun.com/' },
+  ]
+
+  if (!apiKey) {
+    return {
+      ...baseReport(
+        'alibaba',
+        'not_configured',
+        'none',
+        'Alibaba Model Studio usage',
+        'No DashScope API key is configured.',
+      ),
+      docsUrl: DOCS.alibaba,
+      links,
+    }
+  }
+
+  const baseUrl = getProviderBaseUrl('alibaba')
+  const region = alibabaRegionLabel(baseUrl)
+  let reachable = false
+  let rejected = false
+  let catalogue = ''
+
+  try {
+    const response = await fetch(`${baseUrl.replace(/\/+$/, '')}/models`, {
+      headers: { Authorization: `Bearer ${apiKey}` },
+      signal: AbortSignal.timeout(TIMEOUT_MS),
+    })
+    if (response.status === 401 || response.status === 403) {
+      rejected = true
+    } else if (response.ok) {
+      reachable = true
+      const data = (await response.json()) as { data?: Array<{ id?: string }> }
+      const ids = (data.data ?? [])
+        .map(row => row.id)
+        .filter((id): id is string => typeof id === 'string' && id.length > 0)
+      recordAlibabaLiveModels(ids)
+      const rows = listAlibabaModelMeta()
+      const thinking = rows.filter(row => row.reasoning).length
+      // Deliberately NOT a metric. The status bar reads the first metric
+      // carrying a summary as this provider's headline quota reading, so a
+      // model count here would render as "Quota 51 chat models, 30 with
+      // selectable thinking" — a number that is not a quota, in the slot
+      // reserved for one. With no metrics the report settles as "no quota
+      // published", which is the truth, and the bar falls through to session
+      // spend.
+      catalogue =
+        ` ${rows.length} chat models are available to this key, `
+        + `${thinking} with a selectable thinking level.`
+    }
+  } catch {
+    // Offline or a slow endpoint. The key is still configured, which is the
+    // one thing this report can state without guessing.
+  }
+
+  if (rejected) {
+    return {
+      ...baseReport(
+        'alibaba',
+        'error',
+        'api_key',
+        'Alibaba Model Studio usage',
+        `DashScope rejected this key on the ${region} endpoint.`,
+      ),
+      detail:
+        'A Model Studio API key only works against the region that issued it. '
+        + 'Set DASHSCOPE_BASE_URL to the matching host — '
+        + ALIBABA_DEFAULT_BASE_URL + ' for international, '
+        + ALIBABA_CN_BASE_URL + ' for Beijing — or create a key in the '
+        + 'region you are calling.',
+      docsUrl: DOCS.alibaba,
+      links,
+    }
+  }
+
+  return {
+    ...baseReport(
+      'alibaba',
+      'connected',
+      'api_key',
+      'Alibaba Model Studio usage',
+      reachable
+        ? `DashScope key verified against the ${region} endpoint.`
+        : `DashScope key is configured for the ${region} endpoint.`,
+    ),
+    detail:
+      'Model Studio meters spend through Alibaba Cloud billing, which an API '
+      + 'key cannot read — only an account AccessKey pair can — so consumption '
+      + 'lives in the console. Per-request cost is still costed locally from '
+      + 'published pay-as-you-go rates for this region, and cached prompt '
+      + 'tokens are billed at the cache-read rate.'
+      + catalogue,
+    docsUrl: DOCS.alibaba,
+    links,
+  }
+}
+
+async function reportMoonshot(): Promise<ProviderUsageReport> {
+  const apiKey = getProviderApiKey('moonshot')
+  if (!apiKey) {
+    return {
+      ...baseReport(
+        'moonshot',
+        'not_configured',
+        'none',
+        'Moonshot balance',
+        'No Moonshot API key is configured.',
+      ),
+      docsUrl: DOCS.moonshot,
+      links: [{
+        label: 'Moonshot API keys',
+        url: 'https://platform.kimi.ai/console/api-keys',
+      }],
+    }
+  }
+
+  const baseUrl = getProviderBaseUrl('moonshot').replace(/\/+$/, '')
+  const data = await fetchJson(`${baseUrl}/users/me/balance`, {
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      Accept: 'application/json',
+    },
+  })
+  const balance = parseMoonshotBalance(data)
+  if (!balance) {
+    return {
+      ...baseReport(
+        'moonshot',
+        'error',
+        'api_key',
+        'Moonshot balance',
+        'Moonshot returned an unrecognized balance response.',
+      ),
+      docsUrl: DOCS.moonshot,
+    }
+  }
+
+  const budget = getBudget(
+    `CLAUDEX_USAGE_MOONSHOT_BUDGET_${balance.currency}`,
+    'CLAUDEX_USAGE_MOONSHOT_BUDGET_CNY',
+    'MOONSHOT_MONTHLY_BUDGET_CNY',
+  )
+  const used = budget ? Math.max(0, budget - balance.available) : null
+  const detailParts = [
+    balance.cash !== null ? `${formatCurrency(balance.cash, balance.currency)} cash` : null,
+    balance.voucher !== null ? `${formatCurrency(balance.voucher, balance.currency)} voucher` : null,
+  ].filter((part): part is string => part !== null)
+
+  return {
+    ...baseReport(
+      'moonshot',
+      'ok',
+      'api_key',
+      'Moonshot balance',
+      `${formatCurrency(balance.available, balance.currency)} available.`,
+    ),
+    detail: 'Set CLAUDEX_USAGE_MOONSHOT_BUDGET_CNY to turn remaining balance into a percent-used bar.',
+    metrics: [{
+      label: `${balance.currency} balance`,
+      usedPercent: budget && used !== null ? clampPercent(used / budget * 100) : undefined,
+      summary: budget && used !== null
+        ? `${formatCurrency(used, balance.currency)} / ${formatCurrency(budget, balance.currency)} budget used`
+        : `${formatCurrency(balance.available, balance.currency)} available`,
+      detail: detailParts.length > 0 ? detailParts.join(', ') : undefined,
+    }],
+    docsUrl: DOCS.moonshot,
+  }
+}
+
+async function reportMiniMax(): Promise<ProviderUsageReport> {
+  const apiKey = getProviderApiKey('minimax')
+  const links: UsageLink[] = [
+    {
+      label: 'MiniMax API keys',
+      url: 'https://platform.minimax.io/user-center/basic-information/interface-key',
+    },
+    {
+      label: 'MiniMax Token Plan',
+      url: 'https://platform.minimax.io/user-center/payment/coding-plan',
+    },
+  ]
+
+  if (!apiKey) {
+    return {
+      ...baseReport(
+        'minimax',
+        'not_configured',
+        'none',
+        'MiniMax Token Plan remains',
+        'No MiniMax API key is configured.',
+      ),
+      docsUrl: DOCS.minimax,
+      links,
+    }
+  }
+
+  let data: unknown
+  try {
+    data = await fetchMiniMaxUsage(apiKey)
+  } catch (error) {
+    return {
+      ...baseReport(
+        'minimax',
+        'error',
+        'api_key',
+        'MiniMax Token Plan remains',
+        'MiniMax usage API request failed.',
+      ),
+      detail: messageFromError(error),
+      docsUrl: DOCS.minimax,
+      links,
+    }
+  }
+
+  const parsed = parseMiniMaxUsage(data)
+  if (!parsed) {
+    return {
+      ...baseReport(
+        'minimax',
+        'error',
+        'api_key',
+        'MiniMax Token Plan remains',
+        'MiniMax returned an unrecognized usage response.',
+      ),
+      docsUrl: DOCS.minimax,
+      links,
+    }
+  }
+
+  return {
+    ...baseReport(
+      'minimax',
+      'ok',
+      'api_key',
+      'MiniMax Token Plan remains',
+      parsed.summary,
+    ),
+    detail: parsed.detail,
+    metrics: parsed.metrics,
+    docsUrl: DOCS.minimax,
+    links,
+  }
+}
+
+async function reportOllama(): Promise<ProviderUsageReport> {
+  return {
+    ...baseReport(
+      'ollama',
+      'ok',
+      'local',
+      'Local runtime',
+      'Ollama runs locally and has no remote billing API.',
+    ),
+    links: [{
+      label: 'Ollama settings',
+      url: 'https://ollama.com/settings',
+    }],
+  }
+}
+
+async function reportCline(): Promise<ProviderUsageReport> {
+  const links = [{
+    label: 'Cline dashboard',
+    url: 'https://app.cline.bot/dashboard',
+  }]
+
+  const token = await getValidClineUsageOAuthToken()
+  if (!token) {
+    return {
+      ...baseReport(
+        'cline',
+        'not_configured',
+        'none',
+        'Cline account API',
+        'No Cline OAuth token is configured.',
+      ),
+      links,
+    }
+  }
+
+  try {
+    const account = await fetchClineAccountSnapshot(token)
+    const accountLabel = account.activeOrganization?.name ?? 'Personal account'
+    const balanceSummary = account.displayedBalance !== null
+      ? `${formatCurrency(account.displayedBalance, 'USD')} credits`
+      : 'credits unavailable'
+    const identity = account.email ?? account.displayName ?? account.userId
+    const detail = [
+      account.createdAt ? `Member since ${formatDateOnly(account.createdAt) ?? account.createdAt}` : null,
+      `Active account: ${accountLabel}`,
+      `Organizations: ${formatNumber(account.organizations.length)}`,
+    ].filter((part): part is string => Boolean(part)).join(' · ')
+    const metrics: UsageMetric[] = [{
+      label: 'Credits',
+      summary: balanceSummary,
+      detail: account.activeOrganization
+        ? [
+          account.organizationBalance !== null
+            ? `${accountLabel}: ${formatCurrency(account.organizationBalance, 'USD')}`
+            : null,
+          account.personalBalance !== null
+            ? `Personal: ${formatCurrency(account.personalBalance, 'USD')}`
+            : null,
+        ].filter((part): part is string => Boolean(part)).join(' · ') || undefined
+        : undefined,
+    }]
+
+    return {
+      ...baseReport(
+        'cline',
+        'ok',
+        'oauth',
+        'Cline account API',
+        `${identity} · ${accountLabel} · ${balanceSummary}`,
+      ),
+      detail,
+      metrics,
+      links,
+    }
+  } catch (error) {
+    return {
+      ...baseReport(
+        'cline',
+        'connected',
+        'oauth',
+        'Cline account API',
+        `Cline OAuth is connected, but live account usage could not be fetched: ${messageFromError(error)}`,
+      ),
+      links,
+    }
+  }
+}
+
+async function getValidClineUsageOAuthToken(): Promise<string | null> {
+  const stored = readStoredOAuth(CLINE_OAUTH_STORAGE)
+  const token = getClineOAuthToken() ?? stored?.accessToken ?? null
+  if (!token) return null
+
+  const expiresAt = typeof stored?.expiresAt === 'number' ? stored.expiresAt : null
+  const needsRefresh = expiresAt !== null && Date.now() > expiresAt - CLINE_REFRESH_BUFFER_MS
+  if (!needsRefresh) return token
+  if (!stored?.refreshToken) return token
+
+  try {
+    return await refreshClineOAuth(stored.refreshToken)
+  } catch (error) {
+    if (expiresAt !== null && Date.now() > expiresAt) throw error
+    return token
+  }
+}
+
+async function fetchClineAccountSnapshot(token: string): Promise<ClineAccountSnapshot> {
+  const user = asRecord(await fetchClineAccountEndpoint('/api/v1/users/me', token))
+  const userId = readString(user?.id) ?? readString(user?.userId)
+  if (!user || !userId) throw new Error('Cline account response did not include a user id')
+
+  const organizations = parseClineOrganizations(user.organizations)
+  const activeOrganization = organizations.find(organization => organization.active) ?? null
+  const [balanceData, organizationBalanceData] = await Promise.all([
+    fetchClineAccountEndpoint(`/api/v1/users/${encodeURIComponent(userId)}/balance`, token),
+    activeOrganization?.organizationId
+      ? fetchClineAccountEndpoint(
+        `/api/v1/organizations/${encodeURIComponent(activeOrganization.organizationId)}/balance`,
+        token,
+      ).catch(() => null)
+      : Promise.resolve(null),
+  ])
+
+  const personalBalance = readNumber(asRecord(balanceData)?.balance)
+  const organizationBalance = readNumber(asRecord(organizationBalanceData)?.balance)
+
+  return {
+    userId,
+    email: readString(user.email),
+    displayName: readString(user.displayName) ?? readString(user.display_name),
+    createdAt: readString(user.createdAt) ?? readString(user.created_at),
+    personalBalance,
+    organizationBalance,
+    displayedBalance: activeOrganization ? organizationBalance ?? personalBalance : personalBalance,
+    organizations,
+    activeOrganization,
+  }
+}
+
+async function fetchClineAccountEndpoint(endpoint: string, token: string): Promise<unknown> {
+  const data = await fetchJson(new URL(endpoint, getProviderBaseUrl('cline')).toString(), {
+    headers: {
+      Authorization: `Bearer ${clineBearerToken(token)}`,
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+    },
+  })
+  return unwrapClineEnvelope(data)
+}
+
+function unwrapClineEnvelope(payload: unknown): unknown {
+  const envelope = asRecord(payload)
+  if (!envelope || typeof envelope.success !== 'boolean') return payload
+  if (!envelope.success) {
+    throw new Error(readString(envelope.error) ?? 'Cline account request failed')
+  }
+  return 'data' in envelope ? envelope.data : payload
+}
+
+function parseClineOrganizations(value: unknown): ClineAccountOrganization[] {
+  if (!Array.isArray(value)) return []
+  return value
+    .map(item => {
+      const record = asRecord(item)
+      if (!record) return null
+      return {
+        active: record.active === true,
+        memberId: readString(record.memberId) ?? readString(record.member_id),
+        name: readString(record.name),
+        organizationId: readString(record.organizationId) ?? readString(record.organization_id),
+      }
+    })
+    .filter((organization): organization is ClineAccountOrganization => organization !== null)
+}
+
+function clineBearerToken(token: string): string {
+  return token.toLowerCase().startsWith('workos:') ? token : `workos:${token}`
+}
+
+async function reportCopilot(): Promise<ProviderUsageReport> {
+  const token = await getValidCopilotOAuthToken()
+  const stored = readStoredOAuth('copilot_oauth')
+  const metrics = copilotMetricsFromStoredPlan(stored)
+  const githubToken = getEnv('GITHUB_TOKEN', 'GH_TOKEN')
+  const org = getEnv('GITHUB_COPILOT_ORG')
+
+  if (githubToken && org) {
+    const remote = await fetchGithubCopilotMetrics(githubToken, org)
+    metrics.push(remote)
+  }
+
+  if (metrics.length > 0) {
+    return {
+      ...baseReport(
+        'copilot',
+        'ok',
+        githubToken && org ? 'admin_api_key' : 'oauth',
+        githubToken && org ? 'GitHub Copilot metrics API' : 'Stored Copilot entitlement',
+        'Fetched Copilot usage information.',
+      ),
+      detail: githubToken && org
+        ? `Organization metrics for ${org}.`
+        : 'For official org metrics, set GITHUB_TOKEN and GITHUB_COPILOT_ORG.',
+      metrics,
+      docsUrl: DOCS.copilot,
+      links: [{
+        label: 'Premium requests usage',
+        url: 'https://docs.github.com/copilot/managing-copilot/monitoring-usage-and-entitlements/about-premium-requests',
+        note: 'Premium users can see usage and entitlements here.',
+      }],
+    }
+  }
+
+  return {
+    ...baseReport(
+      'copilot',
+      token ? 'connected' : 'not_configured',
+      token ? 'oauth' : 'none',
+      'GitHub Copilot metrics API',
+      token
+        ? 'Copilot is connected; official usage metrics require an org/enterprise GitHub token.'
+        : 'No Copilot token is configured.',
+    ),
+    detail: 'Set GITHUB_TOKEN and GITHUB_COPILOT_ORG to fetch official Copilot metrics.',
+    docsUrl: DOCS.copilot,
+    links: [{
+      label: 'Premium requests usage',
+      url: 'https://docs.github.com/copilot/managing-copilot/monitoring-usage-and-entitlements/about-premium-requests',
+      note: 'Premium users can see usage and entitlements here.',
+    }],
+  }
+}
+
+async function reportCursor(): Promise<ProviderUsageReport> {
+  const adminKey = getEnv('CURSOR_ADMIN_API_KEY')
+  const oauth = getValidCursorOAuthToken()
+
+  if (!adminKey) {
+    return {
+      ...baseReport(
+        'cursor',
+        oauth ? 'connected' : 'not_configured',
+        oauth ? 'oauth' : 'none',
+        'Cursor Admin API',
+        oauth
+          ? 'Cursor is connected; official team spend requires CURSOR_ADMIN_API_KEY.'
+          : 'No Cursor OAuth token or admin key is configured.',
+      ),
+      detail: 'Cursor Admin API keys are created by team admins in the Cursor dashboard.',
+      docsUrl: DOCS.cursor,
+      links: [{
+        label: 'Cursor usage dashboard',
+        url: 'https://cursor.com/dashboard/usage',
+      }],
+    }
+  }
+
+  const spend = await fetchCursorSpend(adminKey)
+  if (!spend) {
+    return {
+      ...baseReport(
+        'cursor',
+        'error',
+        'admin_api_key',
+        'Cursor Admin API',
+        'Cursor returned an unrecognized spend response.',
+      ),
+      docsUrl: DOCS.cursor,
+    }
+  }
+
+  return {
+    ...baseReport(
+      'cursor',
+      'ok',
+      'admin_api_key',
+      'Cursor Admin API',
+      spend.summary,
+    ),
+    metrics: spend.metric ? [spend.metric] : undefined,
+    docsUrl: DOCS.cursor,
+    links: [{
+      label: 'Cursor usage dashboard',
+      url: 'https://cursor.com/dashboard/usage',
+    }],
+  }
+}
+
+async function reportKiloCode(): Promise<ProviderUsageReport> {
+  const token = getKiloCodeOAuthToken()
+  return {
+    ...baseReport(
+      'kilocode',
+      token ? 'connected' : 'not_configured',
+      token ? 'oauth' : 'none',
+      'KiloCode account',
+      token
+        ? 'KiloCode is connected; usage is available in the Kilo dashboard.'
+        : 'No KiloCode OAuth token is configured.',
+    ),
+    links: [{
+      label: 'Kilo usage dashboard',
+      url: 'https://app.kilo.ai/usage',
+    }],
+  }
+}
+
+async function reportKiro(): Promise<ProviderUsageReport> {
+  const token = await getValidKiroOAuthToken()
+  if (!token) {
+    return baseReport(
+      'kiro',
+      'not_configured',
+      'none',
+      'AWS CodeWhisperer usage limits',
+      'No Kiro OAuth token is configured.',
+    )
+  }
+
+  const data = await fetchKiroUsage(token)
+  const metrics = parseKiroUsage(data)
+  if (metrics.length === 0) {
+    return baseReport(
+      'kiro',
+      'connected',
+      'oauth',
+      'AWS CodeWhisperer usage limits',
+      'Kiro usage endpoint responded without quota details.',
+    )
+  }
+
+  return {
+    ...baseReport(
+      'kiro',
+      'ok',
+      'oauth',
+      'AWS CodeWhisperer usage limits',
+      'Fetched Kiro quota from AWS usage limits.',
+    ),
+    metrics,
+  }
+}
+
+function baseReport(
+  provider: ProviderUsageId,
+  status: ProviderUsageStatus,
+  auth: UsageAuthMethod,
+  source: string,
+  summary: string,
+): ProviderUsageReport {
+  return {
+    provider,
+    name: displayName(provider),
+    status,
+    auth,
+    source,
+    summary,
+  }
+}
+
+function displayName(provider: ProviderUsageId): string {
+  if (provider === 'codex') return 'Codex'
+  return PROVIDER_DISPLAY_NAMES[provider]
+}
+
+function metricsFromAnthropicUtilization(
+  utilization: Utilization | null,
+  subscriptionType: ReturnType<typeof getSubscriptionType>,
+): UsageMetric[] {
+  if (!utilization) return []
+  const showSonnetBar = subscriptionType === 'max' || subscriptionType === 'team' || subscriptionType === null
+  return [
+    utilization.five_hour ? rateLimitMetric('Current session', utilization.five_hour) : null,
+    utilization.seven_day ? rateLimitMetric('Current week (all models)', utilization.seven_day) : null,
+    showSonnetBar && utilization.seven_day_sonnet
+      ? rateLimitMetric('Current week (Sonnet only)', utilization.seven_day_sonnet)
+      : null,
+    utilization.seven_day_opus
+      ? rateLimitMetric('Current week (Opus only)', utilization.seven_day_opus)
+      : null,
+    utilization.extra_usage ? extraUsageMetric(utilization.extra_usage) : null,
+  ].filter((metric): metric is UsageMetric => metric !== null)
+}
+
+function rateLimitMetric(
+  label: string,
+  limit: { utilization: number | null; resets_at: string | null },
+): UsageMetric | null {
+  if (limit.utilization === null) return null
+  return {
+    label,
+    usedPercent: clampPercent(limit.utilization),
+    resetsAt: limit.resets_at,
+  }
+}
+
+function extraUsageMetric(extraUsage: NonNullable<Utilization['extra_usage']>): UsageMetric | null {
+  if (!extraUsage.is_enabled) {
+    return {
+      label: 'Extra usage',
+      summary: 'Not enabled',
+    }
+  }
+  if (extraUsage.monthly_limit === null) {
+    return {
+      label: 'Extra usage',
+      summary: 'Unlimited',
+    }
+  }
+  if (typeof extraUsage.used_credits !== 'number' || typeof extraUsage.utilization !== 'number') {
+    return null
+  }
+  const used = extraUsage.used_credits / 100
+  const limit = extraUsage.monthly_limit / 100
+  return {
+    label: 'Extra usage',
+    usedPercent: clampPercent(extraUsage.utilization),
+    summary: `${formatCurrency(used, 'USD')} / ${formatCurrency(limit, 'USD')} spent`,
+    resetsAt: nextMonthIso(),
+  }
+}
+
+async function fetchAnthropicAdminCost(adminKey: string): Promise<{ summary: string; metric: UsageMetric }> {
+  const url = new URL('https://api.anthropic.com/v1/organizations/cost_report')
+  url.searchParams.set('starting_at', monthStartIso())
+  url.searchParams.set('ending_at', new Date().toISOString())
+  const data = await fetchJson(url.toString(), {
+    headers: {
+      'anthropic-version': '2023-06-01',
+      'x-api-key': adminKey,
+      Accept: 'application/json',
+    },
+  })
+  const cost = sumAnthropicCostCents(data)
+  const budget = getBudget('CLAUDEX_USAGE_ANTHROPIC_BUDGET_USD', 'ANTHROPIC_MONTHLY_BUDGET_USD')
+  const dollars = cost / 100
+  return {
+    summary: 'Anthropic Console API costs are month-to-date.',
+    metric: {
+      label: 'Console API cost',
+      usedPercent: budget ? clampPercent(dollars / budget * 100) : undefined,
+      summary: budget
+        ? `${formatCurrency(dollars, 'USD')} / ${formatCurrency(budget, 'USD')} budget used`
+        : `${formatCurrency(dollars, 'USD')} month-to-date`,
+    },
+  }
+}
+
+async function fetchOpenAICosts(adminKey: string): Promise<{ summary: string; metric: UsageMetric }> {
+  const url = new URL('https://api.openai.com/v1/organization/costs')
+  url.searchParams.set('start_time', String(monthStartEpochSeconds()))
+  url.searchParams.set('bucket_width', '1d')
+  url.searchParams.set('limit', '31')
+  const data = await fetchJson(url.toString(), {
+    headers: {
+      Authorization: `Bearer ${adminKey}`,
+      Accept: 'application/json',
+    },
+  })
+  const cost = sumOpenAICosts(data)
+  const budget = getBudget('CLAUDEX_USAGE_OPENAI_BUDGET_USD', 'OPENAI_MONTHLY_BUDGET_USD')
+  return {
+    summary: 'OpenAI API costs are month-to-date.',
+    metric: {
+      label: 'OpenAI API cost',
+      usedPercent: budget ? clampPercent(cost.value / budget * 100) : undefined,
+      summary: budget
+        ? `${formatCurrency(cost.value, cost.currency)} / ${formatCurrency(budget, cost.currency)} budget used`
+        : `${formatCurrency(cost.value, cost.currency)} month-to-date`,
+    },
+  }
+}
+
+function parseCodexUsage(data: unknown): UsageMetric[] {
+  const root = asRecord(data)
+  const rateLimit = asRecord(root?.rate_limit)
+  if (!rateLimit) return []
+  const metrics: UsageMetric[] = []
+  const primary = asRecord(rateLimit.primary_window)
+  const secondary = asRecord(rateLimit.secondary_window)
+  const planType = readString(root?.plan_type)
+
+  if (primary) {
+    const used = readNumber(primary.used_percent)
+    metrics.push({
+      label: planType ? `Codex session (${planType})` : 'Codex session',
+      usedPercent: used !== null ? clampPercent(used) : undefined,
+      resetsAt: epochSecondsToIso(primary.reset_at),
+    })
+  }
+  if (secondary) {
+    const used = readNumber(secondary.used_percent)
+    metrics.push({
+      label: 'Codex weekly',
+      usedPercent: used !== null ? clampPercent(used) : undefined,
+      resetsAt: epochSecondsToIso(secondary.reset_at),
+    })
+  }
+  return metrics
+}
+
+function parseOpenRouterCredits(data: unknown): { total: number; used: number; remaining: number } | null {
+  const root = asRecord(data)
+  const source = asRecord(root?.data) ?? root
+  if (!source) return null
+  const total = readNumber(source.total_credits)
+  const used = readNumber(source.total_usage)
+  if (total === null || used === null) return null
+  return {
+    total,
+    used,
+    remaining: Math.max(0, total - used),
+  }
+}
+
+function parseVercelCredits(data: unknown): { balance: number; used: number } | null {
+  const root = asRecord(data)
+  const source = asRecord(root?.data) ?? root
+  if (!source) return null
+  const balance = readNumber(source.balance)
+  const used =
+    readNumber(source.total_used)
+    ?? readNumber(source.totalUsed)
+    ?? readNumber(source.total_usage)
+    ?? readNumber(source.usage)
+  if (balance === null || used === null) return null
+  return { balance, used }
+}
+
+function parseRequestyOrg(data: unknown): { name: string; balance: number } | null {
+  const root = asRecord(data)
+  const source = asRecord(root?.data) ?? root
+  if (!source) return null
+  const balance = readNumber(source.balance)
+  if (balance === null) return null
+  return {
+    name: readString(source.name) ?? 'Requesty organization',
+    balance,
+  }
+}
+
+function parseRequestyUsage(data: unknown): {
+  cost: number
+  tokens: number | null
+  requests: number | null
+} | null {
+  const root = asRecord(data)
+  const usage = asRecord(root?.usage)
+  if (!usage) return null
+
+  let sawAny = false
+  let cost = 0
+  let tokens = 0
+  let requests = 0
+  let sawTokens = false
+  let sawRequests = false
+
+  for (const value of Object.values(usage)) {
+    const row = asRecord(value)
+    if (!row) continue
+    const rowCost =
+      readNumber(row.cost)
+      ?? readNumber(row.total_cost)
+      ?? readNumber(row.totalCost)
+      ?? readNumber(row.spend)
+      ?? readNumber(row.total_spend)
+      ?? readNumber(row.totalSpend)
+    if (rowCost !== null) {
+      sawAny = true
+      cost += rowCost
+    }
+
+    const rowTokens =
+      readNumber(row.total_tokens)
+      ?? readNumber(row.totalTokens)
+      ?? readNumber(row.tokens)
+      ?? readNumber(row.token_count)
+      ?? readNumber(row.tokenCount)
+    if (rowTokens !== null) {
+      sawTokens = true
+      tokens += rowTokens
+    }
+
+    const rowRequests =
+      readNumber(row.requests)
+      ?? readNumber(row.request_count)
+      ?? readNumber(row.requestCount)
+      ?? readNumber(row.count)
+    if (rowRequests !== null) {
+      sawRequests = true
+      requests += rowRequests
+    }
+  }
+
+  if (!sawAny && !sawTokens && !sawRequests) return null
+  return {
+    cost,
+    tokens: sawTokens ? tokens : null,
+    requests: sawRequests ? requests : null,
+  }
+}
+
+function parseDeepSeekBalances(data: unknown): Array<{
+  currency: string
+  total: number
+  granted: number
+  toppedUp: number
+}> {
+  const root = asRecord(data)
+  if (!Array.isArray(root?.balance_infos)) return []
+  return root.balance_infos.flatMap((item) => {
+    const info = asRecord(item)
+    if (!info) return []
+    const currency = readString(info.currency) ?? 'USD'
+    const total = readNumber(info.total_balance)
+    const granted = readNumber(info.granted_balance) ?? 0
+    const toppedUp = readNumber(info.topped_up_balance) ?? 0
+    if (total === null) return []
+    return [{ currency, total, granted, toppedUp }]
+  })
+}
+
+async function fetchMistralObservabilityUsage(apiKey: string, baseUrl: string): Promise<unknown> {
+  const url = new URL(`${baseUrl}/observability/chat-completion-events/search`)
+  url.searchParams.set('page_size', '100')
+  return fetchJson(url.toString(), {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      Accept: 'application/json',
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      search_params: {
+        filters: null,
+      },
+      extra_fields: ['model'],
+    }),
+  })
+}
+
+function parseMistralObservabilityUsage(data: unknown): {
+  summary: string
+  detail?: string
+  metrics: UsageMetric[]
+} | null {
+  const root = asRecord(data)
+  const completionEvents = asRecord(root?.completion_events)
+  const results = Array.isArray(completionEvents?.results) ? completionEvents.results : []
+  const rows = results
+    .map((item) => asRecord(item))
+    .filter((item): item is Record<string, unknown> => item !== null)
+  if (rows.length === 0) return null
+
+  let inputTokens = 0
+  let outputTokens = 0
+  let latestTime = 0
+  const models = new Set<string>()
+
+  for (const row of rows) {
+    inputTokens += readNumber(row.nb_input_tokens) ?? 0
+    outputTokens += readNumber(row.nb_output_tokens) ?? 0
+
+    const createdAt = readString(row.created_at)
+    if (createdAt) {
+      const time = new Date(createdAt).getTime()
+      if (Number.isFinite(time) && time > latestTime) latestTime = time
+    }
+
+    const extraFields = asRecord(row.extra_fields)
+    const model = readString(extraFields?.model)
+      ?? readString(extraFields?.model_name)
+      ?? readString(row.model)
+      ?? readString(row.model_name)
+    if (model) models.add(model)
+  }
+
+  const totalTokens = inputTokens + outputTokens
+  const modelSummary = summarizeSet(models)
+  const latestEvent = latestTime > 0 ? new Date(latestTime).toISOString() : null
+  const detailParts = [
+    `Input tokens: ${formatNumber(inputTokens)}.`,
+    `Output tokens: ${formatNumber(outputTokens)}.`,
+    modelSummary ? `Models: ${modelSummary}.` : null,
+    latestEvent ? `Latest event: ${latestEvent}.` : null,
+  ].filter((part): part is string => part !== null)
+
+  return {
+    summary: `${formatNumber(rows.length)} recent chat completion events; ${formatNumber(totalTokens)} tokens.`,
+    detail: detailParts.join(' '),
+    metrics: [{
+      label: 'Recent chat completions',
+      summary: `${formatNumber(rows.length)} events; ${formatNumber(totalTokens)} tokens`,
+      detail: `${formatNumber(inputTokens)} input tokens, ${formatNumber(outputTokens)} output tokens`,
+    }],
+  }
+}
+
+function parseMoonshotBalance(data: unknown): {
+  currency: string
+  available: number
+  cash: number | null
+  voucher: number | null
+} | null {
+  const root = asRecord(data)
+  const source = asRecord(root?.data) ?? root
+  if (!source) return null
+
+  const available =
+    readNumber(source.available_balance)
+    ?? readNumber(source.availableBalance)
+    ?? readNumber(source.total_balance)
+    ?? readNumber(source.totalBalance)
+    ?? readNumber(source.balance)
+    ?? findFirstNumberByKey(data, [
+      'available_balance',
+      'availableBalance',
+      'total_balance',
+      'totalBalance',
+      'balance',
+    ])
+  if (available === null) return null
+
+  const cash =
+    readNumber(source.cash_balance)
+    ?? readNumber(source.cashBalance)
+    ?? findFirstNumberByKey(data, ['cash_balance', 'cashBalance'])
+  const voucher =
+    readNumber(source.voucher_balance)
+    ?? readNumber(source.voucherBalance)
+    ?? readNumber(source.grant_balance)
+    ?? readNumber(source.grantBalance)
+    ?? findFirstNumberByKey(data, [
+      'voucher_balance',
+      'voucherBalance',
+      'grant_balance',
+      'grantBalance',
+    ])
+  const currency = (
+    readString(source.currency)
+    ?? findFirstStringByKey(data, ['currency', 'unit'])
+    ?? 'CNY'
+  ).toUpperCase()
+
+  return { currency, available, cash, voucher }
+}
+
+async function fetchMiniMaxUsage(apiKey: string): Promise<unknown> {
+  const headers = {
+    Authorization: `Bearer ${apiKey}`,
+    Accept: 'application/json',
+    'Content-Type': 'application/json',
+  }
+  const endpoints = [
+    'https://www.minimax.io/v1/token_plan/remains',
+    'https://www.minimax.io/v1/api/openplatform/coding_plan/remains',
+  ]
+  const groupId = getEnv('MINIMAX_GROUP_ID')
+  if (groupId) {
+    const url = new URL('https://platform.minimax.io/v1/api/openplatform/coding_plan/remains')
+    url.searchParams.set('GroupId', groupId)
+    endpoints.push(url.toString())
+  }
+
+  const errors: string[] = []
+  for (const endpoint of endpoints) {
+    try {
+      return await fetchJson(endpoint, { headers })
+    } catch (error) {
+      errors.push(`${endpoint}: ${messageFromError(error)}`)
+    }
+  }
+  throw new Error(errors.join('; ') || 'no MiniMax usage endpoint responded')
+}
+
+function parseMiniMaxUsage(data: unknown): {
+  summary: string
+  detail?: string
+  metrics: UsageMetric[]
+} | null {
+  const rows = collectMiniMaxUsageRows(data)
+  if (rows.length === 0) return null
+
+  const metrics = rows.map(row => ({
+    label: row.label,
+    usedPercent: row.total > 0 ? clampPercent(row.used / row.total * 100) : undefined,
+    summary: `${formatNumber(row.used)} / ${formatNumber(row.total)} used (${formatNumber(row.remaining)} remaining)`,
+    resetsAt: row.resetsAt,
+  }))
+  const primary = rows[0]
+  const plan = findFirstStringByKey(data, ['plan', 'plan_name', 'planName', 'subscription', 'subscription_name'])
+  const detailParts = [
+    plan ? `Plan: ${plan}.` : null,
+    primary.resetsAt ? `Next reset: ${primary.resetsAt}.` : null,
+    'MiniMax Token Plan usage is fetched from the official remains endpoint.',
+  ].filter((part): part is string => part !== null)
+
+  return {
+    summary: `${formatNumber(primary.remaining)} of ${formatNumber(primary.total)} ${primary.unit} remaining.`,
+    detail: detailParts.join(' '),
+    metrics,
+  }
+}
+
+function collectMiniMaxUsageRows(data: unknown): Array<{
+  label: string
+  used: number
+  total: number
+  remaining: number
+  unit: string
+  resetsAt?: string | null
+}> {
+  const rows: Array<{
+    label: string
+    used: number
+    total: number
+    remaining: number
+    unit: string
+    resetsAt?: string | null
+  }> = []
+  const seen = new Set<string>()
+
+  const scan = (value: unknown): void => {
+    if (Array.isArray(value)) {
+      for (const item of value) scan(item)
+      return
+    }
+    const record = asRecord(value)
+    if (!record) return
+    const row = parseMiniMaxUsageRecord(record)
+    if (row) {
+      const signature = `${row.label}:${row.used}:${row.total}:${row.remaining}`
+      if (!seen.has(signature)) {
+        seen.add(signature)
+        rows.push(row)
+      }
+    }
+    for (const item of Object.values(record)) scan(item)
+  }
+  scan(data)
+
+  const root = asRecord(data)
+  const source = asRecord(root?.data) ?? asRecord(root?.result) ?? root
+  if (source) {
+    const rootRow = parseMiniMaxUsageRecord(source)
+    if (rootRow) {
+      const signature = `${rootRow.label}:${rootRow.used}:${rootRow.total}:${rootRow.remaining}`
+      if (!seen.has(signature)) rows.unshift(rootRow)
+    }
+  }
+
+  return rows.sort((a, b) => {
+    if (a.label === 'Token Plan') return -1
+    if (b.label === 'Token Plan') return 1
+    return a.label.localeCompare(b.label)
+  })
+}
+
+function parseMiniMaxUsageRecord(record: Record<string, unknown>): {
+  label: string
+  used: number
+  total: number
+  remaining: number
+  unit: string
+  resetsAt?: string | null
+} | null {
+  const used =
+    readNumber(record.used)
+    ?? readNumber(record.used_count)
+    ?? readNumber(record.usedCount)
+    ?? readNumber(record.current_usage)
+    ?? readNumber(record.currentUsage)
+    ?? readNumber(record.current_interval_usage_count)
+    ?? readNumber(record.currentIntervalUsageCount)
+    ?? readNumber(record.used_prompts)
+    ?? readNumber(record.usedPrompts)
+    ?? readNumber(record.usage)
+  const remaining =
+    readNumber(record.remaining)
+    ?? readNumber(record.remain)
+    ?? readNumber(record.remains)
+    ?? readNumber(record.left)
+    ?? readNumber(record.available)
+    ?? readNumber(record.remaining_count)
+    ?? readNumber(record.remainingCount)
+    ?? readNumber(record.remain_count)
+    ?? readNumber(record.remainCount)
+  const explicitTotal =
+    readNumber(record.total)
+    ?? readNumber(record.limit)
+    ?? readNumber(record.quota)
+    ?? readNumber(record.total_quota)
+    ?? readNumber(record.totalQuota)
+    ?? readNumber(record.usage_limit)
+    ?? readNumber(record.usageLimit)
+    ?? readNumber(record.total_count)
+    ?? readNumber(record.totalCount)
+    ?? readNumber(record.current_interval_quota)
+    ?? readNumber(record.currentIntervalQuota)
+    ?? readNumber(record.max)
+
+  const total = explicitTotal ?? (
+    used !== null && remaining !== null ? used + remaining : null
+  )
+  if (total === null || total <= 0) return null
+
+  const normalizedUsed = used ?? (
+    remaining !== null ? Math.max(0, total - remaining) : null
+  )
+  const normalizedRemaining = remaining ?? (
+    normalizedUsed !== null ? Math.max(0, total - normalizedUsed) : null
+  )
+  if (normalizedUsed === null || normalizedRemaining === null) return null
+
+  return {
+    label: readString(record.model)
+      ?? readString(record.model_id)
+      ?? readString(record.modelId)
+      ?? readString(record.resource)
+      ?? readString(record.resource_type)
+      ?? readString(record.resourceType)
+      ?? readString(record.name)
+      ?? 'Token Plan',
+    used: normalizedUsed,
+    total,
+    remaining: normalizedRemaining,
+    unit: readString(record.unit) ?? readString(record.quota_unit) ?? 'requests',
+    resetsAt: normalizeMiniMaxReset(record),
+  }
+}
+
+function normalizeMiniMaxReset(record: Record<string, unknown>): string | null {
+  const raw =
+    readString(record.reset_at)
+    ?? readString(record.resetAt)
+    ?? readString(record.reset_time)
+    ?? readString(record.resetTime)
+    ?? readString(record.next_reset)
+    ?? readString(record.nextReset)
+    ?? readString(record.expire_at)
+    ?? readString(record.expireAt)
+  const iso = validFutureIso(raw)
+  if (iso) return iso
+  return epochSecondsToIso(record.reset_at)
+    ?? epochSecondsToIso(record.resetAt)
+    ?? epochSecondsToIso(record.reset_time)
+    ?? epochSecondsToIso(record.resetTime)
+    ?? epochSecondsToIso(record.next_reset)
+    ?? epochSecondsToIso(record.nextReset)
+    ?? epochSecondsToIso(record.expire_at)
+    ?? epochSecondsToIso(record.expireAt)
+}
+
+function copilotMetricsFromStoredPlan(blob: StoredOAuthBlob | null): UsageMetric[] {
+  const meta = blob?.meta
+  if (!meta) return []
+  const quotas = asRecord(meta.limitedUserQuotas)
+  const reset = typeof meta.limitedUserResetDate === 'number'
+    ? new Date(meta.limitedUserResetDate * 1000).toISOString()
+    : undefined
+  if (!quotas) return []
+
+  return Object.entries(quotas).flatMap(([key, value]) => {
+    const total = readNumber(value)
+    if (!total || total <= 0) return []
+    return [{
+      label: `Copilot ${key}`,
+      summary: `${Math.round(total)} monthly quota`,
+      resetsAt: reset,
+    }]
+  })
+}
+
+async function fetchGithubCopilotMetrics(token: string, org: string): Promise<UsageMetric> {
+  const url = new URL(`https://api.github.com/orgs/${encodeURIComponent(org)}/copilot/metrics`)
+  const since = new Date(Date.now() - 28 * 24 * 60 * 60 * 1000)
+  url.searchParams.set('since', since.toISOString().slice(0, 10))
+  const data = await fetchJson(url.toString(), {
+    headers: {
+      Authorization: `Bearer ${token}`,
+      Accept: 'application/vnd.github+json',
+      'X-GitHub-Api-Version': '2022-11-28',
+    },
+  })
+  const days = Array.isArray(data) ? data : []
+  return {
+    label: 'Copilot org metrics',
+    summary: `${days.length} daily records returned`,
+    detail: 'GitHub returns activity metrics, not a percent billing meter.',
+  }
+}
+
+function parseCursorSpend(data: unknown): { summary: string; metric?: UsageMetric } | null {
+  const total = findFirstNumberByKey(data, [
+    'totalSpend',
+    'total_spend',
+    'spend',
+    'cost',
+    'amount',
+    'totalCost',
+  ])
+  const cents = findFirstNumberByKey(data, [
+    'totalSpendCents',
+    'total_spend_cents',
+    'spendCents',
+    'costCents',
+  ])
+  const dollars = total ?? (cents !== null ? cents / 100 : null)
+  if (dollars === null) {
+    const count = findFirstNumberByKey(data, ['totalMembers', 'numMembers', 'count'])
+    if (count !== null) {
+      return { summary: `Cursor returned spend data for ${Math.round(count)} records.` }
+    }
+    return null
+  }
+  const budget = getBudget('CLAUDEX_USAGE_CURSOR_BUDGET_USD', 'CURSOR_MONTHLY_BUDGET_USD')
+  return {
+    summary: `${formatCurrency(dollars, 'USD')} reported by Cursor Admin API.`,
+    metric: {
+      label: 'Cursor team spend',
+      usedPercent: budget ? clampPercent(dollars / budget * 100) : undefined,
+      summary: budget
+        ? `${formatCurrency(dollars, 'USD')} / ${formatCurrency(budget, 'USD')} budget used`
+        : `${formatCurrency(dollars, 'USD')} reported`,
+    },
+  }
+}
+
+async function fetchCursorSpend(adminKey: string): Promise<{ summary: string; metric?: UsageMetric } | null> {
+  const auth = `Basic ${Buffer.from(`${adminKey}:`).toString('base64')}`
+  let page = 1
+  let totalPages = 1
+  let totalMembers: number | null = null
+  let totalCents = 0
+  let totalFastPremiumRequests = 0
+  let sawSpendRows = false
+  let cycleStart: string | null = null
+
+  while (page <= totalPages && page <= 50) {
+    const data = await fetchJson('https://api.cursor.com/teams/spend', {
+      method: 'POST',
+      headers: {
+        Authorization: auth,
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+      },
+      body: JSON.stringify({
+        page,
+        pageSize: 100,
+      }),
+    })
+    const root = asRecord(data)
+    const rows = Array.isArray(root?.teamMemberSpend) ? root.teamMemberSpend : []
+    for (const item of rows) {
+      const row = asRecord(item)
+      if (!row) continue
+      const spendCents = readNumber(row.spendCents)
+      const requests = readNumber(row.fastPremiumRequests)
+      if (spendCents !== null) {
+        sawSpendRows = true
+        totalCents += spendCents
+      }
+      if (requests !== null) totalFastPremiumRequests += requests
+    }
+    totalMembers = readNumber(root?.totalMembers) ?? totalMembers
+    totalPages = Math.max(1, Math.floor(readNumber(root?.totalPages) ?? totalPages))
+    cycleStart = epochMsToIso(root?.subscriptionCycleStart) ?? cycleStart
+    page += 1
+  }
+
+  if (!sawSpendRows) return parseCursorSpend({})
+
+  const dollars = totalCents / 100
+  const budget = getBudget('CLAUDEX_USAGE_CURSOR_BUDGET_USD', 'CURSOR_MONTHLY_BUDGET_USD')
+  const detailParts = [
+    totalMembers !== null ? `${Math.round(totalMembers)} members` : null,
+    `${formatNumber(totalFastPremiumRequests)} fast premium requests`,
+    cycleStart ? `cycle started ${new Date(cycleStart).toLocaleDateString()}` : null,
+  ].filter((part): part is string => part !== null)
+
+  return {
+    summary: `${formatCurrency(dollars, 'USD')} current-cycle team spend.`,
+    metric: {
+      label: 'Cursor team spend',
+      usedPercent: budget ? clampPercent(dollars / budget * 100) : undefined,
+      summary: budget
+        ? `${formatCurrency(dollars, 'USD')} / ${formatCurrency(budget, 'USD')} budget used`
+        : `${formatCurrency(dollars, 'USD')} reported`,
+      detail: detailParts.join(', '),
+      resetsAt: cycleStart,
+    },
+  }
+}
+
+async function fetchKiroUsage(token: string): Promise<unknown> {
+  const blob = readStoredOAuth('kiro_oauth')
+  const profileArn = readString(blob?.meta?.profileArn)
+  const params = new URLSearchParams({
+    isEmailRequired: 'true',
+    origin: 'AI_EDITOR',
+    resourceType: 'AGENTIC_REQUEST',
+  })
+  const attempts: Array<() => Promise<Response>> = [
+    () => fetchWithTimeout(
+      `https://codewhisperer.us-east-1.amazonaws.com/getUsageLimits?${params.toString()}`,
+      {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Accept: 'application/json',
+          'x-amz-user-agent': 'aws-sdk-js/1.0.0 KiroIDE',
+          'user-agent': 'aws-sdk-js/1.0.0 KiroIDE',
+        },
+      },
+    ),
+    () => fetchWithTimeout('https://codewhisperer.us-east-1.amazonaws.com', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/x-amz-json-1.0',
+        'x-amz-target': 'AmazonCodeWhispererService.GetUsageLimits',
+        Accept: 'application/json',
+      },
+      body: JSON.stringify({
+        origin: 'AI_EDITOR',
+        resourceType: 'AGENTIC_REQUEST',
+        ...(profileArn ? { profileArn } : {}),
+      }),
+    }),
+  ]
+
+  const errors: string[] = []
+  for (const attempt of attempts) {
+    const response = await attempt()
+    const text = await response.text()
+    if (!response.ok) {
+      errors.push(`${response.status}: ${truncate(text)}`)
+      continue
+    }
+    return parseJson(text)
+  }
+  throw new Error(`Kiro usage failed: ${errors.join('; ')}`)
+}
+
+function parseKiroUsage(data: unknown): UsageMetric[] {
+  const root = asRecord(data)
+  const reset = readString(root?.nextDateReset)
+    ?? readString(root?.resetDate)
+    ?? epochSecondsToIso(root?.nextDateReset)
+    ?? epochSecondsToIso(root?.resetDate)
+  const list = Array.isArray(root?.usageBreakdownList) ? root.usageBreakdownList : []
+  return list.flatMap((item) => {
+    const row = asRecord(item)
+    if (!row) return []
+    const used = readNumber(row.currentUsageWithPrecision ?? row.currentUsage)
+    const total = readNumber(row.usageLimitWithPrecision ?? row.usageLimit)
+    const resource = readString(row.resourceType) ?? 'usage'
+    if (used === null || total === null || total <= 0) return []
+    return [{
+      label: humanize(resource),
+      usedPercent: clampPercent(used / total * 100),
+      summary: `${formatNumber(used)} / ${formatNumber(total)} used`,
+      resetsAt: reset,
+    }]
+  })
+}
+
+async function getAntigravityAccount(): Promise<AntigravityAccount | null> {
+  const store = loadStore()
+  // Shared with peekAntigravityAccount so the reader and the refresher can
+  // never pick different accounts. `active` stays a reference into `store`,
+  // which is what lets the refresh below persist through saveStore(store).
+  const active = selectActiveAntigravityAccount(store)
+  if (!active) return null
+  if (active.expires > Date.now() + ANTIGRAVITY_TOKEN_MARGIN_MS) return active
+  try {
+    const refreshed = await refreshAccessToken(active.refreshToken)
+    active.accessToken = refreshed.access_token
+    active.expires = Date.now() + refreshed.expires_in * 1000
+    saveStore(store)
+    return active
+  } catch {
+    return active
+  }
+}
+
+async function fetchGoogleOAuthEmail(accessToken: string): Promise<string | null> {
+  try {
+    const data = await fetchJson('https://www.googleapis.com/oauth2/v2/userinfo', {
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        Accept: 'application/json',
+      },
+    })
+    return readString(asRecord(data)?.email)
+  } catch {
+    return null
+  }
+}
+
+async function ensureAntigravityProject(accessToken: string): Promise<string | null> {
+  try {
+    return await ensureCodeAssistReady(accessToken, 'antigravity')
+  } catch {
+    return null
+  }
+}
+
+/**
+ * The Antigravity quota document, from whichever base answers with the real
+ * per-model rows.
+ *
+ * `preferredBase` is tried first and is the status bar's whole cost saving:
+ * once a base has answered completely, a refresh is one request instead of
+ * probing every base. It changes the search order, never its acceptance test.
+ * The bar and the /usage dialog must end up holding the same document, or they
+ * report different numbers for the same account.
+ */
+async function fetchAntigravityAvailableModels(
+  accessToken: string,
+  projectId: string,
+  preferredBase?: string,
+): Promise<unknown> {
+  const bases = preferredBase
+    ? [preferredBase, ...ANTIGRAVITY_QUOTA_BASES.filter(base => base !== preferredBase)]
+    : [...ANTIGRAVITY_QUOTA_BASES]
+  const headers = antigravityApiHeaders(accessToken)
+  let bestData: unknown = null
+  const errors: string[] = []
+
+  for (const base of bases) {
+    try {
+      // Without a project this endpoint can return a generic catalog with
+      // full quota, even when the authenticated account is exhausted.
+      const data = await fetchJson(`${base}/v1internal:fetchAvailableModels`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ project: projectId }),
+      })
+      const models = extractAntigravityModels(data)
+      if (models) {
+        bestData = data
+        if (hasAntigravity35FlashUsagePair(models)) {
+          // Only a complete document earns the memo. Remembering a base that
+          // merely parsed is what let the bar settle on a thinner answer.
+          _antigravityQuotaBase = { accessToken, base }
+          return data
+        }
+        continue
+      }
+      if (bestData === null) bestData = data
+    } catch (error) {
+      errors.push(`${base}: ${messageFromError(error)}`)
+    }
+  }
+
+  // Nothing answered completely, so the memo is stale by definition.
+  if (_antigravityQuotaBase?.accessToken === accessToken) _antigravityQuotaBase = null
+  if (bestData !== null) return bestData
+  throw new Error(errors.join('; ') || 'no Antigravity quota response')
+}
+
+/** Credential for which no host served the quota summary. */
+let _antigravityQuotaSummaryUnavailable: string | null = null
+
+/**
+ * The weekly and 5-hour limits of each model group, as the Antigravity app
+ * shows them, from the first host in request order that answers with any.
+ *
+ * Null sends the caller to the per-model document. When no host serves the
+ * summary for a credential, it is not asked again for that credential, so a
+ * status bar refresh stays one request.
+ */
+async function fetchAntigravityQuotaSummaryMetrics(
+  accessToken: string,
+  projectId: string,
+): Promise<AntigravityUsageMetric[] | null> {
+  if (_antigravityQuotaSummaryUnavailable === accessToken) return null
+  const headers = antigravityApiHeaders(accessToken)
+  for (const base of ANTIGRAVITY_QUOTA_BASES) {
+    try {
+      const data = await fetchJson(`${base}/v1internal:retrieveUserQuotaSummary`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ project: projectId }),
+      })
+      const metrics = parseAntigravityQuotaSummary(data)
+      if (metrics.length > 0) return metrics
+    } catch {
+      // Try the next host.
+    }
+  }
+  _antigravityQuotaSummaryUnavailable = accessToken
+  return null
+}
+
+async function fetchJson(url: string, init: RequestInit = {}): Promise<unknown> {
+  const { data } = await fetchJsonWithHeaders(url, init)
+  return data
+}
+
+async function fetchJsonWithHeaders(url: string, init: RequestInit = {}): Promise<{
+  data: unknown
+  headers: Headers
+}> {
+  const response = await fetchWithTimeout(url, init)
+  const text = await response.text()
+  if (!response.ok) {
+    throw new Error(`${response.status}: ${truncate(text)}`)
+  }
+  return {
+    data: parseJson(text),
+    headers: response.headers,
+  }
+}
+
+async function fetchWithTimeout(url: string, init: RequestInit = {}): Promise<Response> {
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), TIMEOUT_MS)
+  try {
+    return await fetch(url, {
+      ...init,
+      signal: controller.signal,
+    })
+  } catch (error) {
+    if (error instanceof Error && error.name === 'AbortError') {
+      throw new Error('request timed out')
+    }
+    throw error
+  } finally {
+    clearTimeout(timeout)
+  }
+}
+
+function parseJson(text: string): unknown {
+  if (!text.trim()) return {}
+  return JSON.parse(text) as unknown
+}
+
+function readStoredOAuth(storageKey: string): StoredOAuthBlob | null {
+  const raw = loadProviderKey(storageKey)
+  if (!raw) return null
+  try {
+    return JSON.parse(raw) as StoredOAuthBlob
+  } catch {
+    return null
+  }
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  return value as Record<string, unknown>
+}
+
+function readString(value: unknown): string | null {
+  return typeof value === 'string' && value.trim() ? value.trim() : null
+}
+
+function readNumber(value: unknown): number | null {
+  if (typeof value === 'number' && Number.isFinite(value)) return value
+  if (typeof value === 'string' && value.trim()) {
+    const parsed = Number(value)
+    return Number.isFinite(parsed) ? parsed : null
+  }
+  return null
+}
+
+function epochSecondsToIso(value: unknown): string | null {
+  const seconds = readNumber(value)
+  if (seconds === null || seconds <= 0) return null
+  const ms = seconds > 10_000_000_000 ? seconds : seconds * 1000
+  return new Date(ms).toISOString()
+}
+
+function validFutureIso(value: string | null): string | null {
+  if (!value) return null
+  const time = new Date(value).getTime()
+  if (!Number.isFinite(time) || time <= Date.now()) return null
+  return new Date(time).toISOString()
+}
+
+function epochMsToIso(value: unknown): string | null {
+  const ms = readNumber(value)
+  if (ms === null || ms <= 0) return null
+  return new Date(ms).toISOString()
+}
+
+function getEnv(...names: string[]): string | null {
+  for (const name of names) {
+    const value = process.env[name]
+    if (value && value.trim()) return value.trim()
+  }
+  return null
+}
+
+function getBudget(...names: string[]): number | null {
+  const value = getEnv(...names)
+  if (!value) return null
+  const parsed = Number(value)
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null
+}
+
+function compatBaseUrl(provider: APIProvider): string {
+  const base = getProviderBaseUrl(provider).replace(/\/+$/, '')
+  return base.endsWith('/v1') ? base : `${base}/v1`
+}
+
+function clampPercent(value: number): number {
+  return Math.max(0, Math.min(100, value))
+}
+
+function formatCurrency(value: number, currency: string): string {
+  try {
+    return new Intl.NumberFormat('en-US', {
+      style: 'currency',
+      currency: currency.toUpperCase(),
+      maximumFractionDigits: 2,
+    }).format(value)
+  } catch {
+    return `${value.toFixed(2)} ${currency.toUpperCase()}`
+  }
+}
+
+function formatNumber(value: number): string {
+  return new Intl.NumberFormat('en-US', {
+    maximumFractionDigits: 2,
+  }).format(value)
+}
+
+function formatDateOnly(value: string): string | null {
+  const time = new Date(value).getTime()
+  if (!Number.isFinite(time)) return null
+  return new Intl.DateTimeFormat('en-US', {
+    month: 'long',
+    day: 'numeric',
+    year: 'numeric',
+  }).format(new Date(time))
+}
+
+function summarizeSet(values: Set<string>, limit = 4): string | null {
+  if (values.size === 0) return null
+  const items = Array.from(values).sort()
+  const shown = items.slice(0, limit).join(', ')
+  const hidden = items.length - limit
+  return hidden > 0 ? `${shown}, and ${hidden} more` : shown
+}
+
+function humanize(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/[_-]+/g, ' ')
+    .replace(/\b\w/g, (char) => char.toUpperCase())
+}
+
+function monthStartIso(): string {
+  const now = new Date()
+  return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1)).toISOString()
+}
+
+function monthStartEpochSeconds(): number {
+  return Math.floor(new Date(monthStartIso()).getTime() / 1000)
+}
+
+function nextMonthIso(): string {
+  const now = new Date()
+  return new Date(now.getFullYear(), now.getMonth() + 1, 1).toISOString()
+}
+
+function sumOpenAICosts(data: unknown): { value: number; currency: string } {
+  let value = 0
+  let currency = 'USD'
+  const root = asRecord(data)
+  const buckets = Array.isArray(root?.data) ? root.data : []
+  for (const bucket of buckets) {
+    const row = asRecord(bucket)
+    const results = Array.isArray(row?.results)
+      ? row.results
+      : Array.isArray(row?.result)
+        ? row.result
+        : []
+    for (const result of results) {
+      const amount = asRecord(asRecord(result)?.amount)
+      const amountValue = readNumber(amount?.value)
+      const amountCurrency = readString(amount?.currency)
+      if (amountValue !== null) value += amountValue
+      if (amountCurrency) currency = amountCurrency.toUpperCase()
+    }
+  }
+  return { value, currency }
+}
+
+function sumAnthropicCostCents(data: unknown): number {
+  let cents = 0
+  walk(data, (key, value) => {
+    if ((key === 'amount' || key === 'cost') && typeof value === 'string') {
+      const parsed = Number(value)
+      if (Number.isFinite(parsed)) cents += parsed
+    } else if ((key === 'amount' || key === 'cost') && typeof value === 'number') {
+      cents += value
+    }
+  })
+  return cents
+}
+
+function findFirstNumberByKey(value: unknown, keys: string[]): number | null {
+  const wanted = new Set(keys)
+  let found: number | null = null
+  walk(value, (key, item) => {
+    if (found !== null || !wanted.has(key)) return
+    found = readNumber(item)
+  })
+  return found
+}
+
+function findFirstStringByKey(value: unknown, keys: string[]): string | null {
+  const wanted = new Set(keys)
+  let found: string | null = null
+  walk(value, (key, item) => {
+    if (found !== null || !wanted.has(key)) return
+    found = readString(item)
+  })
+  return found
+}
+
+function walk(value: unknown, visit: (key: string, value: unknown) => void): void {
+  if (Array.isArray(value)) {
+    for (const item of value) walk(item, visit)
+    return
+  }
+  const record = asRecord(value)
+  if (!record) return
+  for (const [key, item] of Object.entries(record)) {
+    visit(key, item)
+    walk(item, visit)
+  }
+}
+
+function truncate(value: string): string {
+  return value.replace(/\s+/g, ' ').trim().slice(0, 300)
+}
+
+function messageFromError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}

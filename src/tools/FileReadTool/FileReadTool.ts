@@ -1,0 +1,1824 @@
+import type { Base64ImageSource } from '@anthropic-ai/sdk/resources/index.mjs'
+import { readdir, readFile as readFileAsync } from 'fs/promises'
+import * as path from 'path'
+import { posix, win32 } from 'path'
+import { z } from 'zod/v4'
+import {
+  PDF_AT_MENTION_INLINE_THRESHOLD,
+  PDF_EXTRACT_SIZE_THRESHOLD,
+  PDF_MAX_PAGES_PER_READ,
+} from '../../constants/apiLimits.js'
+import { hasBinaryExtension } from '../../constants/files.js'
+import { memoryFreshnessNote } from '../../memdir/memoryAge.js'
+import { getFeatureValue_CACHED_MAY_BE_STALE } from '../../services/analytics/growthbook.js'
+import { logEvent } from '../../services/analytics/index.js'
+import {
+  type AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
+  getFileExtensionForAnalytics,
+} from '../../services/analytics/metadata.js'
+import {
+  countTokensWithAPI,
+  roughTokenCountEstimationForFileType,
+} from '../../services/tokenEstimation.js'
+import {
+  activateConditionalSkillsForPaths,
+  addSkillDirectories,
+  discoverSkillDirsForPaths,
+} from '../../skills/loadSkillsDir.js'
+import type { ToolUseContext } from '../../Tool.js'
+import { buildTool, type ToolDef } from '../../Tool.js'
+import { getCwd } from '../../utils/cwd.js'
+import { recordVisitedDir } from '../../bootstrap/state.js'
+import { getClaudeConfigHomeDir, isEnvTruthy } from '../../utils/envUtils.js'
+import { getErrnoCode, isENOENT } from '../../utils/errors.js'
+import {
+  addLineNumbers,
+  FILE_NOT_FOUND_CWD_NOTE,
+  findSimilarFile,
+  getFileModificationTimeAsync,
+  suggestPathUnderCwd,
+} from '../../utils/file.js'
+import { logFileOperation } from '../../utils/fileOperationAnalytics.js'
+import { formatFileSize } from '../../utils/format.js'
+import { getFsImplementation } from '../../utils/fsOperations.js'
+import {
+  compressImageBufferWithTokenLimit,
+  createImageMetadataText,
+  detectImageFormatFromBuffer,
+  type ImageDimensions,
+  ImageResizeError,
+  maybeResizeAndDownsampleImageBuffer,
+} from '../../utils/imageResizer.js'
+import { lazySchema } from '../../utils/lazySchema.js'
+import { logError } from '../../utils/log.js'
+import { isAutoMemFile } from '../../utils/memoryFileDetection.js'
+import { createUserMessage } from '../../utils/messages.js'
+import { getCanonicalName, getMainLoopModel } from '../../utils/model/model.js'
+import {
+  mapNotebookCellsToToolResult,
+  readNotebook,
+} from '../../utils/notebook.js'
+import {
+  canReadOfficeLocally,
+  hasApprovedOfficeUpload,
+  isFirecrawlOfficeExtension,
+  isOfficeDocExtension,
+  isOfficeParseEnabled,
+  readOfficeDocument,
+} from '../../utils/officeDocs.js'
+import { expandPath } from '../../utils/path.js'
+import { recordFileRead } from '../../utils/readHistory.js'
+import {
+  extractPDFPages,
+  extractPDFText,
+  getPDFPageCount,
+  getPopplerInstallHint,
+  type PDFTextResult,
+  readPDF,
+} from '../../utils/pdf.js'
+import {
+  isPDFExtension,
+  isPDFSupported,
+  parsePDFPageRange,
+} from '../../utils/pdfUtils.js'
+import {
+  checkReadPermissionForTool,
+  matchingRuleForInput,
+} from '../../utils/permissions/filesystem.js'
+import type { PermissionDecision } from '../../utils/permissions/PermissionResult.js'
+import { matchWildcardPattern } from '../../utils/permissions/shellRuleMatching.js'
+import { readFileInRange } from '../../utils/readFileInRange.js'
+import { semanticBoolean } from '../../utils/semanticBoolean.js'
+import { semanticNumber } from '../../utils/semanticNumber.js'
+import { jsonStringify } from '../../utils/slowOperations.js'
+import { BASH_TOOL_NAME } from '../BashTool/toolName.js'
+import { getDefaultFileReadingLimits } from './limits.js'
+import { inlineSourceMapView, supportsInlineSourceMaps } from './inlineSourceMaps.js'
+import {
+  buildSkeleton,
+  fileReadTokenLimitAdvice,
+  getAutoSkeletonMinBytes,
+  isAutoSkeletonEnabled,
+  isSkeletonSupportedExt,
+  shouldReadWholeInstead,
+} from './skeleton.js'
+import {
+  DESCRIPTION,
+  FILE_READ_TOOL_NAME,
+  FILE_UNCHANGED_STUB,
+  LINE_FORMAT_INSTRUCTION,
+  OFFSET_INSTRUCTION_DEFAULT,
+  OFFSET_INSTRUCTION_TARGETED,
+  rangeUnchangedStub,
+  renderPromptTemplate,
+} from './prompt.js'
+import { findUnchangedSeenRange, withSeenRange } from './rangeDedup.js'
+import {
+  getToolUseSummary,
+  renderToolResultMessage,
+  renderToolUseErrorMessage,
+  renderToolUseMessage,
+  renderToolUseTag,
+  userFacingName,
+} from './UI.js'
+
+// Device files that would hang the process: infinite output or blocking input.
+// Checked by path only (no I/O). Safe devices like /dev/null are intentionally omitted.
+const BLOCKED_DEVICE_PATHS = new Set([
+  // Infinite output — never reach EOF
+  '/dev/zero',
+  '/dev/random',
+  '/dev/urandom',
+  '/dev/full',
+  // Blocks waiting for input
+  '/dev/stdin',
+  '/dev/tty',
+  '/dev/console',
+  // Nonsensical to read
+  '/dev/stdout',
+  '/dev/stderr',
+  // fd aliases for stdin/stdout/stderr
+  '/dev/fd/0',
+  '/dev/fd/1',
+  '/dev/fd/2',
+])
+
+function isBlockedDevicePath(filePath: string): boolean {
+  if (BLOCKED_DEVICE_PATHS.has(filePath)) return true
+  // /proc/self/fd/0-2 and /proc/<pid>/fd/0-2 are Linux aliases for stdio
+  if (
+    filePath.startsWith('/proc/') &&
+    (filePath.endsWith('/fd/0') ||
+      filePath.endsWith('/fd/1') ||
+      filePath.endsWith('/fd/2'))
+  )
+    return true
+  return false
+}
+
+// Narrow no-break space (U+202F) used by some macOS versions in screenshot filenames
+const THIN_SPACE = String.fromCharCode(8239)
+
+/**
+ * Resolves macOS screenshot paths that may have different space characters.
+ * macOS uses either regular space or thin space (U+202F) before AM/PM in screenshot
+ * filenames depending on the macOS version. This function tries the alternate space
+ * character if the file doesn't exist with the given path.
+ *
+ * @param filePath - The normalized file path to resolve
+ * @returns The path to the actual file on disk (may differ in space character)
+ */
+/**
+ * For macOS screenshot paths with AM/PM, the space before AM/PM may be a
+ * regular space or a thin space depending on the macOS version.  Returns
+ * the alternate path to try if the original doesn't exist, or undefined.
+ */
+function getAlternateScreenshotPath(filePath: string): string | undefined {
+  const filename = path.basename(filePath)
+  const amPmPattern = /^(.+)([ \u202F])(AM|PM)(\.png)$/
+  const match = filename.match(amPmPattern)
+  if (!match) return undefined
+
+  const currentSpace = match[2]
+  const alternateSpace = currentSpace === ' ' ? THIN_SPACE : ' '
+  return filePath.replace(
+    `${currentSpace}${match[3]}${match[4]}`,
+    `${alternateSpace}${match[3]}${match[4]}`,
+  )
+}
+
+// File read listeners - allows other services to be notified when files are read
+type FileReadListener = (filePath: string, content: string) => void
+const fileReadListeners: FileReadListener[] = []
+
+export function registerFileReadListener(
+  listener: FileReadListener,
+): () => void {
+  fileReadListeners.push(listener)
+  return () => {
+    const i = fileReadListeners.indexOf(listener)
+    if (i >= 0) fileReadListeners.splice(i, 1)
+  }
+}
+
+export class MaxFileReadTokenExceededError extends Error {
+  constructor(
+    public tokenCount: number,
+    public maxTokens: number,
+    // Trailing guidance. Defaulted so the generic form is preserved for any
+    // caller that does not compute advice (e.g. the attachment fallback path).
+    advice = 'Use offset and limit parameters to read specific portions of the file, or search for specific content instead of reading the whole file.',
+  ) {
+    super(
+      `File content (${tokenCount} tokens) exceeds maximum allowed tokens (${maxTokens}). ${advice}`,
+    )
+    this.name = 'MaxFileReadTokenExceededError'
+  }
+}
+
+// Common image extensions
+const IMAGE_EXTENSIONS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp'])
+
+/**
+ * Whether a path names an image this tool renders visually.
+ *
+ * Extension-based on purpose: this runs during transcript grouping, where only
+ * the tool input is available — the file is not read and may not exist.
+ */
+export function isImageFilePath(filePath: unknown): boolean {
+  if (typeof filePath !== 'string') return false
+  const ext = filePath.split('.').pop()?.toLowerCase()
+  return ext !== undefined && IMAGE_EXTENSIONS.has(ext)
+}
+
+/** Whether a path names a Jupyter notebook, whose cells may carry figures. */
+export function isNotebookFilePath(filePath: unknown): boolean {
+  return (
+    typeof filePath === 'string' && filePath.toLowerCase().endsWith('.ipynb')
+  )
+}
+
+/**
+ * Detects if a file path is a session-related file for analytics logging.
+ * Only matches files within the Claude config directory (e.g., ~/.claude).
+ * Returns the type of session file or null if not a session file.
+ */
+function detectSessionFileType(
+  filePath: string,
+): 'session_memory' | 'session_transcript' | null {
+  const configDir = getClaudeConfigHomeDir()
+
+  // Only match files within the Claude config directory
+  if (!filePath.startsWith(configDir)) {
+    return null
+  }
+
+  // Normalize path to use forward slashes for consistent matching across platforms
+  const normalizedPath = filePath.split(win32.sep).join(posix.sep)
+
+  // Session memory files: ~/.claude/session-memory/*.md (including summary.md)
+  if (
+    normalizedPath.includes('/session-memory/') &&
+    normalizedPath.endsWith('.md')
+  ) {
+    return 'session_memory'
+  }
+
+  // Session JSONL transcript files: ~/.claude/projects/*/*.jsonl
+  if (
+    normalizedPath.includes('/projects/') &&
+    normalizedPath.endsWith('.jsonl')
+  ) {
+    return 'session_transcript'
+  }
+
+  return null
+}
+
+const inputSchema = lazySchema(() =>
+  z.strictObject({
+    file_path: z.string().describe('The absolute path to the file to read'),
+    offset: semanticNumber(z.number().int().nonnegative().optional()).describe(
+      'The line number to start reading from. Only provide if the file is too large to read at once',
+    ),
+    limit: semanticNumber(z.number().int().positive().optional()).describe(
+      'The number of lines to read. Only provide if the file is too large to read at once.',
+    ),
+    skeleton: semanticBoolean(z.boolean().optional()).describe(
+      'Return code structure with bodies elided. Large code files auto-skeleton; false expands bodies. Markers give exact offset/limit ranges.',
+    ),
+    include_source_maps: semanticBoolean(z.boolean().optional()).describe(
+      'Include inline source-map comments verbatim and bypass automatic skeletons. Default hides recognized maps; cannot combine with skeleton: true.',
+    ),
+    pages: z
+      .string()
+      .optional()
+      .describe(
+        `PDF page range such as "1-5"; maximum ${PDF_MAX_PAGES_PER_READ} pages.`,
+      ),
+  }),
+)
+type InputSchema = ReturnType<typeof inputSchema>
+
+export type Input = z.infer<InputSchema>
+
+/**
+ * How the skeleton branch was reached: 'explicit' when the model passed
+ * skeleton: true, 'auto' when a whole-file Read of a large supported code
+ * file was converted by policy (see skeleton.ts auto-skeleton gates),
+ * 'off' for a normal read.
+ */
+type SkeletonMode = 'off' | 'explicit' | 'auto'
+
+const outputSchema = lazySchema(() => {
+  // Define the media types supported for images
+  const imageMediaTypes = z.enum([
+    'image/jpeg',
+    'image/png',
+    'image/gif',
+    'image/webp',
+  ])
+
+  return z.discriminatedUnion('type', [
+    z.object({
+      type: z.literal('text'),
+      file: z.object({
+        filePath: z.string().describe('The path to the file that was read'),
+        content: z.string().describe('The content of the file'),
+        numLines: z
+          .number()
+          .describe('Number of lines in the returned content'),
+        startLine: z.number().describe('The starting line number'),
+        totalLines: z.number().describe('Total number of lines in the file'),
+      }),
+    }),
+    z.object({
+      type: z.literal('image'),
+      file: z.object({
+        base64: z.string().describe('Base64-encoded image data'),
+        type: imageMediaTypes.describe('The MIME type of the image'),
+        originalSize: z.number().describe('Original file size in bytes'),
+        dimensions: z
+          .object({
+            originalWidth: z
+              .number()
+              .optional()
+              .describe('Original image width in pixels'),
+            originalHeight: z
+              .number()
+              .optional()
+              .describe('Original image height in pixels'),
+            displayWidth: z
+              .number()
+              .optional()
+              .describe('Displayed image width in pixels (after resizing)'),
+            displayHeight: z
+              .number()
+              .optional()
+              .describe('Displayed image height in pixels (after resizing)'),
+          })
+          .optional()
+          .describe('Image dimension info for coordinate mapping'),
+      }),
+    }),
+    z.object({
+      type: z.literal('notebook'),
+      file: z.object({
+        filePath: z.string().describe('The path to the notebook file'),
+        cells: z.array(z.any()).describe('Array of notebook cells'),
+      }),
+    }),
+    z.object({
+      type: z.literal('pdf'),
+      file: z.object({
+        filePath: z.string().describe('The path to the PDF file'),
+        base64: z.string().describe('Base64-encoded PDF data'),
+        originalSize: z.number().describe('Original file size in bytes'),
+      }),
+    }),
+    z.object({
+      type: z.literal('parts'),
+      file: z.object({
+        filePath: z.string().describe('The path to the PDF file'),
+        originalSize: z.number().describe('Original file size in bytes'),
+        count: z.number().describe('Number of pages extracted'),
+        outputDir: z
+          .string()
+          .describe('Directory containing extracted page images'),
+      }),
+    }),
+    z.object({
+      type: z.literal('file_unchanged'),
+      file: z.object({
+        filePath: z.string().describe('The path to the file'),
+        lines: z
+          .object({
+            start: z.number(),
+            end: z.number(),
+            seenStart: z.number(),
+            seenEnd: z.number(),
+          })
+          .optional()
+          .describe('Requested lines, and the earlier read that showed them'),
+      }),
+    }),
+    z.object({
+      type: z.literal('skeleton'),
+      file: z.object({
+        filePath: z.string().describe('The path to the file that was read'),
+        formatted: z
+          .string()
+          .describe('Line-numbered structure view with body-elision markers'),
+        keptLines: z.number().describe('Original lines still visible'),
+        elidedLines: z.number().describe('Original lines elided'),
+        elidedRegions: z.number().describe('Number of elided body regions'),
+        truncatedLines: z
+          .number()
+          .describe('Kept lines truncated for being too long to inline'),
+        truncatedChars: z
+          .number()
+          .describe('Characters dropped across all truncated lines'),
+        totalLines: z.number().describe('Total lines in the file'),
+        language: z.string().describe('Grammar used to parse the file'),
+        auto: z
+          .boolean()
+          .optional()
+          .describe(
+            'True when the skeleton was returned automatically for a large file rather than explicitly requested',
+          ),
+        condensedRegions: z
+          .number()
+          .optional()
+          .describe('Runs of plain code also folded so the view fits the read limit'),
+        condensedLines: z
+          .number()
+          .optional()
+          .describe('Lines in those folded runs'),
+      }),
+    }),
+  ])
+})
+type OutputSchema = ReturnType<typeof outputSchema>
+
+export type Output = z.infer<OutputSchema>
+
+export const FileReadTool = buildTool({
+  name: FILE_READ_TOOL_NAME,
+  searchHint: 'read files, images, PDFs, Word/Excel documents, notebooks',
+  // Output is bounded by maxTokens (validateContentTokens). Persisting to a
+  // file the model reads back with Read is circular — never persist.
+  maxResultSizeChars: Infinity,
+  strict: true,
+  async description() {
+    return DESCRIPTION
+  },
+  async prompt() {
+    const limits = getDefaultFileReadingLimits()
+    const maxSizeInstruction = limits.includeMaxSizeInPrompt
+      ? `. Files larger than ${formatFileSize(limits.maxSizeBytes)} will return an error; use offset and limit for larger files`
+      : ''
+    // Targeted by default: whole-file reads of large files are the costliest
+    // Read habit. The override can still switch the old wording back on.
+    const offsetInstruction =
+      limits.targetedRangeNudge === false
+        ? OFFSET_INSTRUCTION_DEFAULT
+        : OFFSET_INSTRUCTION_TARGETED
+    return renderPromptTemplate(
+      pickLineFormatInstruction(),
+      maxSizeInstruction,
+      offsetInstruction,
+    )
+  },
+  get inputSchema(): InputSchema {
+    return inputSchema()
+  },
+  get outputSchema(): OutputSchema {
+    return outputSchema()
+  },
+  userFacingName,
+  getToolUseSummary,
+  getActivityDescription(input) {
+    const summary = getToolUseSummary(input)
+    return summary ? `Reading ${summary}` : 'Reading file'
+  },
+  isConcurrencySafe() {
+    return true
+  },
+  isReadOnly() {
+    return true
+  },
+  toAutoClassifierInput(input) {
+    return input.file_path
+  },
+  isSearchOrReadCommand(input) {
+    // Image reads render a visual preview in the transcript. Marking them
+    // collapsible would fold the result into a "Read N files" summary line,
+    // which replaces the per-result renderer outright — the preview would
+    // never mount and the user would see only the count.
+    // Notebooks join images here: their cells can carry executed figures, which
+    // render as previews and would be swallowed by the same summary line.
+    if (
+      isImageFilePath(input?.file_path) ||
+      isNotebookFilePath(input?.file_path)
+    ) {
+      return { isSearch: false, isRead: false }
+    }
+    return { isSearch: false, isRead: true }
+  },
+  getPath({ file_path }): string {
+    return file_path || getCwd()
+  },
+  backfillObservableInput(input) {
+    // hooks.mdx documents file_path as absolute; expand so hook allowlists
+    // can't be bypassed via ~ or relative paths.
+    if (typeof input.file_path === 'string') {
+      input.file_path = expandPath(input.file_path)
+    }
+  },
+  async preparePermissionMatcher({ file_path }) {
+    return pattern => matchWildcardPattern(pattern, file_path)
+  },
+  async checkPermissions(input, context): Promise<PermissionDecision> {
+    const appState = context.getAppState()
+    const decision = await checkReadPermissionForTool(
+      FileReadTool,
+      input,
+      appState.toolPermissionContext,
+    )
+
+    // Reading an office document with no local Python library for it uploads
+    // it to Firecrawl to be converted — the only path in this tool that sends
+    // file contents off the machine. A filesystem read rule grants local
+    // access and cannot speak to egress, so ask once per session on top of
+    // whatever those rules decided. A denial still wins. parseOfficeDocument
+    // records the approval on its first success, so this asks once and then
+    // stays quiet. With a local library nothing leaves the machine: no ask.
+    const officeExt = path.extname(input.file_path).toLowerCase()
+    if (
+      decision.behavior === 'allow' &&
+      isOfficeParseEnabled() &&
+      !hasApprovedOfficeUpload() &&
+      isFirecrawlOfficeExtension(officeExt) &&
+      !(await canReadOfficeLocally(officeExt))
+    ) {
+      const decisionReason = {
+        type: 'other' as const,
+        reason:
+          'No local Python library reads this Office document; reading it uploads it to Firecrawl for conversion to markdown',
+      }
+      return {
+        behavior: 'ask',
+        decisionReason,
+        message: `Claude wants to read ${path.basename(input.file_path)}, which uploads it to Firecrawl to convert it to text`,
+      }
+    }
+
+    return decision
+  },
+  renderToolUseMessage,
+  renderToolUseTag,
+  renderToolResultMessage,
+  // UI.tsx:140 — ALL types render summary chrome only: "Read N lines",
+  // "Read image (42KB)". Never the content itself. The model-facing
+  // serialization (below) sends content + CYBER_RISK_MITIGATION_REMINDER
+  // + line prefixes; UI shows none of it. Nothing to index. Caught by
+  // the render-fidelity test when this initially claimed file.content.
+  extractSearchText() {
+    return ''
+  },
+  renderToolUseErrorMessage,
+  async validateInput({ file_path, pages }, toolUseContext: ToolUseContext) {
+    // Validate pages parameter (pure string parsing, no I/O)
+    if (pages !== undefined) {
+      const parsed = parsePDFPageRange(pages)
+      if (!parsed) {
+        return {
+          result: false,
+          message: `Invalid pages parameter: "${pages}". Use formats like "1-5", "3", or "10-20". Pages are 1-indexed.`,
+          errorCode: 7,
+        }
+      }
+      const rangeSize =
+        parsed.lastPage === Infinity
+          ? PDF_MAX_PAGES_PER_READ + 1
+          : parsed.lastPage - parsed.firstPage + 1
+      if (rangeSize > PDF_MAX_PAGES_PER_READ) {
+        return {
+          result: false,
+          message: `Page range "${pages}" exceeds maximum of ${PDF_MAX_PAGES_PER_READ} pages per request. Please use a smaller range.`,
+          errorCode: 8,
+        }
+      }
+    }
+
+    // Path expansion + deny rule check (no I/O)
+    const fullFilePath = expandPath(file_path)
+    // Remember this dir so later commands can find files here from another cwd.
+    recordVisitedDir(path.dirname(fullFilePath))
+
+    const appState = toolUseContext.getAppState()
+    const denyRule = matchingRuleForInput(
+      fullFilePath,
+      appState.toolPermissionContext,
+      'read',
+      'deny',
+    )
+    if (denyRule !== null) {
+      return {
+        result: false,
+        message:
+          'File is in a directory that is denied by your permission settings.',
+        errorCode: 1,
+      }
+    }
+
+    // SECURITY: UNC path check (no I/O) — defer filesystem operations
+    // until after user grants permission to prevent NTLM credential leaks
+    const isUncPath =
+      fullFilePath.startsWith('\\\\') || fullFilePath.startsWith('//')
+    if (isUncPath) {
+      return { result: true }
+    }
+
+    // Binary extension check (string check on extension only, no I/O).
+    // PDF, images, and SVG are excluded - this tool renders them natively.
+    const ext = path.extname(fullFilePath).toLowerCase()
+    // Office documents are binary containers, but the office branch in
+    // callInner converts them to markdown: with a local Python library, else
+    // Firecrawl. When neither can, it says what to install, so they pass here.
+    const isOfficeDoc = isOfficeDocExtension(ext)
+    if (
+      hasBinaryExtension(fullFilePath) &&
+      !isPDFExtension(ext) &&
+      !isOfficeDoc &&
+      !IMAGE_EXTENSIONS.has(ext.slice(1))
+    ) {
+      return {
+        result: false,
+        message: `This tool cannot read binary files. The file appears to be a binary ${ext} file. Please use appropriate tools for binary file analysis.`,
+        errorCode: 4,
+      }
+    }
+
+    // Block specific device files that would hang (infinite output or blocking input).
+    // This is a path-based check with no I/O — safe special files like /dev/null are allowed.
+    if (isBlockedDevicePath(fullFilePath)) {
+      return {
+        result: false,
+        message: `Cannot read '${file_path}': this device file would block or produce infinite output.`,
+        errorCode: 9,
+      }
+    }
+
+    return { result: true }
+  },
+  async call(
+    { file_path, offset = 1, limit = undefined, skeleton, include_source_maps = false, pages },
+    context,
+    _canUseTool?,
+    parentMessage?,
+  ) {
+    const { readFileState, fileReadingLimits } = context
+    if (include_source_maps && skeleton === true) {
+      throw new Error('include_source_maps: true requires skeleton: false or omitted.')
+    }
+
+    const defaults = getDefaultFileReadingLimits()
+    const maxSizeBytes =
+      fileReadingLimits?.maxSizeBytes ?? defaults.maxSizeBytes
+    const maxTokens = fileReadingLimits?.maxTokens ?? defaults.maxTokens
+
+    // Telemetry: track when callers override default read limits.
+    // Only fires on override (low volume) — event count = override frequency.
+    if (fileReadingLimits !== undefined) {
+      logEvent('tengu_file_read_limits_override', {
+        hasMaxTokens: fileReadingLimits.maxTokens !== undefined,
+        hasMaxSizeBytes: fileReadingLimits.maxSizeBytes !== undefined,
+      })
+    }
+
+    const ext = path.extname(file_path).toLowerCase().slice(1)
+    // Use expandPath for consistent path normalization with FileEditTool/FileWriteTool
+    // (especially handles whitespace trimming and Windows path separators)
+    const fullFilePath = expandPath(file_path)
+
+    // `pages` is PDF-only. On any other file type it does not apply. Rather than
+    // erroring in the user's face — or silently no-opping, which collides with
+    // the read-dedup stub and surfaces as a baffling "File unchanged" — drop the
+    // inapplicable param, read the file normally, and tag the result so the
+    // mapper appends a model-only nudge steering the agent to offset/limit. The
+    // user just sees a normal read; the agent self-corrects. General across
+    // every non-PDF file type.
+    const pagesIgnoredOnNonPdf = pages !== undefined && !isPDFExtension(ext)
+    if (pagesIgnoredOnNonPdf) {
+      pages = undefined
+    }
+    function markPagesIgnored<T extends { data: object }>(result: T): T {
+      if (pagesIgnoredOnNonPdf) pagesIgnoredResults.add(result.data)
+      return result
+    }
+
+    // Dedup: if we've already read this exact range and the file hasn't
+    // changed on disk, return a stub instead of re-sending the full content.
+    // The earlier Read tool_result is still in context — two full copies
+    // waste cache_creation tokens on every subsequent turn. BQ proxy shows
+    // ~18% of Read calls are same-file collisions (up to 2.64% of fleet
+    // cache_creation). Only applies to text/notebook reads — images/PDFs
+    // aren't cached in readFileState so won't match here.
+    //
+    // Ant soak: 1,734 dedup hits in 2h, no Read error regression.
+    // Killswitch pattern: GB can disable if the stub message confuses
+    // the model externally.
+    // 3P default: killswitch off = dedup enabled. Client-side only — no
+    // server support needed, safe for Bedrock/Vertex/Foundry.
+    const dedupKillswitch = getFeatureValue_CACHED_MAY_BE_STALE(
+      'tengu_read_dedup_killswitch',
+      false,
+    )
+    // A Read whose result goes to code (the Eval bridge) or into a summary
+    // must return the text itself, never a note pointing elsewhere.
+    const readHidden = context.readResultHidden === true
+    // Skeleton reads never dedup: they are cheap to recompute and their
+    // output shape differs from the full-content read the dedup stub
+    // would point the model back to. (Auto-skeleton reads don't need a
+    // guard here: a prior skeleton stores isPartialView: true with
+    // offset: undefined, which the conditions below already reject.)
+    const existingState =
+      dedupKillswitch || readHidden || skeleton === true
+        ? undefined
+        : readFileState.get(fullFilePath)
+    // Only dedup entries that came from a prior Read (offset is always set
+    // by Read). Edit/Write store offset=undefined — their readFileState
+    // entry reflects post-edit mtime, so deduping against it would wrongly
+    // point the model at the pre-edit Read content.
+    if (
+      existingState &&
+      !existingState.isPartialView &&
+      // The model never saw a hidden read's text, so it cannot refer to it.
+      !existingState.hiddenRead &&
+      // Right after a range note, repeating the Read must send the lines
+      // (rangeDedup.ts), so this stub does not answer it either.
+      !existingState.lastRangeStub &&
+      (existingState.sourceMapsIncluded ?? false) === include_source_maps &&
+      existingState.offset !== undefined
+    ) {
+      const rangeMatch =
+        existingState.offset === offset && existingState.limit === limit
+      if (rangeMatch) {
+        try {
+          const mtimeMs = await getFileModificationTimeAsync(fullFilePath)
+          if (mtimeMs === existingState.timestamp) {
+            const analyticsExt = getFileExtensionForAnalytics(fullFilePath)
+            logEvent('tengu_file_read_dedup', {
+              ...(analyticsExt !== undefined && { ext: analyticsExt }),
+            })
+            return markPagesIgnored({
+              data: {
+                type: 'file_unchanged' as const,
+                file: { filePath: file_path },
+              },
+            })
+          }
+        } catch {
+          // stat failed — fall through to full read
+        }
+      }
+    }
+
+    // Range dedup only for Reads whose result reaches the model as this
+    // tool_result. Internal reads (changed-file notices, @-mentions, memory)
+    // pass no parent message, and bridged ones are hidden.
+    const rangeDedup =
+      !dedupKillswitch &&
+      !readHidden &&
+      parentMessage !== undefined &&
+      context.toolUseId !== undefined
+
+    // Discover skills from this file's path (fire-and-forget, non-blocking)
+    // Skip in simple mode - no skills available
+    const cwd = getCwd()
+    if (!isEnvTruthy(process.env.CLAUDE_CODE_SIMPLE)) {
+      const newSkillDirs = await discoverSkillDirsForPaths([fullFilePath], cwd)
+      if (newSkillDirs.length > 0) {
+        // Store discovered dirs for attachment display
+        for (const dir of newSkillDirs) {
+          context.dynamicSkillDirTriggers?.add(dir)
+        }
+        // Don't await - let skill loading happen in the background
+        addSkillDirectories(newSkillDirs).catch(() => {})
+      }
+
+      // Activate conditional skills whose path patterns match this file
+      activateConditionalSkillsForPaths([fullFilePath], cwd)
+    }
+
+    // Auto-skeleton: a whole-file Read of a large, skeleton-supported code
+    // file returns structure instead of full content. Decided once here at
+    // execution time — the result is frozen into the transcript like any
+    // other tool output, so later requests re-send identical bytes and no
+    // provider prefix cache is disturbed. Explicit skeleton: false, an
+    // offset/limit range, or pages always bypass the policy.
+    let skeletonMode: SkeletonMode = skeleton === true ? 'explicit' : 'off'
+    if (
+      skeleton === undefined &&
+      !include_source_maps &&
+      offset <= 1 &&
+      limit === undefined &&
+      pages === undefined &&
+      isAutoSkeletonEnabled() &&
+      isSkeletonSupportedExt(ext)
+    ) {
+      try {
+        const stats = await getFsImplementation().stat(fullFilePath)
+        if (stats.size > getAutoSkeletonMinBytes()) {
+          skeletonMode = 'auto'
+        }
+      } catch {
+        // stat failed (missing file, permissions) — leave mode off and let
+        // callInner surface the real error through the existing paths.
+      }
+    }
+
+    try {
+      const result = await callInner(
+        file_path,
+        fullFilePath,
+        fullFilePath,
+        ext,
+        offset,
+        limit,
+        pages,
+        maxSizeBytes,
+        maxTokens,
+        readFileState,
+        context,
+        parentMessage?.message.id,
+        skeletonMode,
+        include_source_maps,
+        rangeDedup,
+        readHidden,
+      )
+      return markPagesIgnored(result)
+    } catch (error) {
+      // Handle file-not-found: suggest similar files
+      const code = getErrnoCode(error)
+      if (code === 'ENOENT') {
+        // macOS screenshots may use a thin space or regular space before
+        // AM/PM — try the alternate before giving up.
+        const altPath = getAlternateScreenshotPath(fullFilePath)
+        if (altPath) {
+          try {
+            const result = await callInner(
+              file_path,
+              fullFilePath,
+              altPath,
+              ext,
+              offset,
+              limit,
+              pages,
+              maxSizeBytes,
+              maxTokens,
+              readFileState,
+              context,
+              parentMessage?.message.id,
+              skeletonMode,
+              include_source_maps,
+              rangeDedup,
+              readHidden,
+            )
+            return markPagesIgnored(result)
+          } catch (altError) {
+            if (!isENOENT(altError)) {
+              throw altError
+            }
+            // Alt path also missing — fall through to friendly error
+          }
+        }
+
+        const similarFilename = findSimilarFile(fullFilePath)
+        const cwdSuggestion = await suggestPathUnderCwd(fullFilePath)
+        let message = `File does not exist. ${FILE_NOT_FOUND_CWD_NOTE} ${getCwd()}.`
+        if (cwdSuggestion) {
+          message += ` Did you mean ${cwdSuggestion}?`
+        } else if (similarFilename) {
+          message += ` Did you mean ${similarFilename}?`
+        }
+        throw new Error(message)
+      }
+      throw error
+    }
+  },
+  mapToolResultToToolResultBlockParam(data, toolUseID) {
+    switch (data.type) {
+      case 'image': {
+        return {
+          tool_use_id: toolUseID,
+          type: 'tool_result',
+          content: [
+            {
+              type: 'image',
+              source: {
+                type: 'base64',
+                data: data.file.base64,
+                media_type: data.file.type,
+              },
+            },
+          ],
+        }
+      }
+      case 'notebook':
+        return mapNotebookCellsToToolResult(data.file.cells, toolUseID)
+      case 'pdf':
+        // Return PDF metadata only - the actual content is sent as a supplemental DocumentBlockParam
+        return {
+          tool_use_id: toolUseID,
+          type: 'tool_result',
+          content: `PDF file read: ${data.file.filePath} (${formatFileSize(data.file.originalSize)})`,
+        }
+      case 'parts':
+        // Extracted page images are read and sent as image blocks in mapToolResultToAPIMessage
+        return {
+          tool_use_id: toolUseID,
+          type: 'tool_result',
+          content: `PDF pages extracted: ${data.file.count} page(s) from ${data.file.filePath} (${formatFileSize(data.file.originalSize)})`,
+        }
+      case 'file_unchanged':
+        return {
+          tool_use_id: toolUseID,
+          type: 'tool_result',
+          content:
+            (data.file.lines
+              ? rangeUnchangedStub(data.file.lines)
+              : FILE_UNCHANGED_STUB) +
+            (pagesIgnoredResults.has(data) ? PAGES_IGNORED_NUDGE : ''),
+        }
+      case 'skeleton': {
+        // Built from parts: a skeleton may elide bodies, truncate overlong
+        // lines, or both, and claiming "0 bodies elided" reads like a failure.
+        const { elidedRegions, elidedLines, totalLines, truncatedLines, truncatedChars, auto, condensedRegions } = data.file
+        const parts = [
+          auto
+            ? 'Auto-skeleton view: this file is large, so this Read returned its structure instead of full content.'
+            : 'Skeleton view:',
+        ]
+        if (condensedRegions) {
+          parts.push(
+            `${elidedRegions} regions elided (${elidedLines} of ${totalLines} lines), including ${condensedRegions} long ${condensedRegions === 1 ? 'run' : 'runs'} of plain code folded so this view fits the read limit; each ⋮ marker shows the exact Read offset/limit to expand it.`,
+          )
+        } else if (elidedRegions > 0) {
+          parts.push(
+            `${elidedRegions} function ${elidedRegions === 1 ? 'body' : 'bodies'} elided (${elidedLines} of ${totalLines} lines); each ⋮ marker shows the exact Read offset/limit to expand that body.`,
+          )
+        }
+        if (truncatedLines > 0) {
+          parts.push(
+            `${truncatedLines} overlong ${truncatedLines === 1 ? 'line was' : 'lines were'} truncated (${truncatedChars} chars dropped); such lines are typically minified code, inline sourcemaps, or embedded blobs, and re-reading one alone may still exceed the token limit.`,
+          )
+        }
+        if (auto) {
+          parts.push(
+            'Read specific ranges (offset/limit) for the bodies you need — preferred — or re-Read with skeleton: false to force the full file.',
+          )
+        }
+        parts.push(
+          'Line numbers are real file line numbers. Before editing this file, Read the relevant full range first.',
+        )
+        const note = `<system-reminder>${parts.join(' ')}</system-reminder>`
+        return {
+          tool_use_id: toolUseID,
+          type: 'tool_result',
+          content:
+            data.file.formatted +
+            '\n\n' +
+            note +
+            (pagesIgnoredResults.has(data) ? PAGES_IGNORED_NUDGE : '') +
+            (shouldIncludeFileReadMitigation()
+              ? CYBER_RISK_MITIGATION_REMINDER
+              : ''),
+        }
+      }
+      case 'text': {
+        let content: string
+
+        if (data.file.content) {
+          const pdfTextNote = pdfTextOnlyNotes.get(data)
+          content =
+            (pdfTextNote
+              ? `<system-reminder>${pdfTextNote}</system-reminder>\n`
+              : '') +
+            memoryFileFreshnessPrefix(data) +
+            formatFileLines(data.file) +
+            (shouldIncludeFileReadMitigation()
+              ? CYBER_RISK_MITIGATION_REMINDER
+              : '')
+        } else {
+          // Determine the appropriate warning message
+          content =
+            data.file.totalLines === 0
+              ? '<system-reminder>Warning: the file exists but the contents are empty.</system-reminder>'
+              : `<system-reminder>Warning: the file exists but is shorter than the provided offset (${data.file.startLine}). The file has ${data.file.totalLines} lines.</system-reminder>`
+        }
+
+        return {
+          tool_use_id: toolUseID,
+          type: 'tool_result',
+          content:
+            content +
+            (pagesIgnoredResults.has(data) ? PAGES_IGNORED_NUDGE : ''),
+        }
+      }
+    }
+  },
+} satisfies ToolDef<InputSchema, Output>)
+
+function pickLineFormatInstruction(): string {
+  return LINE_FORMAT_INSTRUCTION
+}
+
+/** Format file content with line numbers. */
+function formatFileLines(file: { content: string; startLine: number }): string {
+  return addLineNumbers(file)
+}
+
+export const CYBER_RISK_MITIGATION_REMINDER =
+  '\n\n<system-reminder>\nWhenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.\n</system-reminder>\n'
+
+// Models where cyber risk mitigation should be skipped
+const MITIGATION_EXEMPT_MODELS = new Set(['claude-opus-4-6'])
+
+function shouldIncludeFileReadMitigation(): boolean {
+  const shortName = getCanonicalName(getMainLoopModel())
+  return !MITIGATION_EXEMPT_MODELS.has(shortName)
+}
+
+/**
+ * Side-channel from call() to mapToolResultToToolResultBlockParam: mtime
+ * of auto-memory files, keyed by the `data` object identity. Avoids
+ * adding a presentation-only field to the output schema (which flows
+ * into SDK types) and avoids sync fs in the mapper. WeakMap auto-GCs
+ * when the data object becomes unreachable after rendering.
+ */
+const memoryFileMtimes = new WeakMap<object, number>()
+
+// Side-channel marking a Read result whose `pages` argument was dropped because
+// the file is not a PDF (pages is PDF-only). The mapper appends a model-only
+// nudge so the agent self-corrects to offset/limit — invisibly to the user, who
+// only ever sees the "Read N lines" summary. Never an error and never a silent
+// no-op: the read still returns real content, keeping the agent fully capable.
+const pagesIgnoredResults = new WeakSet<object>()
+const PAGES_IGNORED_NUDGE =
+  '\n\n<system-reminder>Note: the "pages" parameter applies only to PDF files and was ignored for this read. To read a specific part of a text or code file, use offset/limit (1-indexed line numbers); for a large code file, skeleton: true returns a structural overview.</system-reminder>'
+
+// Side-channel marking a PDF page read that fell back to extracted text
+// because the pages could not be rendered as images. The mapper puts the note
+// first, so the model knows nothing visual was inspected.
+const pdfTextOnlyNotes = new WeakMap<object, string>()
+
+/** Label each page of pdftotext output, which ends every page with a form feed. */
+function formatPDFTextPages({ text, firstPage }: PDFTextResult): {
+  content: string
+  hasText: boolean
+} {
+  const pages = text.replaceAll('\r\n', '\n').split('\f')
+  if (pages.length > 1 && pages.at(-1)!.trim() === '') pages.pop()
+  return {
+    content: pages
+      .map((page, i) => `--- Page ${firstPage + i} ---\n${page.trimEnd()}`)
+      .join('\n\n'),
+    hasText: pages.some(page => page.trim() !== ''),
+  }
+}
+
+function memoryFileFreshnessPrefix(data: object): string {
+  const mtimeMs = memoryFileMtimes.get(data)
+  if (mtimeMs === undefined) return ''
+  return memoryFreshnessNote(mtimeMs)
+}
+
+async function validateContentTokens(
+  content: string,
+  ext: string,
+  maxTokens?: number,
+  // True when the read that produced `content` was a skeleton request (either
+  // the skeleton output itself, or a full-read fall-through after skeleton
+  // produced nothing). Suppresses the "retry with skeleton" hint so the model
+  // cannot loop on the same failing mode.
+  skeletonRequested = false,
+): Promise<void> {
+  const effectiveMaxTokens =
+    maxTokens ?? getDefaultFileReadingLimits().maxTokens
+
+  const tokenEstimate = roughTokenCountEstimationForFileType(content, ext)
+  if (!tokenEstimate || tokenEstimate <= effectiveMaxTokens / 4) return
+
+  const tokenCount = await countTokensWithAPI(content)
+  const effectiveCount = tokenCount ?? tokenEstimate
+
+  if (effectiveCount > effectiveMaxTokens) {
+    throw new MaxFileReadTokenExceededError(
+      effectiveCount,
+      effectiveMaxTokens,
+      fileReadTokenLimitAdvice(ext, skeletonRequested),
+    )
+  }
+}
+
+type ImageResult = {
+  type: 'image'
+  file: {
+    base64: string
+    type: Base64ImageSource['media_type']
+    originalSize: number
+    dimensions?: ImageDimensions
+  }
+}
+
+function createImageResponse(
+  buffer: Buffer,
+  mediaType: string,
+  originalSize: number,
+  dimensions?: ImageDimensions,
+): ImageResult {
+  return {
+    type: 'image',
+    file: {
+      base64: buffer.toString('base64'),
+      type: `image/${mediaType}` as Base64ImageSource['media_type'],
+      originalSize,
+      dimensions,
+    },
+  }
+}
+
+/**
+ * Inner implementation of call, separated to allow ENOENT handling in the outer call.
+ */
+/** Share of the read limit an outline aims for when it has to fold to fit. */
+const SKELETON_FIT_MARGIN = 0.9
+
+async function callInner(
+  file_path: string,
+  fullFilePath: string,
+  resolvedFilePath: string,
+  ext: string,
+  offset: number,
+  limit: number | undefined,
+  pages: string | undefined,
+  maxSizeBytes: number,
+  maxTokens: number,
+  readFileState: ToolUseContext['readFileState'],
+  context: ToolUseContext,
+  messageId: string | undefined,
+  skeletonMode: SkeletonMode = 'off',
+  includeSourceMaps = false,
+  rangeDedup = false,
+  readHidden = false,
+): Promise<{
+  data: Output
+  newMessages?: ReturnType<typeof createUserMessage>[]
+}> {
+  // --- Notebook ---
+  if (ext === 'ipynb') {
+    const cells = await readNotebook(resolvedFilePath)
+    const cellsJson = jsonStringify(cells)
+
+    const cellsJsonBytes = Buffer.byteLength(cellsJson)
+    if (cellsJsonBytes > maxSizeBytes) {
+      throw new Error(
+        `Notebook content (${formatFileSize(cellsJsonBytes)}) exceeds maximum allowed size (${formatFileSize(maxSizeBytes)}). ` +
+          `Use ${BASH_TOOL_NAME} with jq to read specific portions:\n` +
+          `  cat "${file_path}" | jq '.cells[:20]' # First 20 cells\n` +
+          `  cat "${file_path}" | jq '.cells[100:120]' # Cells 100-120\n` +
+          `  cat "${file_path}" | jq '.cells | length' # Count total cells\n` +
+          `  cat "${file_path}" | jq '.cells[] | select(.cell_type=="code") | .source' # All code sources`,
+      )
+    }
+
+    await validateContentTokens(cellsJson, ext, maxTokens)
+
+    // Get mtime via async stat (single call, no prior existence check)
+    const stats = await getFsImplementation().stat(resolvedFilePath)
+    readFileState.set(fullFilePath, {
+      content: cellsJson,
+      timestamp: Math.floor(stats.mtimeMs),
+      offset,
+      limit,
+      ...(readHidden ? { hiddenRead: true as const } : {}),
+    })
+    recordFileRead(fullFilePath, context.agentId)
+    context.nestedMemoryAttachmentTriggers?.add(fullFilePath)
+
+    const data = {
+      type: 'notebook' as const,
+      file: { filePath: file_path, cells },
+    }
+
+    logFileOperation({
+      operation: 'read',
+      tool: 'FileReadTool',
+      filePath: fullFilePath,
+      content: cellsJson,
+    })
+
+    return { data }
+  }
+
+  // --- Image (single read, no double-read) ---
+  if (IMAGE_EXTENSIONS.has(ext)) {
+    // Images have their own size limits (token budget + compression) —
+    // don't apply the text maxSizeBytes cap.
+    const data = await readImageWithTokenBudget(resolvedFilePath, maxTokens)
+    context.nestedMemoryAttachmentTriggers?.add(fullFilePath)
+
+    logFileOperation({
+      operation: 'read',
+      tool: 'FileReadTool',
+      filePath: fullFilePath,
+      content: data.file.base64,
+    })
+
+    const metadataText = data.file.dimensions
+      ? createImageMetadataText(data.file.dimensions)
+      : null
+
+    return {
+      data,
+      ...(metadataText && {
+        newMessages: [
+          createUserMessage({ content: metadataText, isMeta: true }),
+        ],
+      }),
+    }
+  }
+
+  // --- PDF ---
+  if (isPDFExtension(ext)) {
+    if (pages) {
+      const parsedRange = parsePDFPageRange(pages)
+      const extractResult = await extractPDFPages(
+        resolvedFilePath,
+        parsedRange ?? undefined,
+      )
+      if (!extractResult.success) {
+        const { reason, message } = extractResult.error
+        // Page images need pdftoppm or PyMuPDF. When neither works, the text
+        // layer can still be read (pdftotext or a Python PDF library), and the
+        // note says plainly that nothing visual was inspected. Problems with
+        // the file itself (password, damage, size) would fail the same way,
+        // so they surface.
+        if (reason !== 'unavailable' && reason !== 'unknown') {
+          throw new Error(message)
+        }
+        const textResult = await extractPDFText(
+          resolvedFilePath,
+          parsedRange ?? undefined,
+        )
+        if (!textResult.success) {
+          const pythonInstall =
+            textResult.error.pythonInstall ?? extractResult.error.pythonInstall
+          throw new Error(
+            reason === 'unavailable' && textResult.error.reason === 'unavailable'
+              ? `Cannot read PDF pages ${pages}: nothing here can read PDFs — neither Poppler (pdftoppm for page images, pdftotext for text) nor a Python with a PDF library. Either: ${getPopplerInstallHint()}${pythonInstall ? ` Or: ${pythonInstall}` : ''}${isPDFSupported() ? ' If the PDF is small, Read it without `pages` to attach the whole document instead.' : ''}`
+              : `${message} Extracting the text instead also failed: ${textResult.error.message}${pythonInstall ? ` ${pythonInstall}` : ''}`,
+          )
+        }
+        const { content, hasText } = formatPDFTextPages(textResult.data)
+        await validateContentTokens(content, ext, maxTokens)
+        const lineCount = content.split('\n').length
+        const data = {
+          type: 'text' as const,
+          file: {
+            filePath: file_path,
+            content,
+            numLines: lineCount,
+            startLine: 1,
+            totalLines: lineCount,
+          },
+        }
+        pdfTextOnlyNotes.set(
+          data,
+          hasText
+            ? `This is only the text layer of PDF pages ${pages}, extracted with ${textResult.data.tool}, because the pages could not be rendered as images. Images, charts, scanned pages and layout were not inspected. ${message}`
+            : `PDF pages ${pages} have no text layer (they are probably scanned images) and could not be rendered as images, so their content was not inspected. ${message}`,
+        )
+        logFileOperation({
+          operation: 'read',
+          tool: 'FileReadTool',
+          filePath: fullFilePath,
+          content: `PDF text of pages ${pages}`,
+        })
+        return { data }
+      }
+      logEvent('tengu_pdf_page_extraction', {
+        success: true,
+        pageCount: extractResult.data.file.count,
+        fileSize: extractResult.data.file.originalSize,
+        hasPageRange: true,
+      })
+      logFileOperation({
+        operation: 'read',
+        tool: 'FileReadTool',
+        filePath: fullFilePath,
+        content: `PDF pages ${pages}`,
+      })
+      const entries = await readdir(extractResult.data.file.outputDir)
+      // pdftoppm and current PyMuPDF write JPEG; an old PyMuPDF writes PNG.
+      const imageFiles = entries.filter(f => /\.(jpg|png)$/.test(f)).sort()
+      const imageBlocks = await Promise.all(
+        imageFiles.map(async f => {
+          const imgPath = path.join(extractResult.data.file.outputDir, f)
+          const imgBuffer = await readFileAsync(imgPath)
+          const resized = await maybeResizeAndDownsampleImageBuffer(
+            imgBuffer,
+            imgBuffer.length,
+            f.endsWith('.png') ? 'png' : 'jpeg',
+          )
+          return {
+            type: 'image' as const,
+            source: {
+              type: 'base64' as const,
+              media_type:
+                `image/${resized.mediaType}` as Base64ImageSource['media_type'],
+              data: resized.buffer.toString('base64'),
+            },
+          }
+        }),
+      )
+      return {
+        data: extractResult.data,
+        ...(imageBlocks.length > 0 && {
+          newMessages: [
+            createUserMessage({ content: imageBlocks, isMeta: true }),
+          ],
+        }),
+      }
+    }
+
+    const pageCount = await getPDFPageCount(resolvedFilePath)
+    if (pageCount !== null && pageCount > PDF_AT_MENTION_INLINE_THRESHOLD) {
+      throw new Error(
+        `This PDF has ${pageCount} pages, which is too many to read at once. ` +
+          `Use the pages parameter to read specific page ranges (e.g., pages: "1-5"). ` +
+          `Maximum ${PDF_MAX_PAGES_PER_READ} pages per request.`,
+      )
+    }
+
+    const fs = getFsImplementation()
+    const stats = await fs.stat(resolvedFilePath)
+    const shouldExtractPages =
+      !isPDFSupported() || stats.size > PDF_EXTRACT_SIZE_THRESHOLD
+
+    if (shouldExtractPages) {
+      // Only logged: no Python fallback, which would render every page.
+      const extractResult = await extractPDFPages(resolvedFilePath, undefined, false)
+      if (extractResult.success) {
+        logEvent('tengu_pdf_page_extraction', {
+          success: true,
+          pageCount: extractResult.data.file.count,
+          fileSize: extractResult.data.file.originalSize,
+        })
+      } else {
+        logEvent('tengu_pdf_page_extraction', {
+          success: false,
+          available: extractResult.error.reason !== 'unavailable',
+          fileSize: stats.size,
+        })
+      }
+    }
+
+    if (!isPDFSupported()) {
+      throw new Error(
+        'Reading full PDFs is not supported with this model. Use a newer model (Sonnet 3.5 v2 or later), ' +
+          `or use the pages parameter to read specific page ranges (e.g., pages: "1-5", maximum ${PDF_MAX_PAGES_PER_READ} pages per request). ` +
+          `Page extraction needs Poppler or a Python with PyMuPDF. ${getPopplerInstallHint()}`,
+      )
+    }
+
+    const readResult = await readPDF(resolvedFilePath)
+    if (!readResult.success) {
+      throw new Error(readResult.error.message)
+    }
+    const pdfData = readResult.data
+    logFileOperation({
+      operation: 'read',
+      tool: 'FileReadTool',
+      filePath: fullFilePath,
+      content: pdfData.file.base64,
+    })
+
+    return {
+      data: pdfData,
+      newMessages: [
+        createUserMessage({
+          content: [
+            {
+              type: 'document',
+              source: {
+                type: 'base64',
+                media_type: 'application/pdf',
+                data: pdfData.file.base64,
+              },
+            },
+          ],
+          isMeta: true,
+        }),
+      ],
+    }
+  }
+
+  // --- Office document (Word / Excel / PowerPoint / OpenDocument) ---
+  // Placed after the PDF branch on purpose: .pdf keeps its native, on-machine
+  // path and must never reach the uploader. These formats are binary
+  // containers, converted to markdown by a local Python library when one is
+  // installed, else by Firecrawl.
+  if (isOfficeDocExtension(ext)) {
+    const parsed = await readOfficeDocument(
+      resolvedFilePath,
+      context.abortController.signal,
+    )
+
+    // Slice the converted markdown so offset/limit behave as they do for text.
+    const allLines = parsed.markdown.split('\n')
+    const totalLines = allLines.length
+    const startLine = offset === 0 ? 1 : offset
+    const sliceStart = startLine - 1
+    const selected = allLines.slice(
+      sliceStart,
+      limit === undefined ? undefined : sliceStart + limit,
+    )
+    const content = selected.join('\n')
+
+    await validateContentTokens(content, ext, maxTokens)
+
+    // Deliberately NOT written to readFileState. That map is what Edit and
+    // Write diff against, and this markdown is a rendering rather than the
+    // bytes on disk — feeding it to them would corrupt the document. Leaving
+    // it unset makes both refuse until the file has been read as text, which
+    // for a binary container never happens. Repeat reads are served by the
+    // parse cache in officeDocs.ts instead of the readFileState dedup above.
+    context.nestedMemoryAttachmentTriggers?.add(fullFilePath)
+
+    logFileOperation({
+      operation: 'read',
+      tool: 'FileReadTool',
+      filePath: fullFilePath,
+      content,
+    })
+    const officeAnalyticsExt = getFileExtensionForAnalytics(fullFilePath)
+    logEvent('tengu_file_read_office_parse', {
+      cached: parsed.cached,
+      truncated: selected.length < totalLines,
+      ...(officeAnalyticsExt !== undefined && { ext: officeAnalyticsExt }),
+    })
+
+    const notes = [
+      `Converted ${path.basename(fullFilePath)} to markdown with ${parsed.source}${parsed.cached ? ' (cached from an earlier read)' : ''}.`,
+      'This is a text rendering of a binary document, so it cannot be modified with Edit or Write.',
+    ]
+    if (parsed.warning) {
+      notes.push(`Conversion warning: ${parsed.warning}`)
+    }
+
+    return {
+      data: {
+        type: 'text' as const,
+        file: {
+          filePath: file_path,
+          content,
+          numLines: selected.length,
+          startLine,
+          totalLines,
+        },
+      },
+      newMessages: [
+        createUserMessage({ content: notes.join(' '), isMeta: true }),
+      ],
+    }
+  }
+
+  // --- Skeleton view (structure with long function bodies elided) ---
+  // Only reached for text files: notebook/image/PDF/office branches returned above.
+  // Any unsupported/unparseable case falls through to the normal text read.
+  if (skeletonMode !== 'off') {
+    // Allow larger files than a plain full read: the OUTPUT is what reaches
+    // the model and it is dramatically smaller (and still token-validated).
+    const skeletonSizeBytes = Math.max(
+      maxSizeBytes,
+      Math.min(maxSizeBytes * 4, 2_000_000),
+    )
+    const fullRead = await readFileInRange(
+      resolvedFilePath,
+      0,
+      undefined,
+      skeletonSizeBytes,
+      context.abortController.signal,
+    )
+    // An outline over the read limit folds its longest plain-code runs to
+    // fit (cheap mode's lower limit included), so the model still gets an
+    // outline rather than an error. The margin leaves room for the exact
+    // count validateContentTokens takes.
+    const skeletonResult = await buildSkeleton(
+      fullRead.content,
+      ext,
+      (c, s) => addLineNumbers({ content: c, startLine: s }),
+      formatted =>
+        roughTokenCountEstimationForFileType(formatted, ext) <=
+        maxTokens * SKELETON_FIT_MARGIN,
+    )
+    // Auto mode skips a thin outline (one body holds most of the file) when
+    // the whole file is cheap: the model would open that body next anyway.
+    const readWhole =
+      skeletonResult !== null &&
+      skeletonMode === 'auto' &&
+      shouldReadWholeInstead(
+        skeletonResult,
+        roughTokenCountEstimationForFileType(fullRead.content, ext),
+        maxTokens,
+      )
+    if (skeletonResult && !readWhole) {
+      // Always skeletonRequested=true here: this content IS a skeleton, so a
+      // token overflow must not tell the model to "try skeleton" again.
+      await validateContentTokens(skeletonResult.formatted, ext, maxTokens, true)
+
+      // Partial view: store RAW disk content for diffing, and flag it so
+      // Edit/Write demand a real full-content Read before mutating. Earlier
+      // Read results stay in the conversation, so their ranges are kept.
+      const previous = readFileState.get(fullFilePath)
+      readFileState.set(fullFilePath, {
+        content: fullRead.content,
+        timestamp: Math.floor(fullRead.mtimeMs),
+        offset: undefined,
+        limit: undefined,
+        isPartialView: true,
+        ...(previous?.sourceMapsOmitted ? { sourceMapsOmitted: true } : {}),
+        ...(previous?.seenRanges ? { seenRanges: previous.seenRanges } : {}),
+        ...(readHidden ? { hiddenRead: true as const } : {}),
+      })
+      recordFileRead(fullFilePath, context.agentId)
+      context.nestedMemoryAttachmentTriggers?.add(fullFilePath)
+
+      logFileOperation({
+        operation: 'read',
+        tool: 'FileReadTool',
+        filePath: fullFilePath,
+        content: skeletonResult.formatted,
+      })
+      const analyticsExt = getFileExtensionForAnalytics(fullFilePath)
+      logEvent('tengu_file_read_skeleton', {
+        totalLines: skeletonResult.totalLines,
+        keptLines: skeletonResult.keptLines,
+        elidedLines: skeletonResult.elidedLines,
+        elidedRegions: skeletonResult.elidedRegions,
+        truncatedLines: skeletonResult.truncatedLines,
+        truncatedChars: skeletonResult.truncatedChars,
+        auto: skeletonMode === 'auto',
+        ...(analyticsExt !== undefined && { ext: analyticsExt }),
+      })
+
+      return {
+        data: {
+          type: 'skeleton' as const,
+          file: {
+            filePath: file_path,
+            formatted: skeletonResult.formatted,
+            keptLines: skeletonResult.keptLines,
+            elidedLines: skeletonResult.elidedLines,
+            elidedRegions: skeletonResult.elidedRegions,
+            truncatedLines: skeletonResult.truncatedLines,
+            truncatedChars: skeletonResult.truncatedChars,
+            totalLines: skeletonResult.totalLines,
+            language: skeletonResult.language,
+            // Set only for auto mode so explicit-skeleton results stay
+            // byte-identical to their pre-auto-policy rendering.
+            ...(skeletonMode === 'auto' ? { auto: true } : {}),
+            ...(skeletonResult.condensedRegions
+              ? {
+                  condensedRegions: skeletonResult.condensedRegions,
+                  condensedLines: skeletonResult.condensedLines,
+                }
+              : {}),
+          },
+        },
+      }
+    }
+    // Fall through to a normal read below (unsupported language, parse
+    // failure, nothing long enough to elide, or a thin outline skipped).
+  }
+
+  // --- Text file (single async read via readFileInRange) ---
+  const lineOffset = offset === 0 ? 0 : offset - 1
+  // offset 0 and 1 both read from the first line, so both number from 1.
+  const firstLine = lineOffset + 1
+  const { content, fullContent, lineCount, totalLines, totalBytes, readBytes, mtimeMs } =
+    await readFileInRange(
+      resolvedFilePath,
+      lineOffset,
+      limit,
+      limit === undefined ? maxSizeBytes : undefined,
+      context.abortController.signal,
+      { captureFullContent: !includeSourceMaps && supportsInlineSourceMaps(ext) },
+    )
+
+  // Build the view once, before storing any tool result. Replaying history or
+  // switching providers must never rewrite previously-sent prompt bytes.
+  const view = includeSourceMaps
+    ? { content, omitted: false }
+    : await inlineSourceMapView(content, fullContent, ext, lineOffset)
+  context.abortController.signal.throwIfAborted()
+
+  const previous = readFileState.get(fullFilePath)
+  const sourceMapsOmitted = view.omitted || (
+    previous?.sourceMapsOmitted === true &&
+    !(lineOffset === 0 && lineCount === totalLines)
+  )
+
+  // Lines an earlier Read result in this conversation already shows unchanged
+  // are named instead of sent again (rangeDedup.ts). The read state is set
+  // exactly as sending them would set it, so Edit treats both the same.
+  const seen =
+    rangeDedup && skeletonMode === 'off'
+      ? findUnchangedSeenRange(previous, firstLine, view.content, context.messages)
+      : undefined
+  if (seen) {
+    const lines = {
+      start: firstLine,
+      end: firstLine + lineCount - 1,
+      seenStart: seen.start,
+      seenEnd: seen.end,
+    }
+    readFileState.set(fullFilePath, {
+      content,
+      timestamp: Math.floor(mtimeMs),
+      offset,
+      limit,
+      sourceMapsIncluded: includeSourceMaps,
+      ...(sourceMapsOmitted ? { sourceMapsOmitted: true } : {}),
+      seenRanges: previous?.seenRanges,
+      lastRangeStub: { start: lines.start, end: lines.end },
+    })
+    recordFileRead(fullFilePath, context.agentId)
+    const analyticsExt = getFileExtensionForAnalytics(fullFilePath)
+    logEvent('tengu_file_read_dedup', {
+      ...(analyticsExt !== undefined && { ext: analyticsExt }),
+      range: true,
+    })
+    return {
+      data: {
+        type: 'file_unchanged' as const,
+        file: { filePath: file_path, lines },
+      },
+    }
+  }
+
+  // Pass the requested skeleton flag: when skeleton was asked for (explicit
+  // or auto) but produced nothing (no elidable body / unsupported), we fell
+  // through to this full read. If it overflows, the error must not loop the
+  // model back to skeleton.
+  await validateContentTokens(view.content, ext, maxTokens, skeletonMode !== 'off')
+
+  const seenRanges =
+    rangeDedup && context.toolUseId !== undefined
+      ? withSeenRange(previous?.seenRanges, {
+          start: firstLine,
+          end: firstLine + lineCount - 1,
+          text: view.content,
+          toolUseId: context.toolUseId,
+        })
+      : previous?.seenRanges
+  readFileState.set(fullFilePath, {
+    content,
+    timestamp: Math.floor(mtimeMs),
+    offset,
+    limit,
+    sourceMapsIncluded: includeSourceMaps,
+    ...(sourceMapsOmitted ? { sourceMapsOmitted: true } : {}),
+    ...(seenRanges ? { seenRanges } : {}),
+    ...(readHidden ? { hiddenRead: true as const } : {}),
+  })
+  recordFileRead(fullFilePath, context.agentId)
+  context.nestedMemoryAttachmentTriggers?.add(fullFilePath)
+
+  // Snapshot before iterating — a listener that unsubscribes mid-callback
+  // would splice the live array and skip the next listener.
+  for (const listener of fileReadListeners.slice()) {
+    listener(resolvedFilePath, content)
+  }
+
+  const data = {
+    type: 'text' as const,
+    file: {
+      filePath: file_path,
+      content: view.content,
+      numLines: lineCount,
+      startLine: firstLine,
+      totalLines,
+    },
+  }
+  if (isAutoMemFile(fullFilePath)) {
+    memoryFileMtimes.set(data, mtimeMs)
+  }
+
+  logFileOperation({
+    operation: 'read',
+    tool: 'FileReadTool',
+    filePath: fullFilePath,
+    content,
+  })
+
+  const sessionFileType = detectSessionFileType(fullFilePath)
+  const analyticsExt = getFileExtensionForAnalytics(fullFilePath)
+  logEvent('tengu_session_file_read', {
+    totalLines,
+    readLines: lineCount,
+    totalBytes,
+    readBytes,
+    offset,
+    ...(limit !== undefined && { limit }),
+    ...(analyticsExt !== undefined && { ext: analyticsExt }),
+    ...(messageId !== undefined && {
+      messageID:
+        messageId as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
+    }),
+    is_session_memory: sessionFileType === 'session_memory',
+    is_session_transcript: sessionFileType === 'session_transcript',
+  })
+
+  return { data }
+}
+
+/**
+ * Reads an image file and applies token-based compression if needed.
+ * Reads the file ONCE, then applies standard resize. If the result exceeds
+ * the token limit, applies aggressive compression from the same buffer.
+ *
+ * @param filePath - Path to the image file
+ * @param maxTokens - Maximum token budget for the image
+ * @returns Image data with appropriate compression applied
+ */
+export async function readImageWithTokenBudget(
+  filePath: string,
+  maxTokens: number = getDefaultFileReadingLimits().maxTokens,
+  maxBytes?: number,
+): Promise<ImageResult> {
+  // Read file ONCE — capped to maxBytes to avoid OOM on huge files
+  const imageBuffer = await getFsImplementation().readFileBytes(
+    filePath,
+    maxBytes,
+  )
+  const originalSize = imageBuffer.length
+
+  if (originalSize === 0) {
+    throw new Error(`Image file is empty: ${filePath}`)
+  }
+
+  const detectedMediaType = detectImageFormatFromBuffer(imageBuffer)
+  const detectedFormat = detectedMediaType.split('/')[1] || 'png'
+
+  // Try standard resize
+  let result: ImageResult
+  try {
+    const resized = await maybeResizeAndDownsampleImageBuffer(
+      imageBuffer,
+      originalSize,
+      detectedFormat,
+    )
+    result = createImageResponse(
+      resized.buffer,
+      resized.mediaType,
+      originalSize,
+      resized.dimensions,
+    )
+  } catch (e) {
+    if (e instanceof ImageResizeError) throw e
+    logError(e)
+    result = createImageResponse(imageBuffer, detectedFormat, originalSize)
+  }
+
+  // Check if it fits in token budget
+  const estimatedTokens = Math.ceil(result.file.base64.length * 0.125)
+  if (estimatedTokens > maxTokens) {
+    // Aggressive compression from the SAME buffer (no re-read)
+    try {
+      const compressed = await compressImageBufferWithTokenLimit(
+        imageBuffer,
+        maxTokens,
+        detectedMediaType,
+      )
+      return {
+        type: 'image',
+        file: {
+          base64: compressed.base64,
+          type: compressed.mediaType,
+          originalSize,
+        },
+      }
+    } catch (e) {
+      logError(e)
+      // Fallback: heavily compressed version from the SAME buffer
+      try {
+        const sharpModule = await import('sharp')
+        const sharp =
+          (
+            sharpModule as {
+              default?: typeof sharpModule
+            } & typeof sharpModule
+          ).default || sharpModule
+
+        const fallbackBuffer = await sharp(imageBuffer)
+          .resize(400, 400, {
+            fit: 'inside',
+            withoutEnlargement: true,
+          })
+          .jpeg({ quality: 20 })
+          .toBuffer()
+
+        return createImageResponse(fallbackBuffer, 'jpeg', originalSize)
+      } catch (error) {
+        logError(error)
+        return createImageResponse(imageBuffer, detectedFormat, originalSize)
+      }
+    }
+  }
+
+  return result
+}

@@ -1,0 +1,1550 @@
+/**
+ * Gemini Lane — Native REST API Client
+ *
+ * Direct HTTP client for Gemini's REST API. No SDK dependency.
+ * Supports both API key and OAuth token auth.
+ *
+ * Endpoints:
+ *   Streaming:     POST /v1beta/models/{model}:streamGenerateContent?alt=sse
+ *   Non-streaming: POST /v1beta/models/{model}:generateContent
+ *   Model list:    GET  /v1beta/models
+ *
+ * Auth:
+ *   API key:  x-goog-api-key header
+ *   OAuth:    Authorization: Bearer <token> (routed through Code Assist proxy)
+ */
+
+import type { ModelInfo } from '../../services/api/providers/base_provider.js'
+import {
+  antigravityPickerModelsForPlan,
+  ensureCodeAssistReady,
+  getGeminiTier,
+  executorForModel,
+  parseCodeAssistSSE,
+  unwrapCodeAssistResponse,
+  wrapForCodeAssist,
+  wrapForGeminiCLI,
+  geminiCLIApiHeaders,
+  antigravityApiHeaders,
+  codeAssistGenerationBasesForModel,
+  clearCodeAssistCache,
+  isAntigravityGeminiModel,
+  antigravityGeminiEndpointTimeoutMs,
+  antigravityGeminiStickyBase,
+  recordAntigravityGeminiServedBase,
+  shouldTryNextAntigravityGeminiEndpoint,
+  warmupCodeAssist,
+} from '../../services/api/providers/gemini_code_assist.js'
+import { resolveCliModelsForPicker } from '../../services/api/providers/gemini_provider.js'
+import {
+  getAntigravityCacheRequestContext,
+  writeAntigravityEndpointDebugEvent,
+} from './antigravity_cache.js'
+import {
+  startAntigravityDispatchTrace,
+  type AntigravityDispatchAttempt,
+  type AntigravityExperimentProfile,
+} from './antigravity_trace.js'
+import {
+  antigravityTrajectoryForAttempt,
+  rejectAntigravityTrajectoryOn,
+  type AntigravityTrajectoryAttempt,
+} from './antigravity_trajectory.js'
+import { antigravityKeepAliveRequested } from './antigravity_keepalive.js'
+import {
+  antigravityTransportFor,
+  type AntigravityTransport,
+} from './antigravity_transport.js'
+import {
+  classifyGeminiError,
+  type ClassifiedGeminiError,
+  type GeminiErrorKind,
+} from './quota.js'
+import {
+  getAntigravityRotation,
+  familyForAntigravityModel,
+} from './rotation.js'
+import {
+  loadStore as loadAntigravityStore,
+  selectActiveAntigravityAccount,
+} from '../shared/antigravity_auth.js'
+import { parseGeminiApiSSE as parseGeminiApiSSEEvent } from './api_sse.js'
+import { markAntigravityRetryHandled, retryAntigravityRequest } from './antigravity_retry.js'
+
+// Duplicated from services/api/errors.ts to avoid pulling in its
+// transitive import of utils/messages.ts (which has build-time-only
+// module resolution that breaks bun-test). The string must stay
+// identical so isPromptTooLongMessage() downstream matches.
+const PROMPT_TOO_LONG_ERROR_MESSAGE = 'Prompt is too long'
+
+export const TAU_STABLE_SESSION_ID_FIELD = '__tauStableSessionId'
+/**
+ * Internal marker the lane sets so host selection can tell a one-shot
+ * `/report` from a live conversation turn. Stripped before the request is
+ * serialized, exactly like the stable session id above.
+ */
+export const TAU_QUERY_SOURCE_FIELD = '__tauQuerySource'
+
+function takeTauStableSessionId(body: Record<string, unknown>): string | undefined {
+  const value = body[TAU_STABLE_SESSION_ID_FIELD]
+  delete body[TAU_STABLE_SESSION_ID_FIELD]
+  return typeof value === 'string' && value.length > 0 ? value : undefined
+}
+
+function takeTauQuerySource(body: Record<string, unknown>): string | undefined {
+  const value = body[TAU_QUERY_SOURCE_FIELD]
+  delete body[TAU_QUERY_SOURCE_FIELD]
+  return typeof value === 'string' && value.length > 0 ? value : undefined
+}
+
+function withTauStableSessionId(
+  body: Record<string, unknown>,
+  sessionId: string | undefined,
+): Record<string, unknown> {
+  return sessionId ? { ...body, sessionId } : body
+}
+
+/**
+ * Trajectory envelope for one dispatched attempt (see
+ * antigravity_trajectory.ts; on unless TAU_ANTIGRAVITY_TRAJECTORY=0):
+ * Antigravity Gemini conversation streams only.
+ */
+function antigravityTrajectoryFor(
+  request: object,
+  executor: 'cli' | 'antigravity',
+  model: string,
+  accountEmail: string | undefined,
+  projectId: string | null,
+): AntigravityTrajectoryAttempt | undefined {
+  if (!isAntigravityGeminiRoute(executor, model)) return undefined
+  const context = getAntigravityCacheRequestContext(request)
+  if (!context) return undefined
+  return antigravityTrajectoryForAttempt({
+    sessionId: context.sessionId,
+    querySource: context.querySource,
+    model: context.model,
+    account: accountEmail ?? 'active-token',
+    project: projectId,
+  })
+}
+
+// Diagnostics and keep-alive (on unless TAU_ANTIGRAVITY_KEEPALIVE=0) need
+// the transport; with both off, requests go out exactly as before.
+function antigravityTransportIfNeeded(url: string, traced: boolean): AntigravityTransport | undefined {
+  return traced || antigravityKeepAliveRequested() ? antigravityTransportFor(url) : undefined
+}
+
+// Effective experiment arm of one dispatch. A requested keep-alive that was
+// skipped (proxy, Bun) is marked so it never counts as a treated sample.
+function experimentProfile(
+  trajectory: AntigravityTrajectoryAttempt | undefined,
+  transport: AntigravityTransport | undefined,
+): AntigravityExperimentProfile {
+  const skipped = transport?.profile.keepAlive?.skipped
+  return {
+    trajectory: trajectory?.profile ?? 'off',
+    transport: transport?.profile.dispatcher === 'keepalive' ? 'keepalive' : 'baseline',
+    ...(trajectory?.state && { trajectoryState: trajectory.state }),
+    ...(skipped && { transportSkipped: skipped }),
+  }
+}
+
+function antigravityEndpointLogger(request: object, wireSessionId: string | undefined) {
+  const context = getAntigravityCacheRequestContext(request)
+  return (event: string, detail: Record<string, unknown>) =>
+    writeAntigravityEndpointDebugEvent(wireSessionId, event, {
+      ...detail,
+      ...(context && {
+        requestId: context.requestId,
+        conversationSessionId: context.sessionId,
+        model: context.model,
+        querySource: context.querySource,
+      }),
+    })
+}
+
+// ─── Types ───────────────────────────────────────────────────────
+
+export interface GeminiStreamChunk {
+  candidates?: Array<{
+    content?: {
+      role: string
+      parts: Array<Record<string, unknown>>
+    }
+    finishReason?: string
+  }>
+  usageMetadata?: {
+    promptTokenCount?: number
+    candidatesTokenCount?: number
+    cachedContentTokenCount?: number
+    thoughtsTokenCount?: number
+    totalTokenCount?: number
+  }
+}
+
+export async function* parseGeminiApiSSE(
+  body: ReadableStream<Uint8Array>,
+): AsyncGenerator<GeminiStreamChunk> {
+  const reader = body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+  let dataLines: string[] = []
+
+  const flushEvent = (): { done: boolean; chunks: GeminiStreamChunk[] } => {
+    if (dataLines.length === 0) return { done: false, chunks: [] }
+
+    const payload = dataLines.join('\n').trim()
+    dataLines = []
+
+    if (!payload) return { done: false, chunks: [] }
+    if (payload === '[DONE]') return { done: true, chunks: [] }
+
+    try {
+      return { done: false, chunks: [JSON.parse(payload) as GeminiStreamChunk] }
+    } catch {
+      return { done: false, chunks: [] }
+    }
+  }
+
+  const processLine = (rawLine: string): { done: boolean; chunks: GeminiStreamChunk[] } => {
+    const line = rawLine.endsWith('\r') ? rawLine.slice(0, -1) : rawLine
+
+    if (line.trim() === '') {
+      return flushEvent()
+    }
+
+    if (!line.startsWith('data:')) {
+      return { done: false, chunks: [] }
+    }
+
+    const value = line.slice(5)
+    dataLines.push(value.startsWith(' ') ? value.slice(1) : value)
+    return { done: false, chunks: [] }
+  }
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+
+      buffer += decoder.decode(value, { stream: true })
+      const lines = buffer.split('\n')
+      buffer = lines.pop() ?? ''
+
+      for (const rawLine of lines) {
+        const event = processLine(rawLine)
+        if (event.done) return
+        for (const chunk of event.chunks) {
+          yield chunk
+        }
+      }
+    }
+
+    buffer += decoder.decode()
+    if (buffer) {
+      for (const rawLine of buffer.split('\n')) {
+        const event = processLine(rawLine)
+        if (event.done) return
+        for (const chunk of event.chunks) {
+          yield chunk
+        }
+      }
+    }
+
+    const event = flushEvent()
+    if (event.done) return
+    for (const chunk of event.chunks) {
+      yield chunk
+    }
+  } finally {
+    reader.releaseLock()
+  }
+}
+
+// ─── API Client ──────────────────────────────────────────────────
+
+const AI_STUDIO_BASE = 'https://generativelanguage.googleapis.com/v1beta'
+
+class EndpointTimeoutError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'EndpointTimeoutError'
+  }
+}
+
+function isAntigravityGeminiRoute(executor: 'cli' | 'antigravity', model: string): boolean {
+  return executor === 'antigravity' && isAntigravityGeminiModel(model)
+}
+
+function antigravityRetryOptions(
+  signal: AbortSignal | undefined,
+  executor: 'cli' | 'antigravity',
+  model: string,
+): RetryOptions {
+  return { signal, ...(executor === 'antigravity' && { antigravityModel: model }) }
+}
+
+/** Respect both Google RetryInfo and HTTP Retry-After; neither may be shortened. */
+function responseRetryAfter(response: Response, cls: ClassifiedGeminiError): number | undefined {
+  const header = parseRetryAfter(response.headers.get('retry-after'))
+  if (header === undefined) return cls.retryAfterMs
+  return Math.max(header, cls.retryAfterMs ?? 0)
+}
+
+async function fetchCodeAssistEndpoint(
+  url: string,
+  init: RequestInit,
+  opts: {
+    timeoutMs: number
+    signal?: AbortSignal
+  },
+): Promise<Response> {
+  if (opts.timeoutMs <= 0) {
+    return fetch(url, {
+      ...init,
+      signal: opts.signal ?? init.signal,
+    })
+  }
+
+  if (opts.signal?.aborted) throw new DOMException('Aborted', 'AbortError')
+  // The timeout bounds the wait for response headers only. The caller's
+  // signal stays linked for the whole response: an abort after the headers
+  // (Esc during a long generation) cancels the body and frees the connection
+  // instead of waiting for the server's next chunk or its end.
+  const timeout = new AbortController()
+  const signal = opts.signal ? AbortSignal.any([opts.signal, timeout.signal]) : timeout.signal
+
+  let timedOut = false
+  const timer = setTimeout(() => {
+    timedOut = true
+    timeout.abort()
+  }, opts.timeoutMs)
+
+  try {
+    return await fetch(url, {
+      ...init,
+      signal,
+    })
+  } catch (err) {
+    if (timedOut && !opts.signal?.aborted) {
+      throw new EndpointTimeoutError(
+        `Antigravity Gemini endpoint timed out after ${opts.timeoutMs}ms: ${url}`,
+      )
+    }
+    throw err
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+class GeminiApiClient {
+  private apiKey: string | null = null
+  /** OAuth token for the Gemini CLI executor (free-tier flash/lite models). */
+  private cliOAuthToken: string | null = null
+  /** OAuth token for the Antigravity executor (Gemini 3.x pro/flash models). */
+  private antigravityOAuthToken: string | null = null
+
+  /**
+   * Configure auth. Call this before making requests.
+   *
+   * Semantics: only fields explicitly present on `opts` are updated. A
+   * partial call like `configure({ cliOAuthToken: x })` must NOT wipe the
+   * existing `apiKey` or `antigravityOAuthToken` — background token
+   * refreshes come in one token at a time, and stomping the other tokens
+   * leaves the lane with no credentials for half its models until the
+   * next full `reloadGeminiLaneAuth` cycle (seen in the wild as a
+   * multi-minute hang on Antigravity requests after a CLI token refresh).
+   */
+  configure(opts: {
+    apiKey?: string
+    oauthToken?: string
+    cliOAuthToken?: string
+    antigravityOAuthToken?: string
+    oauthMode?: 'cli' | 'antigravity'
+  }): void {
+    if ('apiKey' in opts) this.apiKey = opts.apiKey ?? null
+    if ('cliOAuthToken' in opts) this.cliOAuthToken = opts.cliOAuthToken ?? null
+    if ('antigravityOAuthToken' in opts) this.antigravityOAuthToken = opts.antigravityOAuthToken ?? null
+    // Legacy single-token path: route per oauthMode ('cli' default).
+    if (opts.oauthToken) {
+      if (opts.oauthMode === 'antigravity') {
+        this.antigravityOAuthToken ??= opts.oauthToken
+      } else {
+        this.cliOAuthToken ??= opts.oauthToken
+      }
+    }
+    // Pre-warm Code Assist onboarding to avoid a cold-start round trip on
+    // the first real request. Non-blocking — fires in the background.
+    if (this.cliOAuthToken || this.antigravityOAuthToken) {
+      warmupCodeAssist(
+        this.cliOAuthToken ?? undefined,
+        this.antigravityOAuthToken ?? undefined,
+      )
+    }
+  }
+
+  /** Whether any auth is configured */
+  get isConfigured(): boolean {
+    return !!(this.apiKey || this.cliOAuthToken || this.antigravityOAuthToken)
+  }
+
+  /** Whether any OAuth token is configured (for routing decisions). */
+  get hasOAuth(): boolean {
+    return !!(this.cliOAuthToken || this.antigravityOAuthToken)
+  }
+
+  /** Get the current API key (if configured). For cache integration. */
+  getApiKey(): string | null {
+    return this.apiKey
+  }
+
+  /** Whether the current auth path supports Google's cachedContents API. */
+  supportsServerCache(model?: string): boolean {
+    // Google's cachedContents API is API-key-path only. The Code Assist
+    // OAuth proxy doesn't expose it. Check the model route, not just
+    // whether any OAuth token exists, so Antigravity can coexist with a
+    // regular Gemini API key without disabling API-key caching.
+    return !!this.apiKey && !this._tokenForModel(model ?? '')
+  }
+
+  /** Base URL for cache API calls. */
+  readonly cacheBaseUrl = AI_STUDIO_BASE
+
+  /**
+   * Pick the OAuth token appropriate for a model. Antigravity models
+   * route through the Antigravity executor (Gemini 3.x pro/flash pool),
+   * everything else goes through the CLI executor (Code Assist free tier).
+   *
+   * Multi-account rotation: when the Antigravity rotation store has any
+   * enrolled accounts, prefer the rotation's per-family best-pick over
+   * the single `antigravityOAuthToken` that `configure()` set. This is
+   * a drop-in upgrade — legacy single-token users (no accounts in the
+   * rotation store) keep working unchanged.
+   *
+   * Returns { token, executor, accountEmail? } — `accountEmail` is set
+   * when the token came from the rotation, so the caller can record
+   * success/failure feedback against the right account.
+   */
+  private _tokenForModel(
+    model: string,
+  ): { token: string; executor: 'cli' | 'antigravity'; accountEmail?: string } | null {
+    const executor = executorForModel(model)
+
+    // Antigravity path: always the account the user authenticated.
+    //
+    // Multi-account rotation is deliberately NOT consulted for routing. Picking
+    // a health-ranked account means a quota event silently changes which Google
+    // identity is serving the request: the account whose quota the user is
+    // watching stops being the one in use, and `pickForFamily` used to persist
+    // that switch, so requests never came back. A 429 is surfaced instead.
+    //
+    // Do not borrow the Gemini CLI token either: the CLI Google account is
+    // allowed to be a different account, and may have no Antigravity
+    // enrollment.
+    if (executor === 'antigravity') {
+      const t = this.antigravityOAuthToken
+      if (t) return { token: t, executor: 'antigravity' }
+      // No single-token credential stored. Fall back to the store's ACTIVE
+      // account — the one authentication selected — never a health-ranked pick.
+      const active = selectActiveAntigravityAccount(loadAntigravityStore())
+      return active
+        ? {
+            token: active.accessToken,
+            executor: 'antigravity',
+            accountEmail: active.email,
+          }
+        : null
+    }
+
+    const t = this.cliOAuthToken
+    return t ? { token: t, executor: 'cli' } : null
+  }
+
+  /**
+   * Refresh an expired OAuth access_token and update in-memory / disk state.
+   *
+   * Two paths:
+   *  - Rotation-picked Antigravity account (accountEmail set): refresh the
+   *    account's own refresh_token and write the new access_token back into
+   *    the rotation store via `rotation.add()` (upsert semantics).
+   *  - Single-token path (no accountEmail): delegate to `refreshGeminiOAuth`,
+   *    which writes provider-keys.json and calls reloadGeminiLaneAuth so
+   *    THIS client's in-memory token is updated too.
+   *
+   * Returns the new access token, or null if refresh is impossible (no
+   * refresh_token stored, or the refresh endpoint rejected our creds).
+   *
+   * Called on 401 (access_token expired) and as a secondary remedy on 403
+   * (Google occasionally returns 403 "does not have permission" for expired
+   * tokens instead of 401, so we try both remedies there).
+   */
+  private async _refreshOAuthToken(
+    executor: 'cli' | 'antigravity',
+    accountEmail?: string,
+  ): Promise<string | null> {
+    try {
+      if (accountEmail && executor === 'antigravity') {
+        const rotation = getAntigravityRotation()
+        const account = rotation.list().find(a => a.email === accountEmail)
+        if (!account || !account.refreshToken) return null
+        const { refreshAccessToken } = await import('../shared/antigravity_auth.js')
+        const tokens = await refreshAccessToken(account.refreshToken)
+        rotation.add({
+          ...account,
+          accessToken: tokens.access_token,
+          expires: Date.now() + tokens.expires_in * 1000,
+          refreshToken: tokens.refresh_token ?? account.refreshToken,
+        })
+        return tokens.access_token
+      }
+      const { refreshGeminiOAuth } = await import('../../services/api/auth/google_oauth.js')
+      const { loadProviderKey } = await import('../../services/api/auth/api_key_manager.js')
+      const storageKey = executor === 'cli' ? 'gemini_oauth_cli' : 'gemini_oauth_antigravity'
+      const raw = loadProviderKey(storageKey)
+      if (!raw) return null
+      const parsed = JSON.parse(raw) as { refreshToken?: string }
+      if (!parsed.refreshToken) return null
+      // refreshGeminiOAuth saves the new blob AND reloads geminiApi in-memory.
+      return await refreshGeminiOAuth(executor, parsed.refreshToken)
+    } catch {
+      return null
+    }
+  }
+
+  /**
+   * Antigravity's rows for the account's plan. Discovery is a cache read
+   * once the project is known; a failure leaves the plan unknown, which
+   * lists every row.
+   */
+  private async _antigravityPickerModels(token: string): Promise<readonly ModelInfo[]> {
+    try {
+      await ensureCodeAssistReady(token, 'antigravity')
+    } catch {
+      // Plan unknown: the next request reports any access problem.
+    }
+    return antigravityPickerModelsForPlan(getGeminiTier('antigravity'))
+  }
+
+  /**
+   * Strip thought-signature fields from every part in contents[].
+   *
+   * Google occasionally rejects requests with 400 "Corrupted thought
+   * signature" when a previously-issued signature is stale (e.g. after
+   * rotating to a different Antigravity account mid-conversation, or when
+   * the legacy adapter emits the `skip_thought_signature_validator`
+   * sentinel on Gemini 3.x pro, which has started refusing it). The
+   * signatures are a latency/continuity hint — dropping them only costs
+   * us a re-think on the next turn. Safer than failing the request.
+   */
+  private _stripThoughtSignaturesFromBody(body: any): void {
+    if (!body || typeof body !== 'object') return
+    const contents = body.contents
+    if (!Array.isArray(contents)) return
+    for (const content of contents) {
+      if (!content || !Array.isArray(content.parts)) continue
+      for (const part of content.parts) {
+        if (part && typeof part === 'object') {
+          delete part.thoughtSignature
+          delete part.thought_signature
+        }
+      }
+    }
+  }
+
+  /**
+   * Stream a generateContent request. Returns an async iterable of chunks.
+   * Uses Server-Sent Events (SSE) format.
+   *
+   * Retry behavior: the INITIAL request is retried on 429/5xx/network errors
+   * with exponential backoff + jitter, mirroring gemini-cli's retry.ts.
+   * Once the stream starts yielding chunks we can't rewind, so mid-stream
+   * errors surface to the caller.
+   */
+  async *streamGenerateContent(
+    request: Record<string, unknown>,
+    signal?: AbortSignal,
+  ): AsyncGenerator<GeminiStreamChunk> {
+    const model = (request as any).model ?? 'gemini-2.5-pro'
+    const body = { ...request }
+    delete body.model
+    const tauStableSessionId = takeTauStableSessionId(body)
+    const tauQuerySource = takeTauQuerySource(body)
+    const logEndpoint = antigravityEndpointLogger(request, tauStableSessionId)
+    // TAU_CACHE_DEBUG only: one row per HTTP dispatch of this request.
+    const trace = startAntigravityDispatchTrace(request, tauStableSessionId)
+
+    // OAuth uses each executor's generation endpoint: Antigravity stays on
+    // daily, while Gemini CLI keeps its Code Assist endpoint and retry policy.
+    const oauthRouting = this._tokenForModel(model)
+    if (oauthRouting) {
+      // Stale-project recovery can invalidate discovery; transient retries
+      // preserve the original account, project and serialized request.
+      let reonboardsLeft = 1
+      let sigStripsLeft = 1
+      // Snapshot the account and prepared wire request for this operation.
+      // Only an explicit auth/project or rejected-envelope repair invalidates it.
+      let routing = oauthRouting
+      let project: { id: string | null } | undefined
+      let wire: { serialized: string; trajectory?: AntigravityTrajectoryAttempt } | undefined
+      const basesForExecutor = (executor: 'cli' | 'antigravity') =>
+        codeAssistGenerationBasesForModel(executor, model, tauStableSessionId, tauQuerySource)
+      const urlForBase = (base: string) => `${base}:streamGenerateContent?alt=sse`
+      const _ttftStart = Date.now()
+      const rotation = getAntigravityRotation()
+      let attemptNo = 0
+      // The traced dispatch whose response body the stream below reads.
+      const served: {
+        attempt?: AntigravityDispatchAttempt
+        iterator?: AsyncGenerator<GeminiStreamChunk>
+        first?: IteratorResult<GeminiStreamChunk>
+        fetchMs?: number
+      } = {}
+
+      const response = await retryWithBackoff(
+        async () => {
+          attemptNo++
+          // Auth refresh updates this operation's token without re-selecting an account.
+          const { token, executor, accountEmail } = routing
+          project ??= { id: await ensureCodeAssistReady(token, executor) }
+          if (!wire) {
+            const trajectory = antigravityTrajectoryFor(request, executor, model, accountEmail, project.id)
+            const wrappedBody = executor === 'antigravity'
+              ? wrapForCodeAssist(model, project.id, withTauStableSessionId(body, tauStableSessionId), undefined, trajectory?.identity)
+              : wrapForGeminiCLI(model, project.id, body)
+            wire = {
+              trajectory,
+              serialized: JSON.stringify(wrappedBody).replace(/"thoughtSignature"\s*:/g, '"thought_signature":'),
+            }
+          }
+          const { serialized, trajectory } = wire
+          const headers = executor === 'antigravity'
+            ? antigravityApiHeaders(token)
+            : { ...geminiCLIApiHeaders(token, model), 'Connection': 'keep-alive' }
+
+          let resp: Response | null = null
+          let errText = ''
+          const bases = basesForExecutor(executor)
+          const urls = bases.map(urlForBase)
+          const fastAntigravityGemini = isAntigravityGeminiRoute(executor, model)
+          // Antigravity generation stays on daily. Keep the request envelope
+          // stable while the provider bridge bounds the first-output wait.
+          const onPinnedHost = fastAntigravityGemini
+            && antigravityGeminiStickyBase(tauStableSessionId) === bases[0]
+          const pinnedFirstAttempt = onPinnedHost && attemptNo <= 1
+          let lastEndpointError: unknown
+          let dispatch: AntigravityDispatchAttempt | undefined
+          let hopReason: string | undefined
+          let envelopeRejected = false
+          for (let i = 0; i < urls.length; i++) {
+            const transport = fastAntigravityGemini ? antigravityTransportIfNeeded(urls[i]!, !!trace) : undefined
+            dispatch = fastAntigravityGemini
+              ? trace?.attempt({
+                attempt: attemptNo,
+                hop: i,
+                hopReason,
+                url: urls[i]!,
+                serialized,
+                accountEmail,
+                profile: experimentProfile(trajectory, transport),
+                transport: transport?.profile,
+              })
+              : undefined
+            const send = () => fetchCodeAssistEndpoint(
+              urls[i]!,
+              {
+                method: 'POST',
+                headers,
+                body: serialized,
+                // Only keep-alive brings its own dispatcher.
+                ...(transport?.dispatcher && { dispatcher: transport.dispatcher }),
+              } as RequestInit,
+              {
+                signal,
+                timeoutMs: fastAntigravityGemini
+                  ? antigravityGeminiEndpointTimeoutMs(i, urls.length, i === 0 && onPinnedHost)
+                  : 0,
+              },
+            )
+            try {
+              resp = await (dispatch ? dispatch.send(send) : send())
+            } catch (err) {
+              dispatch?.end(
+                signal?.aborted ? 'aborted' : err instanceof EndpointTimeoutError ? 'timeout' : 'network-error',
+                { error: err },
+              )
+              if (signal?.aborted) throw err
+              lastEndpointError = err
+              if (fastAntigravityGemini && i < urls.length - 1) {
+                hopReason = err instanceof EndpointTimeoutError
+                  ? 'timeout'
+                  : String((err as any)?.code ?? (err as any)?.message ?? err).slice(0, 120)
+                logEndpoint('hop', {
+                  from: bases[i],
+                  reason: hopReason,
+                  attempt: attemptNo,
+                })
+                continue
+              }
+              throw err
+            }
+            dispatch?.headers(resp)
+            if (resp.ok) {
+              if (fastAntigravityGemini) {
+                // A report can sweep away from the conversation's warm host.
+                // Its one-shot serve must not move or reset the chat's pin.
+                if (tauQuerySource !== 'report') {
+                  recordAntigravityGeminiServedBase(tauStableSessionId, bases[i]!)
+                }
+                logEndpoint('served', {
+                  base: bases[i],
+                  index: i,
+                  attempt: attemptNo,
+                  account: accountEmail,
+                })
+              }
+              break
+            }
+            errText = await resp.text().catch(() => '')
+            dispatch?.end('http-error', { status: resp.status, errorBody: errText })
+            // The backend refusing an envelope field turns the envelope off for
+            // the process; this request is sent again without it below.
+            const rejectedFields = rejectAntigravityTrajectoryOn(resp.status, errText, trajectory)
+            if (rejectedFields) {
+              envelopeRejected = true
+              logEndpoint('trajectory-rejected', { status: resp.status, fields: rejectedFields, attempt: attemptNo })
+            }
+            if (shouldTryNextAntigravityGeminiEndpoint(executor, model, resp.status, i, urls.length, pinnedFirstAttempt)) {
+              hopReason = `status ${resp.status}`
+              logEndpoint('hop', {
+                from: bases[i],
+                reason: hopReason,
+                attempt: attemptNo,
+              })
+              continue
+            }
+            if (!(executor === 'antigravity' && resp.status === 404 && i < urls.length - 1)) break
+          }
+          if (!resp) {
+            if (lastEndpointError) throw lastEndpointError
+            throw new GeminiApiError(0, 'No Code Assist endpoint attempted', undefined, {
+              kind: 'non-retryable',
+              details: {},
+            })
+          }
+          if (!resp.ok) {
+            const cls = classifyGeminiError(resp.status, errText)
+            const retryAfterMs = responseRetryAfter(resp, cls)
+
+            // A refused trajectory envelope is not the account's fault: retry
+            // once without it (it is now off) instead of failing the turn.
+            if (envelopeRejected) {
+              wire = undefined
+              throw new GeminiApiError(resp.status, errText, 0, {
+                kind: 'transient',
+                details: cls.details,
+                retryAfterMs: 0,
+              })
+            }
+
+            // Record feedback against the rotation (no-op when the token
+            // came from the legacy single-token path).
+            if (accountEmail && executor === 'antigravity') {
+              const account = rotation.list().find(a => a.email === accountEmail)
+              if (account) {
+                const family = familyForAntigravityModel(model)
+                if (cls.kind === 'retryable-quota' || cls.kind === 'terminal-quota') {
+                  rotation.recordRateLimit(account, family, retryAfterMs)
+                } else if (
+                  cls.kind === 'non-retryable'
+                  || cls.kind === 'validation-required'
+                  || cls.kind === 'auth-stale'
+                ) {
+                  // Auth-stale counts as a hard failure so subsequent
+                  // requests rotate to a different enrolled account. If
+                  // it was actually a transient cache issue, the retry
+                  // succeeds and the follow-up recordSuccess mixes the
+                  // score back up — no harm done.
+                  rotation.recordHardFailure(account)
+                }
+              }
+            }
+
+            // Auth-stale recovery — fix side state + recurse once within
+            // this retry attempt so the user doesn't pay a full backoff
+            // wait for a case we can fix immediately. Budget: one
+            // re-onboard per request — if it happens twice, something
+            // else is wrong.
+            //
+            //   401 → expired access_token. Refresh it; project cache is
+            //         fine and re-onboarding would be wasteful.
+            //   403 "does not have permission" → usually stale project
+            //         cache (re-onboard), but Google occasionally returns
+            //         403 for silently-expired tokens, so refresh too.
+            if (cls.kind === 'auth-stale' && reonboardsLeft > 0) {
+              reonboardsLeft--
+              if (resp.status !== 401) {
+                clearCodeAssistCache(executor)
+                project = undefined
+                wire = undefined
+              }
+              const refreshed = await this._refreshOAuthToken(executor, accountEmail)
+              if (refreshed) routing = { ...routing, token: refreshed }
+              throw new GeminiApiError(resp.status, errText, 0, {
+                kind: 'transient',
+                details: cls.details,
+                retryAfterMs: 0,
+              })
+            }
+
+            // 400 "Corrupted thought signature" — strip all signatures
+            // from contents[].parts[] and retry once. The signatures are
+            // a continuity hint; dropping them trades a re-think for
+            // the request not failing outright.
+            if (
+              executor !== 'antigravity'
+              && resp.status === 400
+              && /corrupted thought signature/i.test(errText)
+              && sigStripsLeft > 0
+            ) {
+              sigStripsLeft--
+              if (fastAntigravityGemini) {
+                // The stripped retry sends different history bytes, so that
+                // turn re-pays the prompt cold and its write is orphaned —
+                // surface it instead of leaving an unexplained cold turn.
+                logEndpoint('sig-strip', {
+                  attempt: attemptNo,
+                })
+              }
+              this._stripThoughtSignaturesFromBody(body)
+              wire = undefined
+              throw new GeminiApiError(resp.status, errText, 0, {
+                kind: 'transient',
+                details: cls.details,
+                retryAfterMs: 0,
+              })
+            }
+
+            throw new GeminiApiError(resp.status, errText, retryAfterMs, cls)
+          }
+          if (!resp.body) {
+            dispatch?.end('failed', { error: 'no response body' })
+            throw new GeminiApiError(0, 'No response body', undefined, {
+              kind: 'transient',
+              details: {},
+            })
+          }
+
+          served.fetchMs = Date.now() - _ttftStart
+          if (executor === 'antigravity') {
+            // A 200 header is not output. Recover a connection dropped before
+            // the first SSE chunk under the same budget and identical envelope.
+            const iterator = parseCodeAssistSSE(resp.body, envelope => dispatch?.envelope(envelope))
+            try {
+              const first = await iterator.next()
+              if (first.done) {
+                throw new GeminiApiError(0, 'Stream ended before any response', undefined, {
+                  kind: 'transient', details: {},
+                })
+              }
+              served.iterator = iterator
+              served.first = first
+            } catch (error) {
+              dispatch?.end(signal?.aborted ? 'aborted' : 'failed', { error })
+              await iterator.return(undefined).catch(() => {})
+              await resp.body.cancel().catch(() => {})
+              throw error
+            }
+          }
+
+          // Success feedback (against the account that served this attempt).
+          if (accountEmail && executor === 'antigravity') {
+            const account = rotation.list().find(a => a.email === accountEmail)
+            if (account) rotation.recordSuccess(account)
+          }
+
+          served.attempt = dispatch
+          return resp
+        },
+        antigravityRetryOptions(signal, oauthRouting.executor, model),
+      )
+
+      // Code Assist SSE frames are wrapped as `{ response: <chunk> }`.
+      const _fetchMs = served.fetchMs ?? Date.now() - _ttftStart
+      let _firstChunk = true
+      let _thoughts = 0
+      let _output = 0
+      const tracedAttempt = served.attempt
+      try {
+        const observeEnvelope = tracedAttempt && ((envelope: object) => tracedAttempt.envelope(envelope))
+        const chunks = served.iterator
+          ? (async function* () {
+            try {
+              yield served.first!.value as GeminiStreamChunk
+              yield* served.iterator!
+            } finally {
+              await served.iterator!.return(undefined).catch(() => {})
+            }
+          })()
+          : parseCodeAssistSSE(response.body!, observeEnvelope)
+        for await (const chunk of chunks) {
+          tracedAttempt?.chunk(chunk)
+          if (_firstChunk) {
+            _firstChunk = false
+            if (process.env.TAU_CACHE_DEBUG) {
+              console.error(`[tau-timing] model=${model} fetchMs=${_fetchMs} ttftMs=${Date.now() - _ttftStart}`)
+            }
+          }
+          const u = (chunk as GeminiStreamChunk).usageMetadata
+          if (u) {
+            _thoughts = u.thoughtsTokenCount ?? _thoughts
+            _output = u.candidatesTokenCount ?? _output
+          }
+          yield chunk as GeminiStreamChunk
+        }
+        tracedAttempt?.end('completed')
+      } catch (err) {
+        tracedAttempt?.end(signal?.aborted ? 'aborted' : 'failed', { error: err })
+        if (oauthRouting.executor === 'antigravity' && !signal?.aborted) markAntigravityRetryHandled(err)
+        throw err
+      } finally {
+        // Reached without an outcome only when the consumer stopped reading.
+        tracedAttempt?.end(signal?.aborted ? 'aborted' : 'abandoned')
+      }
+      if (process.env.TAU_CACHE_DEBUG) {
+        console.error(`[tau-timing] model=${model} totalMs=${Date.now() - _ttftStart} thoughtsTokens=${_thoughts} outputTokens=${_output}`)
+      }
+      return
+    }
+
+    // API-key path — generativelanguage.googleapis.com direct.
+    const url = `${AI_STUDIO_BASE}/models/${model}:streamGenerateContent?alt=sse`
+    const headers = this.getHeaders()
+
+    const response = await retryWithBackoff(
+      async () => {
+        const resp = await fetch(url, {
+          method: 'POST',
+          headers: { ...headers, 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+          signal,
+        })
+        if (!resp.ok) {
+          const errText = await resp.text().catch(() => '')
+          const cls = classifyGeminiError(resp.status, errText)
+          const retryAfterMs = cls.retryAfterMs
+            ?? parseRetryAfter(resp.headers.get('retry-after'))
+          throw new GeminiApiError(resp.status, errText, retryAfterMs, cls)
+        }
+        if (!resp.body) {
+          throw new GeminiApiError(0, 'No response body', undefined, {
+            kind: 'transient',
+            details: {},
+          })
+        }
+        return resp
+      },
+      { signal },
+    )
+
+    for await (const chunk of parseGeminiApiSSEEvent<GeminiStreamChunk>(response.body!)) {
+      yield chunk
+    }
+  }
+
+  /**
+   * Non-streaming generateContent request.
+   */
+  async generateContent(
+    request: Record<string, unknown>,
+    signal?: AbortSignal,
+  ): Promise<GeminiStreamChunk> {
+    const model = (request as any).model ?? 'gemini-2.5-pro'
+    const body = { ...request }
+    delete body.model
+    const tauStableSessionId = takeTauStableSessionId(body)
+    const tauQuerySource = takeTauQuerySource(body)
+    const logEndpoint = antigravityEndpointLogger(request, tauStableSessionId)
+    const trace = startAntigravityDispatchTrace(request, tauStableSessionId)
+
+    // OAuth → Code Assist (unwraps the `{ response: ... }` envelope).
+    const oauthRouting = this._tokenForModel(model)
+    if (oauthRouting) {
+      let reonboardsLeft = 1
+      let sigStripsLeft = 1
+      // Snapshot the account and prepared wire request for this operation.
+      // Only an explicit auth/project or rejected-envelope repair invalidates it.
+      let routing = oauthRouting
+      let project: { id: string | null } | undefined
+      let wire: { serialized: string; trajectory?: AntigravityTrajectoryAttempt } | undefined
+      const basesForExecutor = (executor: 'cli' | 'antigravity') =>
+        codeAssistGenerationBasesForModel(executor, model, tauStableSessionId, tauQuerySource)
+      const urlForBase = (base: string) => `${base}:generateContent`
+      const rotation = getAntigravityRotation()
+      let attemptNo = 0
+
+      const data = await retryWithBackoff(
+        async () => {
+          attemptNo++
+          const { token, executor, accountEmail } = routing
+          project ??= { id: await ensureCodeAssistReady(token, executor) }
+          if (!wire) {
+            const trajectory = antigravityTrajectoryFor(request, executor, model, accountEmail, project.id)
+            const wrappedBody = executor === 'antigravity'
+              ? wrapForCodeAssist(model, project.id, withTauStableSessionId(body, tauStableSessionId), undefined, trajectory?.identity)
+              : wrapForGeminiCLI(model, project.id, body)
+            wire = {
+              trajectory,
+              serialized: JSON.stringify(wrappedBody).replace(/"thoughtSignature"\s*:/g, '"thought_signature":'),
+            }
+          }
+          const { serialized, trajectory } = wire
+          const headers = executor === 'antigravity'
+            ? antigravityApiHeaders(token)
+            : { ...geminiCLIApiHeaders(token, model), 'Connection': 'keep-alive' }
+
+          let resp: Response | null = null
+          let errText = ''
+          const bases = basesForExecutor(executor)
+          const urls = bases.map(urlForBase)
+          const fastAntigravityGemini = isAntigravityGeminiRoute(executor, model)
+          // Antigravity generation stays on daily. Keep the request envelope
+          // stable while the provider bridge bounds the first-output wait.
+          const onPinnedHost = fastAntigravityGemini
+            && antigravityGeminiStickyBase(tauStableSessionId) === bases[0]
+          const pinnedFirstAttempt = onPinnedHost && attemptNo <= 1
+          let lastEndpointError: unknown
+          let dispatch: AntigravityDispatchAttempt | undefined
+          let hopReason: string | undefined
+          let envelopeRejected = false
+          for (let i = 0; i < urls.length; i++) {
+            const transport = fastAntigravityGemini ? antigravityTransportIfNeeded(urls[i]!, !!trace) : undefined
+            dispatch = fastAntigravityGemini
+              ? trace?.attempt({
+                attempt: attemptNo,
+                hop: i,
+                hopReason,
+                url: urls[i]!,
+                serialized,
+                accountEmail,
+                profile: experimentProfile(trajectory, transport),
+                transport: transport?.profile,
+              })
+              : undefined
+            const send = () => fetchCodeAssistEndpoint(
+              urls[i]!,
+              {
+                method: 'POST',
+                headers,
+                body: serialized,
+                // Only keep-alive brings its own dispatcher.
+                ...(transport?.dispatcher && { dispatcher: transport.dispatcher }),
+              } as RequestInit,
+              {
+                signal,
+                timeoutMs: fastAntigravityGemini
+                  ? antigravityGeminiEndpointTimeoutMs(i, urls.length, i === 0 && onPinnedHost)
+                  : 0,
+              },
+            )
+            try {
+              resp = await (dispatch ? dispatch.send(send) : send())
+            } catch (err) {
+              dispatch?.end(
+                signal?.aborted ? 'aborted' : err instanceof EndpointTimeoutError ? 'timeout' : 'network-error',
+                { error: err },
+              )
+              if (signal?.aborted) throw err
+              lastEndpointError = err
+              if (fastAntigravityGemini && i < urls.length - 1) {
+                hopReason = err instanceof EndpointTimeoutError
+                  ? 'timeout'
+                  : String((err as any)?.code ?? (err as any)?.message ?? err).slice(0, 120)
+                logEndpoint('hop', {
+                  from: bases[i],
+                  reason: hopReason,
+                  attempt: attemptNo,
+                })
+                continue
+              }
+              throw err
+            }
+            dispatch?.headers(resp)
+            if (resp.ok) {
+              if (fastAntigravityGemini) {
+                // Reports share the wire session, but have no cache equity
+                // and must not alter the live conversation's host affinity.
+                if (tauQuerySource !== 'report') {
+                  recordAntigravityGeminiServedBase(tauStableSessionId, bases[i]!)
+                }
+                logEndpoint('served', {
+                  base: bases[i],
+                  index: i,
+                  attempt: attemptNo,
+                  account: accountEmail,
+                })
+              }
+              break
+            }
+            errText = await resp.text().catch(() => '')
+            dispatch?.end('http-error', { status: resp.status, errorBody: errText })
+            // The backend refusing an envelope field turns the envelope off for
+            // the process; this request is sent again without it below.
+            const rejectedFields = rejectAntigravityTrajectoryOn(resp.status, errText, trajectory)
+            if (rejectedFields) {
+              envelopeRejected = true
+              logEndpoint('trajectory-rejected', { status: resp.status, fields: rejectedFields, attempt: attemptNo })
+            }
+            if (shouldTryNextAntigravityGeminiEndpoint(executor, model, resp.status, i, urls.length, pinnedFirstAttempt)) {
+              hopReason = `status ${resp.status}`
+              logEndpoint('hop', {
+                from: bases[i],
+                reason: hopReason,
+                attempt: attemptNo,
+              })
+              continue
+            }
+            if (!(executor === 'antigravity' && resp.status === 404 && i < urls.length - 1)) break
+          }
+          if (!resp) {
+            if (lastEndpointError) throw lastEndpointError
+            throw new GeminiApiError(0, 'No Code Assist endpoint attempted', undefined, {
+              kind: 'non-retryable',
+              details: {},
+            })
+          }
+          if (!resp.ok) {
+            const cls = classifyGeminiError(resp.status, errText)
+            const retryAfterMs = responseRetryAfter(resp, cls)
+
+            // A refused trajectory envelope is not the account's fault: retry
+            // once without it (it is now off) instead of failing the turn.
+            if (envelopeRejected) {
+              wire = undefined
+              throw new GeminiApiError(resp.status, errText, 0, {
+                kind: 'transient',
+                details: cls.details,
+                retryAfterMs: 0,
+              })
+            }
+
+            if (accountEmail && executor === 'antigravity') {
+              const account = rotation.list().find(a => a.email === accountEmail)
+              if (account) {
+                const family = familyForAntigravityModel(model)
+                if (cls.kind === 'retryable-quota' || cls.kind === 'terminal-quota') {
+                  rotation.recordRateLimit(account, family, retryAfterMs)
+                } else if (
+                  cls.kind === 'non-retryable'
+                  || cls.kind === 'validation-required'
+                  || cls.kind === 'auth-stale'
+                ) {
+                  // Auth-stale counts as a hard failure so subsequent
+                  // requests rotate to a different enrolled account. If
+                  // it was actually a transient cache issue, the retry
+                  // succeeds and the follow-up recordSuccess mixes the
+                  // score back up — no harm done.
+                  rotation.recordHardFailure(account)
+                }
+              }
+            }
+
+            if (cls.kind === 'auth-stale' && reonboardsLeft > 0) {
+              reonboardsLeft--
+              if (resp.status !== 401) {
+                clearCodeAssistCache(executor)
+                project = undefined
+                wire = undefined
+              }
+              const refreshed = await this._refreshOAuthToken(executor, accountEmail)
+              if (refreshed) routing = { ...routing, token: refreshed }
+              throw new GeminiApiError(resp.status, errText, 0, {
+                kind: 'transient',
+                details: cls.details,
+                retryAfterMs: 0,
+              })
+            }
+
+            if (
+              executor !== 'antigravity'
+              && resp.status === 400
+              && /corrupted thought signature/i.test(errText)
+              && sigStripsLeft > 0
+            ) {
+              sigStripsLeft--
+              if (fastAntigravityGemini) {
+                // The stripped retry sends different history bytes, so that
+                // turn re-pays the prompt cold and its write is orphaned —
+                // surface it instead of leaving an unexplained cold turn.
+                logEndpoint('sig-strip', {
+                  attempt: attemptNo,
+                })
+              }
+              this._stripThoughtSignaturesFromBody(body)
+              wire = undefined
+              throw new GeminiApiError(resp.status, errText, 0, {
+                kind: 'transient',
+                details: cls.details,
+                retryAfterMs: 0,
+              })
+            }
+            throw new GeminiApiError(resp.status, errText, retryAfterMs, cls)
+          }
+
+          if (accountEmail && executor === 'antigravity') {
+            const account = rotation.list().find(a => a.email === accountEmail)
+            if (account) rotation.recordSuccess(account)
+          }
+
+          return dispatch ? dispatch.readJson(resp, signal) : resp.json()
+        },
+        antigravityRetryOptions(signal, oauthRouting.executor, model),
+      )
+      return unwrapCodeAssistResponse(data) as GeminiStreamChunk
+    }
+
+    // API-key path — generativelanguage.googleapis.com direct.
+    const url = `${AI_STUDIO_BASE}/models/${model}:generateContent`
+    const headers = this.getHeaders()
+
+    return retryWithBackoff(
+      async () => {
+        const resp = await fetch(url, {
+          method: 'POST',
+          headers: { ...headers, 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+          signal,
+        })
+        if (!resp.ok) {
+          const errText = await resp.text().catch(() => '')
+          const cls = classifyGeminiError(resp.status, errText)
+          const retryAfterMs = cls.retryAfterMs
+            ?? parseRetryAfter(resp.headers.get('retry-after'))
+          throw new GeminiApiError(resp.status, errText, retryAfterMs, cls)
+        }
+        return resp.json()
+      },
+      { signal },
+    )
+  }
+
+  /**
+   * List available models. Returns a curated list for OAuth paths (Code
+   * Assist doesn't expose /v1beta/models and cloud-platform tokens are
+   * rejected as restricted_client), or the live API-key catalog otherwise.
+   */
+  async listModels(providerFilter?: string): Promise<ModelInfo[]> {
+    const listApiKeyModels = async (): Promise<ModelInfo[]> => {
+      if (!this.apiKey) return []
+
+      const url = `${AI_STUDIO_BASE}/models?key=${encodeURIComponent(this.apiKey)}`
+      const response = await fetch(url, {
+        method: 'GET',
+        headers: { Connection: 'keep-alive' },
+      })
+
+      if (!response.ok) return []
+
+      const data = await response.json()
+      return (data.models ?? [])
+        .filter((m: any) => m.name?.includes('gemini'))
+        .map((m: any) => ({
+          id: m.name?.replace('models/', '') ?? m.name,
+          name: m.displayName ?? m.name,
+          contextWindow: m.inputTokenLimit,
+          supportsToolCalling: m.supportedGenerationMethods?.includes('generateContent'),
+        }))
+    }
+
+    if (providerFilter === 'gemini' && !this.cliOAuthToken) {
+      return listApiKeyModels()
+    }
+
+    if (providerFilter === 'antigravity') {
+      if (!this.antigravityOAuthToken) return []
+      return [...await this._antigravityPickerModels(this.antigravityOAuthToken)]
+    }
+
+    // `providerFilter` is how the UX split between the Gemini row and the
+    // Antigravity row lands here: both routes go through this same lane
+    // (Code Assist proxy), they differ only in which OAuth token + body
+    // envelope gets used. When the caller is the dedicated Antigravity
+    // provider we must return ONLY the pro/flash-3 ids (which the lane
+    // routes to cloudcode-pa with userAgent=antigravity); when the caller
+    // is plain Gemini we return ONLY the free-tier CLI models.
+    if (this.hasOAuth) {
+      const showCli = providerFilter !== 'antigravity'
+      const showAntigravity = providerFilter !== 'gemini'
+      const models: ModelInfo[] = []
+      if (showCli && this.cliOAuthToken) {
+        // The picker is often the FIRST thing the user opens after
+        // /login, before any chat request has triggered onboarding —
+        // force the round-trip here so the entitled-ids / tier caches
+        // that resolveCliModelsForPicker reads are populated.
+        // Without this, a freshly-logged-in Pro user would see flash
+        // until the next session.
+        try {
+          await ensureCodeAssistReady(this.cliOAuthToken, 'cli')
+        } catch {
+          // Onboarding failed — the picker falls back to flash. The
+          // user will hit a clearer error next time they try to chat.
+        }
+        // Strict tier filter: free accounts see flash, paid accounts
+        // see Pro. No mixing — a free user with a Pro option in their
+        // picker would 403 on first chat, and a Pro user with flash
+        // mixed in would pick the slow option by accident.
+        models.push(...resolveCliModelsForPicker())
+      }
+      if (showAntigravity && this.antigravityOAuthToken) {
+        models.push(...await this._antigravityPickerModels(this.antigravityOAuthToken))
+      }
+      return models
+    }
+
+    const url = `${AI_STUDIO_BASE}/models`
+    const headers = this.getHeaders()
+
+    const response = await fetch(url, {
+      method: 'GET',
+      headers,
+    })
+
+    if (!response.ok) return []
+
+    const data = await response.json()
+    return (data.models ?? [])
+      .filter((m: any) => m.name?.includes('gemini'))
+      .map((m: any) => ({
+        id: m.name?.replace('models/', '') ?? m.name,
+        name: m.displayName ?? m.name,
+        contextWindow: m.inputTokenLimit,
+        supportsToolCalling: m.supportedGenerationMethods?.includes('generateContent'),
+      }))
+  }
+
+  private getHeaders(): Record<string, string> {
+    const headers: Record<string, string> = {
+      Connection: 'keep-alive',
+    }
+
+    if (this.apiKey) {
+      headers['x-goog-api-key'] = this.apiKey
+    }
+    // OAuth is never used on the direct AI Studio endpoint — it's routed
+    // through Code Assist above. This header path only runs on API-key
+    // listModels / cache calls.
+    return headers
+  }
+}
+
+// ─── Error Type ──────────────────────────────────────────────────
+
+export class GeminiApiError extends Error {
+  /**
+   * Google error-details classification. Set by the constructor (lazy) or
+   * passed explicitly when the caller already ran the classifier.
+   */
+  private _classified?: ClassifiedGeminiError
+
+  constructor(
+    public readonly status: number,
+    public readonly body: string,
+    public readonly retryAfterMs?: number,
+    classified?: ClassifiedGeminiError,
+  ) {
+    // Prompt-too-long errors must expose the Claude-Code signal prefix so
+    // query.ts reactive compact fires — the downstream check text-matches
+    // against PROMPT_TOO_LONG_ERROR_MESSAGE. The raw body is preserved in
+    // .body so callers can still inspect the upstream detail.
+    const cls = classified ?? classifyGeminiError(status, body)
+    const head = cls.kind === 'prompt-too-long'
+      ? `${PROMPT_TOO_LONG_ERROR_MESSAGE} (Gemini ${status})`
+      : `Gemini API error ${status}`
+    super(`${head}: ${body.slice(0, 200)}`)
+    this.name = 'GeminiApiError'
+    this._classified = cls
+  }
+
+  get classification(): ClassifiedGeminiError {
+    if (!this._classified) {
+      this._classified = classifyGeminiError(this.status, this.body)
+    }
+    return this._classified
+  }
+
+  get kind(): GeminiErrorKind {
+    return this.classification.kind
+  }
+
+  get isRateLimited(): boolean {
+    return this.status === 429
+  }
+
+  get isAuth(): boolean {
+    return this.status === 401 || this.status === 403
+  }
+
+  get isPromptTooLong(): boolean {
+    return this.classification.kind === 'prompt-too-long'
+  }
+
+  /**
+   * Whether the native retry controller may recover this failure. Auth
+   * repair happens in the fetch closure. Completed Antigravity recovery
+   * shadows this getter with false so outer layers cannot restart it.
+   */
+  get isRetryable(): boolean {
+    switch (this.kind) {
+      case 'transient':
+        return true
+      case 'retryable-quota':
+        // A transient refusal retries the same account and prepared request.
+        return true
+      case 'prompt-too-long':
+      case 'validation-required':
+      case 'terminal-quota':
+      case 'non-retryable':
+        return false
+      case 'auth-stale':
+        // Handled by the reonboard counter inside the request closure,
+        // not by retryWithBackoff. Return false so we don't double-retry.
+        return false
+    }
+    // Fallback: legacy status-based heuristic.
+    if (this.status === 400) return false
+    return this.status === 429 || this.status === 499 || (this.status >= 500 && this.status < 600)
+  }
+}
+
+// ─── Retry / Backoff ─────────────────────────────────────────────
+//
+// Ported from gemini-cli packages/core/src/utils/retry.ts. Handles:
+//   - 429, 499, 5xx HTTP errors
+//   - Transient network errors (ECONNRESET, ETIMEDOUT, EPIPE, ENOTFOUND,
+//     EAI_AGAIN, ECONNREFUSED, EPROTO, SSL-alert errors)
+//   - Retry-After header (with +20% jitter to avoid thundering herd)
+//   - Exponential backoff with ±30% jitter for non-quota errors
+//   - AbortSignal propagation
+
+const DEFAULT_MAX_ATTEMPTS = 5
+const INITIAL_DELAY_MS = 2000
+const MAX_DELAY_MS = 30_000
+
+interface RetryOptions {
+  signal?: AbortSignal
+  maxAttempts?: number
+  initialDelayMs?: number
+  maxDelayMs?: number
+  antigravityModel?: string
+}
+
+const RETRYABLE_NETWORK_CODES = new Set([
+  'ECONNRESET',
+  'ETIMEDOUT',
+  'EPIPE',
+  'ENOTFOUND',
+  'EAI_AGAIN',
+  'ECONNREFUSED',
+  'EPROTO',
+  'ERR_SSL_SSLV3_ALERT_BAD_RECORD_MAC',
+  'ERR_SSL_WRONG_VERSION_NUMBER',
+  'ERR_SSL_DECRYPTION_FAILED_OR_BAD_RECORD_MAC',
+  'ERR_SSL_BAD_RECORD_MAC',
+])
+
+function getNetworkErrorCode(error: unknown): string | undefined {
+  let current: unknown = error
+  for (let depth = 0; depth < 5; depth++) {
+    if (typeof current !== 'object' || current === null) return undefined
+    if ('code' in current && typeof (current as any).code === 'string') {
+      return (current as any).code
+    }
+    if (!('cause' in current)) return undefined
+    current = (current as any).cause
+  }
+  return undefined
+}
+
+export function isGeminiRetryableNetworkError(error: unknown): boolean {
+  if (error instanceof EndpointTimeoutError) return true
+  const code = getNetworkErrorCode(error)
+  if (code && RETRYABLE_NETWORK_CODES.has(code)) return true
+  if (error instanceof Error && error.message.toLowerCase().includes('fetch failed')) return true
+  return false
+}
+
+function isRetryableTransport(error: unknown): boolean {
+  if (error instanceof GeminiApiError) return error.isRetryable
+  return isGeminiRetryableNetworkError(error)
+}
+
+function parseRetryAfter(value: string | null): number | undefined {
+  if (!value) return undefined
+  // Retry-After is either seconds or an HTTP date.
+  const asSec = Number(value)
+  if (!isNaN(asSec)) return Math.max(0, asSec * 1000)
+  const asDate = Date.parse(value)
+  if (!isNaN(asDate)) return Math.max(0, asDate - Date.now())
+  return undefined
+}
+
+async function retryWithBackoff<T>(
+  fn: () => Promise<T>,
+  opts: RetryOptions = {},
+): Promise<T> {
+  const { signal } = opts
+  if (opts.antigravityModel) {
+    return retryAntigravityRequest(fn, opts.antigravityModel, isRetryableTransport, signal)
+  }
+  if (signal?.aborted) throw new DOMException('Aborted', 'AbortError')
+
+  const maxAttempts = opts.maxAttempts ?? DEFAULT_MAX_ATTEMPTS
+  const maxDelay = opts.maxDelayMs ?? MAX_DELAY_MS
+  let attempt = 0
+  let currentDelay = opts.initialDelayMs ?? INITIAL_DELAY_MS
+
+  while (attempt < maxAttempts) {
+    attempt++
+    try {
+      return await fn()
+    } catch (err: any) {
+      if (err?.name === 'AbortError' || signal?.aborted) throw err
+
+      if (!isRetryableTransport(err) || attempt >= maxAttempts) throw err
+
+      // Server-specified Retry-After wins if present.
+      const retryAfter = err instanceof GeminiApiError ? err.retryAfterMs : undefined
+      let waitMs: number
+      if (retryAfter != null && retryAfter > 0) {
+        const jitter = retryAfter * 0.2 * Math.random() // 0 to +20%
+        waitMs = retryAfter + jitter
+      } else {
+        const jitter = currentDelay * 0.3 * (Math.random() * 2 - 1) // ±30%
+        waitMs = Math.max(0, currentDelay + jitter)
+      }
+
+      await delayWithAbort(waitMs, signal)
+      currentDelay = Math.min(maxDelay, currentDelay * 2)
+    }
+  }
+
+  throw new Error('Retry attempts exhausted')
+}
+
+function delayWithAbort(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(new DOMException('Aborted', 'AbortError'))
+    const t = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort)
+      resolve()
+    }, ms)
+    const onAbort = (): void => {
+      clearTimeout(t)
+      reject(new DOMException('Aborted', 'AbortError'))
+    }
+    signal?.addEventListener('abort', onAbort, { once: true })
+  })
+}
+
+// ─── Singleton ───────────────────────────────────────────────────
+
+export const geminiApi = new GeminiApiClient()

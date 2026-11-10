@@ -1,0 +1,656 @@
+import type { ModelInfo } from '../../services/api/providers/base_provider.js'
+import type { APIProvider } from './providers.js'
+import {
+  lookupCatalogContextWindow,
+  lookupCatalogPromptCeiling,
+  noteMissingContextWindow,
+} from '../modelPricingCatalog.js'
+import { getAlibabaModelMeta } from './alibabaCatalog.js'
+import {
+  ANTIGRAVITY_CLAUDE_EFFORTS,
+  ANTIGRAVITY_CLAUDE_TIER_MODELS,
+  antigravityClaudeTierModelId,
+} from './antigravityClaudeTiers.js'
+import { getOpencodeContextWindow } from './opencodeModelsDevCatalog.js'
+import { getDirectModelMeta, isDirectProvider } from './directProviderCatalog.js'
+import { getMistralModelMeta } from './mistralCatalog.js'
+import {
+  getStoredContextWindow,
+  persistProviderContextWindows,
+} from './contextWindowStore.js'
+import { getCommandCodeCatalogContextWindow } from './commandCodeCatalog.js'
+import { getXaiContextWindow } from './xaiCatalog.js'
+import { getMetaContextWindow } from './metaCatalog.js'
+
+type ContextWindowMap = Record<string, number>
+
+const OPENAI_LONG_CONTEXT_WINDOW = 1_050_000
+const GEMINI_LONG_CONTEXT_WINDOW = 1_048_576
+const GEMINI_15_PRO_CONTEXT_WINDOW = 2_097_152
+
+const providerContextWindows = new Map<APIProvider, Map<string, number>>()
+
+const PROVIDER_SCOPED_CONTEXT_WINDOWS: Partial<Record<APIProvider, ContextWindowMap>> = {
+  firstParty: {
+    'claude-opus-5-5': 1_000_000,
+    'claude-opus-5': 1_000_000,
+    'claude-sonnet-5': 1_000_000,
+    'claude-opus-4-8': 1_000_000,
+    'claude-opus-4-7': 1_000_000,
+  },
+  // Antigravity's per-level Claude 5.5 ids, per its own catalog. Keyed by the
+  // full level ids: a bare `claude-opus-5-5` is not something Antigravity
+  // serves, so it keeps whatever it resolved to before.
+  antigravity: Object.fromEntries(
+    ANTIGRAVITY_CLAUDE_TIER_MODELS.flatMap(model =>
+      ANTIGRAVITY_CLAUDE_EFFORTS.map(effort => [
+        antigravityClaudeTierModelId(model, effort),
+        model.contextWindow,
+      ]),
+    ),
+  ),
+  // GPT-6 on the OpenAI (Codex) provider, per models.dev (2026-09-26;
+  // GPT-6.1 Sol added 2026-10-12). Input ceilings are applied separately below.
+  openai: {
+    'gpt-6.1-sol': OPENAI_LONG_CONTEXT_WINDOW,
+    'gpt-6-sol': OPENAI_LONG_CONTEXT_WINDOW,
+    'gpt-6-luna': OPENAI_LONG_CONTEXT_WINDOW,
+    'gpt-6-astra': OPENAI_LONG_CONTEXT_WINDOW,
+  },
+  kiro: {
+    auto: 1_000_000,
+    'claude-sonnet-4.5': 200_000,
+    'claude-sonnet-4': 200_000,
+    'claude-haiku-4.5': 200_000,
+    'deepseek-3.2': 164_000,
+    'minimax-m2.5': 196_000,
+    'minimax-m2.1': 196_000,
+    'glm-5': 200_000,
+    'qwen3-coder-next': 256_000,
+  },
+  cursor: {
+    'claude-4-sonnet-1m': 1_000_000,
+    'claude-4-sonnet-1m-thinking': 1_000_000,
+  },
+  // DeepSeek V4: 1M context, per the published pricing table. Scoped because
+  // other hosts (Fireworks, OpenCode Zen, LXD) serve their own v4 rows.
+  deepseek: {
+    'deepseek-v4-pro': 1_000_000,
+    'deepseek-v4-flash': 1_000_000,
+    'deepseek-v4-flash-vision-exp': 1_000_000,
+  },
+  glm: {
+    'glm-5.1': 200_000,
+    'glm-5-turbo': 200_000,
+    'glm-5': 200_000,
+    'glm-4.7': 200_000,
+  },
+  moonshot: {
+    'kimi-k2.6': 262_144,
+    'kimi-k2.5': 262_144,
+    'kimi-k2-thinking': 262_144,
+    'kimi-k2-thinking-turbo': 262_144,
+    'kimi-k2-turbo-preview': 262_144,
+    'kimi-k2-0905-preview': 262_144,
+    'kimi-k2-0711-preview': 131_072,
+  },
+  // LXD serves ids that collide with other providers' catalogs
+  // (minimax-m3, deepseek-v4-*, glm-4.7-flash), and its context windows
+  // differ from those hosts. Scoping them here keeps each provider honest.
+  lxd: {
+    'gpt-oss-120b': 131_072,
+    'glm-4.7-flash': 131_072,
+    'llama-4-scout': 131_072,
+    'gemma-4-31b': 262_144,
+    'minimax-m3': 1_048_576,
+    'nemotron-3-ultra': 1_048_576,
+    'deepseek-v4-flash-0731': 1_048_576,
+    'qwen3.8-27b': 262_144,
+    'random-model': 256_000,
+    'deepseek-v4-pro-0813': 1_000_000,
+    'spy-model': 1_000_000,
+    'qwen-3.8-2.4t-a95b': 1_000_000,
+  },
+  mimo: {
+    'mimo-v2.6-pro': 1_048_576,
+    'mimo-v2.6-flash': 1_048_576,
+    'mimo-v2.5-pro': 1_048_576,
+    'mimo-v2.5': 1_048_576,
+  },
+  minimax: {
+    'minimax-m2.7': 204_800,
+    'minimax-m2.7-highspeed': 204_800,
+    'minimax-m2.5': 196_000,
+    'minimax-m2.5-highspeed': 196_000,
+    'minimax-m2.1': 196_000,
+    'minimax-m2.1-highspeed': 196_000,
+  },
+  commandcode: {
+    'moonshotai/kimi-k3': 1_000_000,
+    'kimi-k3': 1_000_000,
+    'moonshotai/kimi-k2.6': 256_000,
+    'kimi-k2.6': 256_000,
+    'moonshotai/kimi-k2.5': 256_000,
+    'kimi-k2.5': 256_000,
+    'qwen/qwen3.7-max': 1_000_000,
+    'qwen3.7-max': 1_000_000,
+    'qwen/qwen3.7-max-free': 1_000_000,
+    'qwen3.7-max-free': 1_000_000,
+    'qwen/qwen3.7-plus': 1_000_000,
+    'qwen3.7-plus': 1_000_000,
+    'qwen/qwen3.8-max': 1_000_000,
+    'qwen3.8-max': 1_000_000,
+    'qwen/qwen3.8-flash': 1_000_000,
+    'qwen3.8-flash': 1_000_000,
+    'minimaxai/minimax-m3': 1_000_000,
+    'minimax-m3': 1_000_000,
+    'minimaxai/minimax-m2.7': 204_800,
+    'minimax-m2.7': 204_800,
+    'minimaxai/minimax-m2.5': 196_000,
+    'minimax-m2.5': 196_000,
+    'deepseek/deepseek-v4-pro': 1_000_000,
+    'deepseek-v4-pro': 1_000_000,
+    'deepseek/deepseek-v4-flash': 1_000_000,
+    'deepseek-v4-flash': 1_000_000,
+    'zai-org/glm-5.1': 200_000,
+    'glm-5.1': 200_000,
+    'zai-org/glm-5': 200_000,
+    'glm-5': 200_000,
+    'gpt-6-luna': OPENAI_LONG_CONTEXT_WINDOW,
+    'gpt-5.6-luna': OPENAI_LONG_CONTEXT_WINDOW,
+    'gpt-5.3-codex': 272_000,
+    'gpt-5.4-mini': 272_000,
+    'claude-sonnet-4-6': 1_000_000,
+    'claude-opus-4-6': 1_000_000,
+    'claude-haiku-4-5': 200_000,
+  },
+}
+
+const KNOWN_MODEL_CONTEXT_WINDOWS: ContextWindowMap = {
+  // OpenAI and Codex catalogs.
+  'gpt-5.6': OPENAI_LONG_CONTEXT_WINDOW,
+  'gpt-5.6-sol': OPENAI_LONG_CONTEXT_WINDOW,
+  'gpt-5.6-terra': OPENAI_LONG_CONTEXT_WINDOW,
+  'gpt-5.6-luna': OPENAI_LONG_CONTEXT_WINDOW,
+  'gpt-5.5': 272_000,
+  'gpt-5.5-pro': 272_000,
+  'gpt-5.4': OPENAI_LONG_CONTEXT_WINDOW,
+  'gpt-5.4-pro': OPENAI_LONG_CONTEXT_WINDOW,
+  'gpt-5.4-mini': 272_000,
+  'gpt-5.4-nano': 272_000,
+  'gpt-5.3-codex': 272_000,
+  'gpt-5.3-codex-spark-preview': 272_000,
+  'gpt-5.2': 272_000,
+  'gpt-5.2-codex': 272_000,
+  'gpt-5.1': 272_000,
+  'gpt-5.1-codex-max': 272_000,
+  'gpt-5.1-codex-mini': 272_000,
+  'gpt-5-mini': 272_000,
+  'gpt-5': 200_000,
+  'gpt-5-codex': 200_000,
+  o1: 200_000,
+  'o1-mini': 128_000,
+  'o1-preview': 128_000,
+  o3: 200_000,
+  'o3-mini': 200_000,
+  'o4-mini': 200_000,
+  'gpt-4.1': 1_000_000,
+  'gpt-4o': 128_000,
+  'gpt-4-turbo': 128_000,
+  'gpt-4': 8_192,
+
+  // Google Gemini catalogs.
+  'gemini-4-argon': GEMINI_LONG_CONTEXT_WINDOW,
+  'gemini-3.1-pro': GEMINI_LONG_CONTEXT_WINDOW,
+  'gemini-3.1-pro-high': GEMINI_LONG_CONTEXT_WINDOW,
+  'gemini-3.1-pro-low': GEMINI_LONG_CONTEXT_WINDOW,
+  'gemini-3.1-pro-preview': GEMINI_LONG_CONTEXT_WINDOW,
+  'gemini-3.1-pro-preview-customtools': GEMINI_LONG_CONTEXT_WINDOW,
+  'gemini-3.5-flash-high': GEMINI_LONG_CONTEXT_WINDOW,
+  'gemini-3.5-flash-medium': GEMINI_LONG_CONTEXT_WINDOW,
+  'gemini-3.5-flash-low': GEMINI_LONG_CONTEXT_WINDOW,
+  'gemini-3.1-flash-lite-preview': GEMINI_LONG_CONTEXT_WINDOW,
+  'gemini-3-flash': GEMINI_LONG_CONTEXT_WINDOW,
+  'gemini-3-flash-preview': GEMINI_LONG_CONTEXT_WINDOW,
+  'gemini-2.5-pro': GEMINI_LONG_CONTEXT_WINDOW,
+  'gemini-2.5-flash': GEMINI_LONG_CONTEXT_WINDOW,
+  'gemini-2.0': GEMINI_LONG_CONTEXT_WINDOW,
+  'gemini-1.5-pro': GEMINI_15_PRO_CONTEXT_WINDOW,
+  'gemini-1.5-flash': GEMINI_LONG_CONTEXT_WINDOW,
+
+  // Provider-owned and OpenAI-compatible catalogs.
+  'minimax-m2.7': 204_800,
+  'minimax-m2.7-highspeed': 204_800,
+  'deepseek-3.2': 164_000,
+  'minimax-m2.5': 196_000,
+  'minimax-m2.1': 196_000,
+  'glm-5.1': 200_000,
+  'glm-5-turbo': 200_000,
+  'glm-5': 200_000,
+  'glm-4.7': 200_000,
+  'kimi-k2.6': 262_144,
+  'kimi-k2.5': 262_144,
+  'kimi-k2-thinking': 262_144,
+  'kimi-k2-thinking-turbo': 262_144,
+  'kimi-k2-turbo-preview': 262_144,
+  'kimi-k2-0905-preview': 262_144,
+  'kimi-k2-0711-preview': 131_072,
+  'qwen3-coder-next': 256_000,
+
+  // Ollama common models.
+  llama3: 8_192,
+  'llama3.1': 128_000,
+  'llama3.2': 128_000,
+  'llama3.3': 128_000,
+  codellama: 16_384,
+  mixtral: 32_768,
+  mistral: 32_768,
+  'qwen2.5': 128_000,
+  phi3: 128_000,
+  'command-r': 128_000,
+}
+
+const PREFIX_CONTEXT_WINDOWS: ContextWindowMap = {
+  'gpt-5.6': OPENAI_LONG_CONTEXT_WINDOW,
+  'gpt-5.4-mini': 272_000,
+  'gpt-5.4-nano': 272_000,
+  'gpt-5.4-pro': OPENAI_LONG_CONTEXT_WINDOW,
+  'gpt-5.4': OPENAI_LONG_CONTEXT_WINDOW,
+  'gpt-5.3-codex': 272_000,
+  'gpt-5.2-codex': 272_000,
+  'gpt-5.2': 272_000,
+  'gpt-5.1-codex-max': 272_000,
+  'gpt-5.1-codex-mini': 272_000,
+  'gpt-5.1': 272_000,
+  'gpt-5-mini': 272_000,
+  'gemini-4-argon': GEMINI_LONG_CONTEXT_WINDOW,
+  'gemini-3.5-flash': GEMINI_LONG_CONTEXT_WINDOW,
+  'gemini-3.1-pro': GEMINI_LONG_CONTEXT_WINDOW,
+  'gemini-3.1-flash-lite': GEMINI_LONG_CONTEXT_WINDOW,
+  'gemini-3-flash': GEMINI_LONG_CONTEXT_WINDOW,
+  // Family floor for Gemini 3.x. Prefix keys are matched longest-first, so
+  // every specific entry above still wins; this only catches releases that
+  // shipped after the table was last touched (3.6/3.7/3.8 flash, and the
+  // `-tiered` wire ids, all of which resolved to the 200K default before).
+  // Narrower-window variants would need an explicit longer key here.
+  'gemini-3': GEMINI_LONG_CONTEXT_WINDOW,
+  'gemini-2.5-pro': GEMINI_LONG_CONTEXT_WINDOW,
+  'gemini-2.5-flash': GEMINI_LONG_CONTEXT_WINDOW,
+  'gemini-2.0': GEMINI_LONG_CONTEXT_WINDOW,
+  'gemini-1.5-pro': GEMINI_15_PRO_CONTEXT_WINDOW,
+  'gemini-1.5-flash': GEMINI_LONG_CONTEXT_WINDOW,
+  'minimax-m2.7': 204_800,
+  'minimax-m2.7-highspeed': 204_800,
+  'minimax-m2.5': 196_000,
+  'minimax-m2.5-highspeed': 196_000,
+  'minimax-m2.1': 196_000,
+  'minimax-m2.1-highspeed': 196_000,
+  'glm-5.1': 200_000,
+  'glm-5-turbo': 200_000,
+  'glm-5': 200_000,
+  'glm-4.7': 200_000,
+  'kimi-k2.6': 262_144,
+  'kimi-k2.5': 262_144,
+  'kimi-k2-thinking': 262_144,
+  'kimi-k2-thinking-turbo': 262_144,
+  'kimi-k2-turbo-preview': 262_144,
+  'kimi-k2-0905-preview': 262_144,
+  'kimi-k2-0711-preview': 131_072,
+  'llama3.3': 128_000,
+  'llama3.2': 128_000,
+  'llama3.1': 128_000,
+  llama3: 8_192,
+  codellama: 16_384,
+  mixtral: 32_768,
+  mistral: 32_768,
+  'qwen2.5': 128_000,
+  phi3: 128_000,
+  'command-r': 128_000,
+}
+
+const VARIANT_SUFFIXES = new Set([
+  'fast',
+  'high',
+  'low',
+  'max',
+  'medium',
+  'minimal',
+  'none',
+  'thinking',
+  'xhigh',
+])
+
+/**
+ * Providers the models.dev tier must not answer for: Anthropic's own
+ * platforms. models.dev lists their windows with the 1M beta applied (Sonnet
+ * 4.5 at 1M), while getContextWindowForModel decides that from the betas the
+ * session actually sends. Mirrors isAnthropicNativeProvider, which is not
+ * imported because providers.ts pulls in the settings graph and this module
+ * has to stay loadable on its own.
+ */
+const ANTHROPIC_NATIVE_PROVIDERS: ReadonlySet<string> = new Set([
+  'firstParty',
+  'bedrock',
+  'vertex',
+  'foundry',
+])
+
+export function recordProviderModelContextWindows(
+  provider: APIProvider,
+  models: readonly ModelInfo[],
+): void {
+  let providerWindows = providerContextWindows.get(provider)
+  if (!providerWindows) {
+    providerWindows = new Map()
+    providerContextWindows.set(provider, providerWindows)
+  }
+
+  for (const model of models) {
+    if (
+      typeof model.contextWindow !== 'number' ||
+      !Number.isFinite(model.contextWindow) ||
+      model.contextWindow <= 0
+    ) {
+      continue
+    }
+
+    for (const candidate of getModelLookupCandidates(model.id)) {
+      providerWindows.set(candidate, model.contextWindow)
+    }
+  }
+
+  // Hand the resolved map to the durable store so the next session starts
+  // knowing these windows instead of defaulting. Fire-and-forget: persistence
+  // failures leave the in-memory behaviour untouched.
+  persistProviderContextWindows(provider, providerWindows)
+}
+
+export function getProviderCatalogContextWindow(
+  model: string,
+  provider?: APIProvider,
+): number | undefined {
+  const candidates = getModelLookupCandidates(model)
+  if (candidates.length === 0) {
+    return undefined
+  }
+
+  if (provider) {
+    // Zen/Go publish ids only on /models. Their models.dev row is the source
+    // of limits, ahead of old persisted guesses and another host's defaults.
+    if (provider === 'opencode' || provider === 'opencodego') {
+      for (const candidate of candidates) {
+        const window = getOpencodeContextWindow(provider, candidate)
+        if (window !== undefined) return window
+      }
+      const window = lookupCatalogContextWindow(provider, candidates)
+      if (window !== undefined) return window
+    }
+    const hostWindow = lookupHostWindow(model, provider, candidates)
+    if (hostWindow !== undefined) {
+      return capToPromptCeiling(hostWindow, provider, candidates)
+    }
+  }
+
+  const exactWindow = lookupRecord(candidates, KNOWN_MODEL_CONTEXT_WINDOWS)
+  if (exactWindow !== undefined) {
+    return exactWindow
+  }
+
+  return lookupPrefixes(candidates)
+}
+
+/** What the sources scoped to one host say, most authoritative first. */
+function lookupHostWindow(
+  model: string,
+  provider: APIProvider,
+  candidates: readonly string[],
+): number | undefined {
+  const dynamicWindow = lookupMap(candidates, providerContextWindows.get(provider))
+  if (dynamicWindow !== undefined) {
+    return dynamicWindow
+  }
+
+  // Alibaba publishes no context window on its own /models route, so the
+  // catalogue is the only source — and it is a live one, which is why there
+  // is no static Alibaba block below. Consulted here rather than waiting for
+  // the picker to record windows, so a session that resumes straight onto a
+  // Qwen model still knows how big its window is.
+  if (provider === 'alibaba') {
+    const catalogWindow = getAlibabaModelMeta(model)?.contextWindow
+    if (catalogWindow !== undefined) {
+      return catalogWindow
+    }
+  }
+
+  if (provider === 'commandcode') {
+    const catalogWindow = getCommandCodeCatalogContextWindow(model)
+    if (catalogWindow !== undefined) return catalogWindow
+    for (const candidate of candidates) {
+      const w = getCommandCodeCatalogContextWindow(candidate)
+      if (w !== undefined) return w
+    }
+  }
+
+  if (isDirectProvider(provider)) {
+    const window = getDirectModelMeta(provider, model)?.contextWindow
+    if (window !== undefined) return window
+  }
+
+  if (provider === 'mistral') {
+    const window = getMistralModelMeta(model)?.contextWindow
+    if (window !== undefined) return window
+  }
+
+  // xAI states each row's window on /v1/models; the catalog keeps that
+  // listing and a docs snapshot, so a resumed session knows it before /models.
+  if (provider === 'xai') {
+    const window = getXaiContextWindow(model)
+    if (window !== undefined) return window
+  }
+
+  // Meta's /v1/models states ids only; its catalog (models.dev, then a docs
+  // snapshot) knows each window, so a resumed session knows it before /models.
+  if (provider === 'meta') {
+    const window = getMetaContextWindow(model)
+    if (window !== undefined) return window
+  }
+
+  // Windows observed in an earlier session, replayed from disk. Below the
+  // live map (this session's catalogue is fresher) and above the static
+  // tables, since it came from the provider's own catalogue rather than a
+  // hand-maintained list that cannot know about models released after it was
+  // last edited. Same precedence the in-memory map already had, just durable.
+  const storedWindow = getStoredContextWindow(provider, candidates)
+  if (storedWindow !== undefined) {
+    return storedWindow
+  }
+
+  const scopedWindow = lookupRecord(candidates, PROVIDER_SCOPED_CONTEXT_WINDOWS[provider])
+  if (scopedWindow !== undefined) {
+    return scopedWindow
+  }
+
+  // What models.dev states for this host, from the same catalogue the price
+  // table is built from. Unlike the tables below it is host-specific —
+  // Copilot's gpt-4.1 is 128K, OpenAI's 1M — and it already knows models
+  // released after those tables were last edited, such as OpenCode Zen's
+  // claude-fable-5-1 at 1M, which fell to the 200K default before.
+  if (!ANTHROPIC_NATIVE_PROVIDERS.has(provider)) {
+    const catalogWindow = lookupCatalogContextWindow(provider, candidates)
+    if (catalogWindow !== undefined) {
+      return catalogWindow
+    }
+    noteMissingContextWindow(provider)
+  }
+
+  return undefined
+}
+
+/**
+ * Hold a host's window to the prompt ceiling models.dev states for it.
+ *
+ * A provider's own catalogue tends to state a model's whole window —
+ * OpenRouter lists OpenAI's gpt-5 at 400K — while the model rejects a prompt
+ * past a smaller ceiling: OpenAI caps gpt-5 input at 272K and keeps the rest
+ * for output. Sizing compaction by the whole window lets a prompt grow past
+ * that ceiling and fail; the smaller number costs at most an earlier
+ * compaction. A figure already below the ceiling is kept as it is.
+ */
+function capToPromptCeiling(
+  window: number,
+  provider: APIProvider,
+  candidates: readonly string[],
+): number {
+  if (ANTHROPIC_NATIVE_PROVIDERS.has(provider)) {
+    return window
+  }
+  // GPT-6.1 Sol: models.dev's OpenAI row (2026-10-12). Keep its input
+  // ceiling even before the catalog is cached, including after /models
+  // records the larger total window. Other hosts retain their own limits.
+  const ceiling = lookupCatalogPromptCeiling(provider, candidates)
+    ?? (provider === 'openai' && candidates.includes('gpt-6.1-sol') ? 922_000 : undefined)
+  return ceiling !== undefined && ceiling < window ? ceiling : window
+}
+
+function lookupMap(
+  candidates: readonly string[],
+  values: ReadonlyMap<string, number> | undefined,
+): number | undefined {
+  if (!values) {
+    return undefined
+  }
+
+  for (const candidate of candidates) {
+    const value = values.get(candidate)
+    if (value !== undefined) {
+      return value
+    }
+  }
+
+  return undefined
+}
+
+function lookupRecord(
+  candidates: readonly string[],
+  values: ContextWindowMap | undefined,
+): number | undefined {
+  if (!values) {
+    return undefined
+  }
+
+  for (const candidate of candidates) {
+    const value = values[candidate]
+    if (value !== undefined) {
+      return value
+    }
+  }
+
+  return undefined
+}
+
+function lookupPrefixes(candidates: readonly string[]): number | undefined {
+  const keys = Object.keys(PREFIX_CONTEXT_WINDOWS).sort((a, b) => b.length - a.length)
+  for (const candidate of candidates) {
+    for (const key of keys) {
+      if (candidate.startsWith(key)) {
+        return PREFIX_CONTEXT_WINDOWS[key]
+      }
+    }
+  }
+
+  return undefined
+}
+
+function getModelLookupCandidates(model: string): string[] {
+  const normalized = normalizeModelId(model)
+  if (!normalized) {
+    return []
+  }
+
+  const baseCandidates: string[] = []
+  addNamespaceCandidates(normalized, baseCandidates)
+  const slashIndex = normalized.lastIndexOf('/')
+  if (slashIndex >= 0 && slashIndex < normalized.length - 1) {
+    addNamespaceCandidates(normalized.slice(slashIndex + 1), baseCandidates)
+  }
+
+  const candidates: string[] = []
+  for (const candidate of baseCandidates) {
+    addVariantCandidates(candidate, candidates)
+  }
+
+  return Array.from(new Set(candidates))
+}
+
+/**
+ * A leading dot-segment is a vendor namespace only when it is letters alone —
+ * no digit, no hyphen. ModelRouter and AgentRouter name models that way
+ * (`zai.glm-4.7`, `moonshotai.kimi-k2.5`, `us.meta.llama4-scout-...`) while
+ * the shared tables describe them under the bare id. The letters-only test is
+ * what keeps a version dot from being read as a separator: `gemini-3.8-flash`,
+ * `qwen3.8-flash` and `gpt-4.1` all have a head containing a digit or hyphen
+ * and are left whole.
+ */
+const VENDOR_NAMESPACE_SEGMENT = /^[a-z_]+$/
+
+function addNamespaceCandidates(candidate: string, candidates: string[]): void {
+  let current = candidate
+  candidates.push(current)
+  // Bounded: the deepest observed form is two segments (`us.meta.llama4-…`).
+  for (let i = 0; i < 3; i += 1) {
+    const dotIndex = current.indexOf('.')
+    if (dotIndex <= 0 || dotIndex === current.length - 1) {
+      return
+    }
+    if (!VENDOR_NAMESPACE_SEGMENT.test(current.slice(0, dotIndex))) {
+      return
+    }
+    current = current.slice(dotIndex + 1)
+    candidates.push(current)
+  }
+}
+
+function addVariantCandidates(candidate: string, candidates: string[]): void {
+  let current = candidate
+  for (let i = 0; i < 6; i += 1) {
+    candidates.push(current)
+    const stripped = stripKnownVariantSuffix(current)
+    if (!stripped || stripped === current) {
+      return
+    }
+    current = stripped
+  }
+}
+
+function stripKnownVariantSuffix(model: string): string | null {
+  const parts = model.split('-')
+  if (parts.length <= 1) {
+    return null
+  }
+
+  const suffix = parts[parts.length - 1]
+  if (!suffix || !VARIANT_SUFFIXES.has(suffix)) {
+    return null
+  }
+
+  return parts.slice(0, -1).join('-')
+}
+
+function normalizeModelId(model: string): string {
+  let normalized = model.trim().toLowerCase()
+  if (!normalized) {
+    return ''
+  }
+
+  const effortSeparator = '::effort='
+  const effortIndex = normalized.lastIndexOf(effortSeparator)
+  if (effortIndex >= 0) {
+    normalized = normalized.slice(0, effortIndex)
+  }
+
+  normalized = normalized.replace(/\[1m\]$/i, '').trim()
+  normalized = normalized.replace(/^models\//, '')
+  normalized = normalized.replace(/^antigravity-/, '')
+
+  return normalized
+}

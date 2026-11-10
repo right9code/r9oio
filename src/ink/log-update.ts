@@ -1,0 +1,939 @@
+import {
+  type AnsiCode,
+  ansiCodesToString,
+  diffAnsiCodes,
+} from '@alcalzone/ansi-tokenize'
+import { logForDebugging } from '../utils/debug.js'
+import type { Diff, FlickerReason, Frame } from './frame.js'
+import type { Point } from './layout/geometry.js'
+import {
+  type Cell,
+  CellWidth,
+  cellAt,
+  charInCellAt,
+  diffEach,
+  type Hyperlink,
+  isEmptyCellAt,
+  type Screen,
+  type StylePool,
+  shiftRows,
+  visibleCellAtIndex,
+} from './screen.js'
+import {
+  CURSOR_HOME,
+  cursorMove,
+  cursorTo,
+  scrollDown as csiScrollDown,
+  scrollUp as csiScrollUp,
+  RESET_SCROLL_REGION,
+  setScrollRegion,
+} from './termio/csi.js'
+import { LINK_END, link as oscLink } from './termio/osc.js'
+
+type State = {
+  previousOutput: string
+}
+
+/**
+ * An inline image to draw while the rows of its box are being written.
+ * Structural, so this module stays independent of ink/graphicsPlacement.
+ */
+type RowGraphic = {
+  readonly x: number
+  /** Logical row of the box's top edge. */
+  readonly y: number
+  readonly rows: number
+  readonly sequence: string
+}
+
+/** Supplies the images whose boxes end in a range of rows about to be written. */
+type RowGraphicsPlanner = (request: {
+  startY: number
+  endY: number
+  /** First logical row still on screen while these rows are written. */
+  topY: number
+  viewportRows: number
+  viewportColumns: number
+  /** A full-reset reprint: the screen was just wiped. */
+  afterClear: boolean
+}) => readonly RowGraphic[]
+
+type Options = {
+  isTTY: boolean
+  stylePool: StylePool
+  /** Main-screen inline graphics, drawn in the same pass as their rows. */
+  rowGraphics?: RowGraphicsPlanner
+}
+
+const CARRIAGE_RETURN = { type: 'carriageReturn' } as const
+const NEWLINE = { type: 'stdout', content: '\n' } as const
+/** DECSC / DECRC: an image is drawn without moving the writer's cursor. */
+const SAVE_CURSOR = '\x1b7'
+const RESTORE_CURSOR = '\x1b8'
+
+export class LogUpdate {
+  private state: State
+  /** Reason for a full reset owed to the next main-screen render, if any. */
+  private pendingFullReset: FlickerReason | null = null
+  /**
+   * Rows of the last main-screen frame that sit in terminal scrollback.
+   *
+   * Usually the frame's overflow, with the cursor on the bottom row. But a
+   * frame that shrinks has its rows erased in place, and nothing scrolls back
+   * down: rows already in scrollback stay there and blank rows open below the
+   * cursor. A terminal that grows taller may also add rows below rather than
+   * bring rows back. Working this out from the frame's height then counted rows
+   * as on screen that were not, and a cursor-up to one of them stopped at the
+   * top edge: the write landed on the wrong row and every later relative move,
+   * in that frame and the ones after, missed by as much. Tracked instead.
+   */
+  private scrollbackRows = 0
+
+  constructor(private readonly options: Options) {
+    this.state = {
+      previousOutput: '',
+    }
+  }
+
+  /**
+   * Make the next main-screen render a full reset.
+   *
+   * Rows in terminal history cannot be rewritten in place, so an inline image
+   * that could not be drawn when its rows went out can only be drawn by writing
+   * them all again. See ink.tsx.
+   */
+  requestFullReset(reason: FlickerReason): void {
+    this.pendingFullReset = reason
+  }
+
+  /**
+   * Rows of the frame last written that are in terminal scrollback: the first
+   * row still on screen. Always 0 in the alt screen.
+   */
+  get rowsInScrollback(): number {
+    return this.scrollbackRows
+  }
+
+  /** Images to draw within `[startY, endY)`, or undefined when there are none. */
+  private rowGraphicsFor(
+    frame: Frame,
+    altScreen: boolean,
+    startY: number,
+    endY: number,
+    topY: number,
+    afterClear: boolean,
+  ): readonly RowGraphic[] | undefined {
+    const plan = this.options.rowGraphics
+    // The alt screen redraws visible images every frame by itself and has no
+    // history to write into.
+    if (plan === undefined || altScreen || startY >= endY) return undefined
+    const graphics = plan({
+      startY,
+      endY,
+      topY,
+      viewportRows: frame.viewport.height,
+      viewportColumns: frame.viewport.width,
+      afterClear,
+    })
+    return graphics.length > 0 ? graphics : undefined
+  }
+
+  private fullReset(
+    frame: Frame,
+    reason: FlickerReason,
+    altScreen: boolean,
+    debug?: { triggerY: number; prevLine: string; nextLine: string },
+  ): Diff {
+    // Written from the top of a cleared screen: only the overflow scrolls away.
+    this.scrollbackRows = altScreen ? 0 : overflowRows(frame)
+    return fullResetSequence_CAUSES_FLICKER(
+      frame,
+      reason,
+      this.options.stylePool,
+      debug,
+      this.rowGraphicsFor(frame, altScreen, 0, frame.screen.height, 0, true),
+    )
+  }
+
+  renderPreviousOutput_DEPRECATED(prevFrame: Frame): Diff {
+    if (!this.options.isTTY) {
+      // Non-TTY output is no longer supported (string output was removed)
+      return [NEWLINE]
+    }
+    return this.getRenderOpsForDone(prevFrame)
+  }
+
+  // Called when process resumes from suspension (SIGCONT) to prevent clobbering terminal content
+  reset(): void {
+    this.state.previousOutput = ''
+    // The next render writes everything from scratch anyway.
+    this.pendingFullReset = null
+    this.scrollbackRows = 0
+  }
+
+  private renderFullFrame(frame: Frame): Diff {
+    const { screen } = frame
+    const lines: string[] = []
+    let currentStyles: AnsiCode[] = []
+    let currentHyperlink: Hyperlink = undefined
+    for (let y = 0; y < screen.height; y++) {
+      let line = ''
+      for (let x = 0; x < screen.width; x++) {
+        const cell = cellAt(screen, x, y)
+        if (cell && cell.width !== CellWidth.SpacerTail) {
+          // Handle hyperlink transitions
+          if (cell.hyperlink !== currentHyperlink) {
+            if (currentHyperlink !== undefined) {
+              line += LINK_END
+            }
+            if (cell.hyperlink !== undefined) {
+              line += oscLink(cell.hyperlink)
+            }
+            currentHyperlink = cell.hyperlink
+          }
+          const cellStyles = this.options.stylePool.get(cell.styleId)
+          const styleDiff = diffAnsiCodes(currentStyles, cellStyles)
+          if (styleDiff.length > 0) {
+            line += ansiCodesToString(styleDiff)
+            currentStyles = cellStyles
+          }
+          line += cell.char
+        }
+      }
+      // Close any open hyperlink before resetting styles
+      if (currentHyperlink !== undefined) {
+        line += LINK_END
+        currentHyperlink = undefined
+      }
+      // Reset styles at end of line so trimEnd doesn't leave dangling codes
+      const resetCodes = diffAnsiCodes(currentStyles, [])
+      if (resetCodes.length > 0) {
+        line += ansiCodesToString(resetCodes)
+        currentStyles = []
+      }
+      lines.push(line.trimEnd())
+    }
+
+    if (lines.length === 0) {
+      return []
+    }
+    return [{ type: 'stdout', content: lines.join('\n') }]
+  }
+
+  private getRenderOpsForDone(prev: Frame): Diff {
+    this.state.previousOutput = ''
+
+    if (!prev.cursor.visible) {
+      return [{ type: 'cursorShow' }]
+    }
+    return []
+  }
+
+  render(
+    prev: Frame,
+    next: Frame,
+    altScreen = false,
+    decstbmSafe = true,
+  ): Diff {
+    if (!this.options.isTTY) {
+      return this.renderFullFrame(next)
+    }
+
+    const owedReset = this.pendingFullReset
+    this.pendingFullReset = null
+    if (owedReset !== null && !altScreen) {
+      return this.fullReset(next, owedReset, altScreen)
+    }
+
+    const startTime = performance.now()
+    const stylePool = this.options.stylePool
+
+    // Since we assume the cursor is at the bottom on the screen, we only need
+    // to clear when the viewport gets shorter (i.e. the cursor position drifts)
+    // or when it gets thinner (and text wraps). We _could_ figure out how to
+    // not reset here but that would involve predicting the current layout
+    // _after_ the viewport change which means calcuating text wrapping.
+    // Resizing is a rare enough event that it's not practically a big issue.
+    if (
+      next.viewport.height < prev.viewport.height ||
+      (prev.viewport.width !== 0 && next.viewport.width !== prev.viewport.width)
+    ) {
+      return this.fullReset(next, 'resize', altScreen)
+    }
+
+    // DECSTBM scroll optimization: when a ScrollBox's scrollTop changed,
+    // shift content with a hardware scroll (CSI top;bot r + CSI n S/T)
+    // instead of rewriting the whole scroll region. The shiftRows on
+    // prev.screen simulates the shift so the diff loop below naturally
+    // finds only the rows that scrolled IN as diffs. prev.screen is
+    // about to become backFrame (reused next render) so mutation is safe.
+    // CURSOR_HOME after RESET_SCROLL_REGION is defensive — DECSTBM reset
+    // homes cursor per spec but terminal implementations vary.
+    //
+    // decstbmSafe: caller passes false when the DECSTBM→diff sequence
+    // can't be made atomic (no DEC 2026 / BSU/ESU). Without atomicity the
+    // outer terminal renders the intermediate state — region scrolled,
+    // edge rows not yet painted — a visible vertical jump on every frame
+    // where scrollTop moves. Falling through to the diff loop writes all
+    // shifted rows: more bytes, no intermediate state. next.screen from
+    // render-node-to-output's blit+shift is correct either way.
+    let scrollPatch: Diff = []
+    if (altScreen && next.scrollHint && decstbmSafe) {
+      const { top, bottom, delta } = next.scrollHint
+      if (
+        top >= 0 &&
+        bottom < prev.screen.height &&
+        bottom < next.screen.height
+      ) {
+        shiftRows(prev.screen, top, bottom, delta)
+        scrollPatch = [
+          {
+            type: 'stdout',
+            content:
+              setScrollRegion(top + 1, bottom + 1) +
+              (delta > 0 ? csiScrollUp(delta) : csiScrollDown(-delta)) +
+              RESET_SCROLL_REGION +
+              CURSOR_HOME,
+          },
+        ]
+      }
+    }
+
+    // We have to use purely relative operations to manipulate the cursor since
+    // we don't know its starting point.
+    //
+    // Rows of the previous frame that are in scrollback, out of the cursor's
+    // reach: its overflow (the cursor-restore LF at the end of a frame as tall
+    // as the viewport scrolls one more row out), or more after a shrink — see
+    // `scrollbackRows`. We need fullReset if any changes are to those rows.
+    //
+    // This early full-reset check only applies in "steady state" (not growing).
+    // For growing, the viewportY below catches unreachable scrollback rows in
+    // the diff loop instead.
+    const prevScrollback =
+      altScreen || prev.screen.height === 0
+        ? 0
+        : Math.min(
+            prev.screen.height,
+            Math.max(this.scrollbackRows, overflowRows(prev)),
+          )
+    const cursorAtBottom = prev.cursor.y >= prev.screen.height
+    const isGrowing = next.screen.height > prev.screen.height
+    const prevHadScrollback = cursorAtBottom && prevScrollback > 0
+    const isShrinking = next.screen.height < prev.screen.height
+    const nextFitsViewport = next.screen.height <= prev.viewport.height
+
+    // When shrinking from above-viewport to at-or-below-viewport, content that
+    // was in scrollback should now be visible. Terminal clear operations can't
+    // bring scrollback content into view, so we need a full reset.
+    // Use <= (not <) because even when next height equals viewport height, the
+    // scrollback depth from the previous render differs from a fresh render.
+    if (prevHadScrollback && nextFitsViewport && isShrinking) {
+      logForDebugging(
+        `Full reset (shrink->below): prevHeight=${prev.screen.height}, nextHeight=${next.screen.height}, viewport=${prev.viewport.height}`,
+      )
+      return this.fullReset(next, 'offscreen', altScreen)
+    }
+
+    if (prevHadScrollback && !isGrowing) {
+      let scrollbackChangeY = -1
+      diffEach(prev.screen, next.screen, (_x, y) => {
+        if (y < prevScrollback) {
+          scrollbackChangeY = y
+          return true // early exit
+        }
+      })
+      if (scrollbackChangeY >= 0) {
+        const prevLine = readLine(prev.screen, scrollbackChangeY)
+        const nextLine = readLine(next.screen, scrollbackChangeY)
+        return this.fullReset(next, 'offscreen', altScreen, {
+          triggerY: scrollbackChangeY,
+          prevLine,
+          nextLine,
+        })
+      }
+    }
+
+    const screen = new VirtualScreen(prev.cursor, next.viewport.width)
+
+    // Treat empty screen as height 1 to avoid spurious adjustments on first render
+    const heightDelta =
+      Math.max(next.screen.height, 1) - Math.max(prev.screen.height, 1)
+    const shrinking = heightDelta < 0
+    const growing = heightDelta > 0
+
+    // Handle shrinking: clear lines from the bottom
+    if (shrinking) {
+      const linesToClear = prev.screen.height - next.screen.height
+
+      // eraseLines only works within the viewport - it can't clear scrollback.
+      // If we need to clear more lines than fit in the viewport, some are in
+      // scrollback, so we need a full reset.
+      if (linesToClear > prev.viewport.height) {
+        return this.fullReset(next, 'offscreen', altScreen)
+      }
+
+      // clear(N) moves cursor UP by N-1 lines and to column 0
+      // This puts us at line prev.screen.height - N = next.screen.height
+      // But we want to be at next.screen.height - 1 (bottom of new screen)
+      screen.txn(prev => [
+        [
+          { type: 'clear', count: linesToClear },
+          { type: 'cursorMove', x: 0, y: -1 },
+        ],
+        { dx: -prev.x, dy: -linesToClear },
+      ])
+    }
+
+    // viewportY = number of rows in scrollback (not visible on terminal), as the
+    // previous frame left them: the first pass writes before any new row
+    // scrolls, and terminal clears don't scroll. Treating one of these rows as
+    // reachable lets the cursor clamp at the viewport top, so writes land rows
+    // off and garble the output.
+    const viewportY = prevScrollback
+
+    let currentStyleId = stylePool.none
+    let currentHyperlink: Hyperlink = undefined
+
+    // First pass: render changes to existing rows (rows < prev.screen.height)
+    let needsFullReset = false
+    let resetTriggerY = -1
+    diffEach(prev.screen, next.screen, (x, y, removed, added) => {
+      // Skip new rows - we'll render them directly after
+      if (growing && y >= prev.screen.height) {
+        return
+      }
+
+      // Skip spacers during rendering because the terminal will automatically
+      // advance 2 columns when we write the wide character itself.
+      // SpacerTail: Second cell of a wide character
+      // SpacerHead: Marks line-end position where wide char wraps to next line
+      if (
+        added &&
+        (added.width === CellWidth.SpacerTail ||
+          added.width === CellWidth.SpacerHead)
+      ) {
+        return
+      }
+
+      if (
+        removed &&
+        (removed.width === CellWidth.SpacerTail ||
+          removed.width === CellWidth.SpacerHead) &&
+        !added
+      ) {
+        return
+      }
+
+      // Skip empty cells that don't need to overwrite existing content.
+      // This prevents writing trailing spaces that would cause unnecessary
+      // line wrapping at the edge of the screen.
+      // Uses isEmptyCellAt to check if both packed words are zero (empty cell).
+      if (added && isEmptyCellAt(next.screen, x, y) && !removed) {
+        return
+      }
+
+      // If the cell outside the viewport range has changed, we need to reset
+      // because we can't move the cursor there to draw.
+      if (y < viewportY) {
+        needsFullReset = true
+        resetTriggerY = y
+        return true // early exit
+      }
+
+      moveCursorTo(screen, x, y)
+
+      if (added) {
+        const targetHyperlink = added.hyperlink
+        currentHyperlink = transitionHyperlink(
+          screen.diff,
+          currentHyperlink,
+          targetHyperlink,
+        )
+        const styleStr = stylePool.transition(currentStyleId, added.styleId)
+        if (writeCellWithStyleStr(screen, added, styleStr)) {
+          currentStyleId = added.styleId
+        }
+      } else if (removed) {
+        // Cell was removed - clear it with a space
+        // (This handles shrinking content)
+        // Reset any active styles/hyperlinks first to avoid leaking into cleared cells
+        const styleIdToReset = currentStyleId
+        const hyperlinkToReset = currentHyperlink
+        currentStyleId = stylePool.none
+        currentHyperlink = undefined
+
+        screen.txn(() => {
+          const patches: Diff = []
+          transitionStyle(patches, stylePool, styleIdToReset, stylePool.none)
+          transitionHyperlink(patches, hyperlinkToReset, undefined)
+          patches.push({ type: 'stdout', content: ' ' })
+          return [patches, { dx: 1, dy: 0 }]
+        })
+      }
+    })
+    if (needsFullReset) {
+      return this.fullReset(next, 'offscreen', altScreen, {
+        triggerY: resetTriggerY,
+        prevLine: readLine(prev.screen, resetTriggerY),
+        nextLine: readLine(next.screen, resetTriggerY),
+      })
+    }
+
+    // Reset styles before rendering new rows (they'll set their own styles)
+    currentStyleId = transitionStyle(
+      screen.diff,
+      stylePool,
+      currentStyleId,
+      stylePool.none,
+    )
+    currentHyperlink = transitionHyperlink(
+      screen.diff,
+      currentHyperlink,
+      undefined,
+    )
+
+    // Inline images whose boxes this pass left complete on screen: draw them now,
+    // before the rows written below can push them into history.
+    const completed = this.rowGraphicsFor(
+      next,
+      altScreen,
+      viewportY,
+      Math.min(prev.screen.height, next.screen.height),
+      viewportY,
+      false,
+    )
+    if (completed !== undefined) {
+      for (const graphic of completed) emitRowGraphic(screen, graphic)
+    }
+
+    // Handle growth: render new rows directly (they naturally scroll the terminal)
+    if (growing) {
+      renderFrameSlice(
+        screen,
+        next,
+        prev.screen.height,
+        next.screen.height,
+        stylePool,
+        this.rowGraphicsFor(
+          next,
+          altScreen,
+          prev.screen.height,
+          next.screen.height,
+          viewportY,
+          false,
+        ),
+      )
+    }
+
+    // Restore cursor. Skipped in alt-screen: the cursor is hidden, its
+    // position only matters as the starting point for the NEXT frame's
+    // relative moves, and in alt-screen the next frame always begins with
+    // CSI H (see ink.tsx onRender) which resets to (0,0) regardless. This
+    // saves a CR + cursorMove round-trip (~6-10 bytes) every frame.
+    //
+    // Main screen: if cursor needs to be past the last line of content
+    // (typical: cursor.y = screen.height), emit \n to create that line
+    // since cursor movement can't create new lines.
+    if (altScreen) {
+      // no-op; next frame's CSI H anchors cursor
+    } else if (next.cursor.y >= next.screen.height) {
+      // Move to column 0 of current line, then emit newlines to reach target row
+      screen.txn(prev => {
+        const rowsToCreate = next.cursor.y - prev.y
+        if (rowsToCreate > 0) {
+          // Use CR to resolve pending wrap (if any) without advancing
+          // to the next line, then LF to create each new row.
+          const patches: Diff = new Array<Diff[number]>(1 + rowsToCreate)
+          patches[0] = CARRIAGE_RETURN
+          for (let i = 0; i < rowsToCreate; i++) {
+            patches[1 + i] = NEWLINE
+          }
+          return [patches, { dx: -prev.x, dy: rowsToCreate }]
+        }
+        // At or past target row - need to move cursor to correct position
+        const dy = next.cursor.y - prev.y
+        if (dy !== 0 || prev.x !== next.cursor.x) {
+          // Use CR to clear pending wrap (if any), then cursor move
+          const patches: Diff = [CARRIAGE_RETURN]
+          patches.push({ type: 'cursorMove', x: next.cursor.x, y: dy })
+          return [patches, { dx: next.cursor.x - prev.x, dy }]
+        }
+        return [[], { dx: 0, dy: 0 }]
+      })
+    } else {
+      moveCursorTo(screen, next.cursor.x, next.cursor.y)
+    }
+
+    const elapsed = performance.now() - startTime
+    if (elapsed > 50) {
+      const damage = next.screen.damage
+      const damageInfo = damage
+        ? `${damage.width}x${damage.height} at (${damage.x},${damage.y})`
+        : 'none'
+      logForDebugging(
+        `Slow render: ${elapsed.toFixed(1)}ms, screen: ${next.screen.height}x${next.screen.width}, damage: ${damageInfo}, changes: ${screen.diff.length}`,
+      )
+    }
+
+    // New rows scroll the screen only once the cursor reaches its bottom row;
+    // a shrink scrolls nothing back.
+    this.scrollbackRows = altScreen
+      ? 0
+      : Math.max(prevScrollback, overflowRows(next))
+
+    return scrollPatch.length > 0
+      ? [...scrollPatch, ...screen.diff]
+      : screen.diff
+  }
+}
+
+function transitionHyperlink(
+  diff: Diff,
+  current: Hyperlink,
+  target: Hyperlink,
+): Hyperlink {
+  if (current !== target) {
+    diff.push({ type: 'hyperlink', uri: target ?? '' })
+    return target
+  }
+  return current
+}
+
+function transitionStyle(
+  diff: Diff,
+  stylePool: StylePool,
+  currentId: number,
+  targetId: number,
+): number {
+  const str = stylePool.transition(currentId, targetId)
+  if (str.length > 0) {
+    diff.push({ type: 'styleStr', str })
+  }
+  return targetId
+}
+
+/**
+ * Rows of a main-screen frame that scroll out of a terminal holding only it:
+ * the cursor rests one row below the content, so content as tall as the
+ * viewport already pushes its first row into scrollback.
+ */
+function overflowRows(frame: Frame): number {
+  return Math.max(0, frame.screen.height - frame.viewport.height + 1)
+}
+
+function readLine(screen: Screen, y: number): string {
+  let line = ''
+  for (let x = 0; x < screen.width; x++) {
+    line += charInCellAt(screen, x, y) ?? ' '
+  }
+  return line.trimEnd()
+}
+
+function fullResetSequence_CAUSES_FLICKER(
+  frame: Frame,
+  reason: FlickerReason,
+  stylePool: StylePool,
+  debug?: { triggerY: number; prevLine: string; nextLine: string },
+  graphics?: readonly RowGraphic[],
+): Diff {
+  // After clearTerminal, cursor is at (0, 0)
+  const screen = new VirtualScreen({ x: 0, y: 0 }, frame.viewport.width)
+  renderFrame(screen, frame, stylePool, graphics)
+  return [{ type: 'clearTerminal', reason, debug }, ...screen.diff]
+}
+
+function renderFrame(
+  screen: VirtualScreen,
+  frame: Frame,
+  stylePool: StylePool,
+  graphics?: readonly RowGraphic[],
+): void {
+  renderFrameSlice(screen, frame, 0, frame.screen.height, stylePool, graphics)
+}
+
+/**
+ * Draw an inline image over rows already written, leaving the cursor as it was.
+ *
+ * The box's rows are on screen at this moment — the caller guarantees it — so a
+ * relative move from the writer's own cursor reaches the top row exactly. The
+ * image then scrolls into history with those rows as later ones are written.
+ */
+function emitRowGraphic(screen: VirtualScreen, graphic: RowGraphic): void {
+  screen.diff.push({
+    type: 'stdout',
+    content:
+      SAVE_CURSOR +
+      cursorMove(0, graphic.y - screen.cursor.y) +
+      cursorTo(graphic.x + 1) +
+      graphic.sequence +
+      RESTORE_CURSOR,
+  })
+}
+
+/**
+ * Render a slice of rows from the frame's screen.
+ * Each row is rendered followed by a newline. Cursor ends at (0, endY).
+ *
+ * `graphics`, ordered by the last row of their boxes, are drawn right after
+ * that row's newline: its box is complete and its top still on screen.
+ */
+function renderFrameSlice(
+  screen: VirtualScreen,
+  frame: Frame,
+  startY: number,
+  endY: number,
+  stylePool: StylePool,
+  graphics?: readonly RowGraphic[],
+): VirtualScreen {
+  let currentStyleId = stylePool.none
+  let currentHyperlink: Hyperlink = undefined
+  // Track the styleId of the last rendered cell on this line (-1 if none).
+  // Passed to visibleCellAtIndex to enable fg-only space optimization.
+  let lastRenderedStyleId = -1
+  let nextGraphic = 0
+
+  const { width: screenWidth, cells, charPool, hyperlinkPool } = frame.screen
+
+  let index = startY * screenWidth
+  for (let y = startY; y < endY; y += 1) {
+    // Advance cursor to this row using LF (not CSI CUD / cursor-down).
+    // CSI CUD stops at the viewport bottom margin and cannot scroll,
+    // but LF scrolls the viewport to create new lines. Without this,
+    // when the cursor is at the viewport bottom, moveCursorTo's
+    // cursor-down silently fails, creating a permanent off-by-one
+    // between the virtual cursor and the real terminal cursor.
+    if (screen.cursor.y < y) {
+      const rowsToAdvance = y - screen.cursor.y
+      screen.txn(prev => {
+        const patches: Diff = new Array<Diff[number]>(1 + rowsToAdvance)
+        patches[0] = CARRIAGE_RETURN
+        for (let i = 0; i < rowsToAdvance; i++) {
+          patches[1 + i] = NEWLINE
+        }
+        return [patches, { dx: -prev.x, dy: rowsToAdvance }]
+      })
+    }
+    // Reset at start of each line — no cell rendered yet
+    lastRenderedStyleId = -1
+
+    for (let x = 0; x < screenWidth; x += 1, index += 1) {
+      // Skip spacers, unstyled empty cells, and fg-only styled spaces that
+      // match the last rendered style (since cursor-forward produces identical
+      // visual result). visibleCellAtIndex handles the optimization internally
+      // to avoid allocating Cell objects for skipped cells.
+      const cell = visibleCellAtIndex(
+        cells,
+        charPool,
+        hyperlinkPool,
+        index,
+        lastRenderedStyleId,
+      )
+      if (!cell) {
+        continue
+      }
+
+      moveCursorTo(screen, x, y)
+
+      // Handle hyperlink
+      const targetHyperlink = cell.hyperlink
+      currentHyperlink = transitionHyperlink(
+        screen.diff,
+        currentHyperlink,
+        targetHyperlink,
+      )
+
+      // Style transition — cached string, zero allocations after warmup
+      const styleStr = stylePool.transition(currentStyleId, cell.styleId)
+      if (writeCellWithStyleStr(screen, cell, styleStr)) {
+        currentStyleId = cell.styleId
+        lastRenderedStyleId = cell.styleId
+      }
+    }
+    // Reset styles/hyperlinks before newline so background color doesn't
+    // bleed into the next line when the terminal scrolls. The old code
+    // reset implicitly by writing trailing unstyled spaces; now that we
+    // skip empty cells, we must reset explicitly.
+    currentStyleId = transitionStyle(
+      screen.diff,
+      stylePool,
+      currentStyleId,
+      stylePool.none,
+    )
+    currentHyperlink = transitionHyperlink(
+      screen.diff,
+      currentHyperlink,
+      undefined,
+    )
+    // CR+LF at end of row — \r resets to column 0, \n moves to next line.
+    // Without \r, the terminal cursor stays at whatever column content ended
+    // (since we skip trailing spaces, this can be mid-row).
+    screen.txn(prev => [[CARRIAGE_RETURN, NEWLINE], { dx: -prev.x, dy: 1 }])
+
+    if (graphics !== undefined) {
+      while (
+        nextGraphic < graphics.length &&
+        graphics[nextGraphic]!.y + graphics[nextGraphic]!.rows - 1 <= y
+      ) {
+        emitRowGraphic(screen, graphics[nextGraphic]!)
+        nextGraphic++
+      }
+    }
+  }
+
+  // Reset any open style/hyperlink at end of slice
+  transitionStyle(screen.diff, stylePool, currentStyleId, stylePool.none)
+  transitionHyperlink(screen.diff, currentHyperlink, undefined)
+
+  return screen
+}
+
+type Delta = { dx: number; dy: number }
+
+/**
+ * Write a cell with a pre-serialized style transition string (from
+ * StylePool.transition). Inlines the txn logic to avoid closure/tuple/delta
+ * allocations on every cell.
+ *
+ * Returns true if the cell was written, false if skipped (wide char at
+ * viewport edge). Callers MUST gate currentStyleId updates on this — when
+ * skipped, styleStr is never pushed and the terminal's style state is
+ * unchanged. Updating the virtual tracker anyway desyncs it from the
+ * terminal, and the next transition is computed from phantom state.
+ */
+function writeCellWithStyleStr(
+  screen: VirtualScreen,
+  cell: Cell,
+  styleStr: string,
+): boolean {
+  const cellWidth = cell.width === CellWidth.Wide ? 2 : 1
+  const px = screen.cursor.x
+  const vw = screen.viewportWidth
+
+  // Don't write wide chars that would cross the viewport edge.
+  // Single-codepoint chars (CJK) at vw-2 are safe; multi-codepoint
+  // graphemes (flags, ZWJ emoji) need stricter threshold.
+  if (cellWidth === 2 && px < vw) {
+    const threshold = cell.char.length > 2 ? vw : vw + 1
+    if (px + 2 >= threshold) {
+      return false
+    }
+  }
+
+  const diff = screen.diff
+  if (styleStr.length > 0) {
+    diff.push({ type: 'styleStr', str: styleStr })
+  }
+
+  const needsCompensation = cellWidth === 2 && needsWidthCompensation(cell.char)
+
+  // On terminals with old wcwidth tables, a compensated emoji only advances
+  // the cursor 1 column, so the CHA below skips column x+1 without painting
+  // it. Write a styled space there first — on correct terminals the emoji
+  // glyph (width 2) overwrites it harmlessly; on old terminals it fills the
+  // gap with the emoji's background. Also clears any stale content at x+1.
+  // CHA is 1-based, so column px+1 (0-based) is CHA target px+2.
+  if (needsCompensation && px + 1 < vw) {
+    diff.push({ type: 'cursorTo', col: px + 2 })
+    diff.push({ type: 'stdout', content: ' ' })
+    diff.push({ type: 'cursorTo', col: px + 1 })
+  }
+
+  diff.push({ type: 'stdout', content: cell.char })
+
+  // Force terminal cursor to correct column after the emoji.
+  if (needsCompensation) {
+    diff.push({ type: 'cursorTo', col: px + cellWidth + 1 })
+  }
+
+  // Update cursor — mutate in place to avoid Point allocation
+  if (px >= vw) {
+    screen.cursor.x = cellWidth
+    screen.cursor.y++
+  } else {
+    screen.cursor.x = px + cellWidth
+  }
+  return true
+}
+
+function moveCursorTo(screen: VirtualScreen, targetX: number, targetY: number) {
+  screen.txn(prev => {
+    const dx = targetX - prev.x
+    const dy = targetY - prev.y
+    const inPendingWrap = prev.x >= screen.viewportWidth
+
+    // If we're in pending wrap state (cursor.x >= width), use CR
+    // to reset to column 0 on the current line without advancing
+    // to the next line, then issue the cursor movement.
+    if (inPendingWrap) {
+      return [
+        [CARRIAGE_RETURN, { type: 'cursorMove', x: targetX, y: dy }],
+        { dx, dy },
+      ]
+    }
+
+    // When moving to a different line, use carriage return (\r) to reset to
+    // column 0 first, then cursor move.
+    if (dy !== 0) {
+      return [
+        [CARRIAGE_RETURN, { type: 'cursorMove', x: targetX, y: dy }],
+        { dx, dy },
+      ]
+    }
+
+    // Standard same-line cursor move
+    return [[{ type: 'cursorMove', x: dx, y: dy }], { dx, dy }]
+  })
+}
+
+/**
+ * Identify emoji where the terminal's wcwidth may disagree with Unicode.
+ * On terminals with correct tables, the CHA we emit is a harmless no-op.
+ *
+ * Two categories:
+ * 1. Newer emoji (Unicode 12.0+) missing from terminal wcwidth tables.
+ * 2. Text-by-default emoji + VS16 (U+FE0F): the base codepoint is width 1
+ *    in wcwidth, but VS16 triggers emoji presentation making it width 2.
+ *    Examples: ⚔️ (U+2694), ☠️ (U+2620), ❤️ (U+2764).
+ */
+function needsWidthCompensation(char: string): boolean {
+  const cp = char.codePointAt(0)
+  if (cp === undefined) return false
+  // U+1FA70-U+1FAFF: Symbols and Pictographs Extended-A (Unicode 12.0-15.0)
+  // U+1FB00-U+1FBFF: Symbols for Legacy Computing (Unicode 13.0)
+  if ((cp >= 0x1fa70 && cp <= 0x1faff) || (cp >= 0x1fb00 && cp <= 0x1fbff)) {
+    return true
+  }
+  // Text-by-default emoji with VS16: scan for U+FE0F in multi-codepoint
+  // graphemes. Single BMP chars (length 1) and surrogate pairs without VS16
+  // skip this check. VS16 (0xFE0F) can't collide with surrogates (0xD800-0xDFFF).
+  if (char.length >= 2) {
+    for (let i = 0; i < char.length; i++) {
+      if (char.charCodeAt(i) === 0xfe0f) return true
+    }
+  }
+  return false
+}
+
+class VirtualScreen {
+  // Public for direct mutation by writeCellWithStyleStr (avoids txn overhead).
+  // File-private class — not exposed outside log-update.ts.
+  cursor: Point
+  diff: Diff = []
+
+  constructor(
+    origin: Point,
+    readonly viewportWidth: number,
+  ) {
+    this.cursor = { ...origin }
+  }
+
+  txn(fn: (prev: Point) => [patches: Diff, next: Delta]): void {
+    const [patches, next] = fn(this.cursor)
+    for (const patch of patches) {
+      this.diff.push(patch)
+    }
+    this.cursor.x += next.dx
+    this.cursor.y += next.dy
+  }
+}

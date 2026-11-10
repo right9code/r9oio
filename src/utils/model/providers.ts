@@ -1,0 +1,311 @@
+import type { AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS } from '../../services/analytics/index.js'
+import { isEnvTruthy } from '../envUtils.js'
+import { getGlobalConfig, saveGlobalConfig } from '../config.js'
+import { getForcedProvider } from '../forcedProvider.js'
+import { createSignal } from '../signal.js'
+import {
+  API_PROVIDERS,
+  SELECTABLE_PROVIDERS,
+  type APIProvider,
+} from './providerRegistry.js'
+import { isCustomProvider } from '../customProviders.js'
+
+export type { APIProvider } from './providerRegistry.js'
+export { API_PROVIDERS, SELECTABLE_PROVIDERS } from './providerRegistry.js'
+
+const VALID_PROVIDERS: readonly APIProvider[] = API_PROVIDERS
+
+export function isAPIProvider(value: string): value is APIProvider {
+  return VALID_PROVIDERS.includes(value as APIProvider)
+}
+
+// Session-local snapshot of the active provider.
+//
+// The previous implementation re-read activeProvider from the shared
+// global-config cache on every request. That cache is kept in sync with
+// ~/.claude.json by a 1-second fs.watchFile poller (see
+// startGlobalConfigFreshnessWatcher in utils/config.ts), so when one
+// session ran `/provider nim` the other session (running ollama) saw the
+// write within a second and started mis-routing requests — producing
+// cross-talk 404s like "ollama API error 404: model 'nim/xxx' not found"
+// and vice-versa.
+//
+// Fix: each process latches the provider it resolves on first call and
+// ignores later disk changes made by sibling sessions. Disk persistence
+// is preserved (for next-launch default), but in-memory routing for a
+// running session is frozen. `NODE_ENV=test` bypasses the cache so the
+// test suite can toggle providers freely.
+let _sessionActiveProvider: APIProvider | null = null
+
+function _resolveAPIProvider(): APIProvider {
+  // 1. Check persistent config first (set by /provider command)
+  const configured = getGlobalConfig().activeProvider
+  if (configured && VALID_PROVIDERS.includes(configured as APIProvider)) {
+    return configured as APIProvider
+  }
+  // 1b. Accept custom provider ids stored in config — these are not in the
+  //     compile-time APIProvider union. The cast is intentional: routing in
+  //     client.ts checks isCustomProvider() before hitting the static switch.
+  if (configured && isCustomProvider(configured)) {
+    return configured as APIProvider
+  }
+  // 2. Fall back to environment variables
+  if (isEnvTruthy(process.env.CLAUDE_CODE_USE_OMNIROUTE))   return 'omniroute'
+  if (isEnvTruthy(process.env.CLAUDE_CODE_USE_BEDROCK))    return 'bedrock'
+  if (isEnvTruthy(process.env.CLAUDE_CODE_USE_VERTEX))     return 'vertex'
+  if (isEnvTruthy(process.env.CLAUDE_CODE_USE_FOUNDRY))    return 'foundry'
+  if (isEnvTruthy(process.env.CLAUDE_CODE_USE_OPENAI))     return 'openai'
+  if (isEnvTruthy(process.env.CLAUDE_CODE_USE_GEMINI))     return 'gemini'
+  if (isEnvTruthy(process.env.CLAUDE_CODE_USE_OPENROUTER)) return 'openrouter'
+  if (isEnvTruthy(process.env.CLAUDE_CODE_USE_AGENTROUTER)) return 'agentrouter'
+  if (isEnvTruthy(process.env.CLAUDE_CODE_USE_MODELROUTER) || isEnvTruthy(process.env.CLAUDE_CODE_USE_MODEL_ROUTER) || isEnvTruthy(process.env.CLAUDE_CODE_USE_LXG2IT)) return 'modelrouter'
+  if (isEnvTruthy(process.env.CLAUDE_CODE_USE_VERCEL) || isEnvTruthy(process.env.CLAUDE_CODE_USE_VERCEL_AI_GATEWAY)) return 'vercel'
+  if (isEnvTruthy(process.env.CLAUDE_CODE_USE_REQUESTY))    return 'requesty'
+  if (isEnvTruthy(process.env.CLAUDE_CODE_USE_OPENCODE_GO) || isEnvTruthy(process.env.CLAUDE_CODE_USE_OPENCODEGO)) return 'opencodego'
+  if (isEnvTruthy(process.env.CLAUDE_CODE_USE_OPENCODE) || isEnvTruthy(process.env.CLAUDE_CODE_USE_OPENCODE_ZEN)) return 'opencode'
+  if (isEnvTruthy(process.env.CLAUDE_CODE_USE_COMMANDCODE) || isEnvTruthy(process.env.CLAUDE_CODE_USE_COMMAND_CODE)) return 'commandcode'
+  if (isEnvTruthy(process.env.CLAUDE_CODE_USE_LXD) || isEnvTruthy(process.env.CLAUDE_CODE_USE_LXDS)) return 'lxd'
+  if (isEnvTruthy(process.env.CLAUDE_CODE_USE_MIMO) || isEnvTruthy(process.env.CLAUDE_CODE_USE_XIAOMI_MIMO)) return 'mimo'
+  if (isEnvTruthy(process.env.CLAUDE_CODE_USE_FIREWORKS)) return 'fireworks'
+  if (isEnvTruthy(process.env.CLAUDE_CODE_USE_CLOUDFLARE) || isEnvTruthy(process.env.CLAUDE_CODE_USE_CLOUDFLARE_WORKERS_AI)) return 'cloudflare'
+  if (isEnvTruthy(process.env.CLAUDE_CODE_USE_GROQ))       return 'groq'
+  if (isEnvTruthy(process.env.CLAUDE_CODE_USE_MISTRAL))    return 'mistral'
+  if (isEnvTruthy(process.env.CLAUDE_CODE_USE_NIM))        return 'nim'
+  if (isEnvTruthy(process.env.CLAUDE_CODE_USE_DEEPSEEK))   return 'deepseek'
+  if (isEnvTruthy(process.env.CLAUDE_CODE_USE_GLM))        return 'glm'
+  if (isEnvTruthy(process.env.CLAUDE_CODE_USE_MOONSHOT))   return 'moonshot'
+  if (isEnvTruthy(process.env.CLAUDE_CODE_USE_MINIMAX))    return 'minimax'
+  if (isEnvTruthy(process.env.CLAUDE_CODE_USE_ALIBABA) || isEnvTruthy(process.env.CLAUDE_CODE_USE_DASHSCOPE) || isEnvTruthy(process.env.CLAUDE_CODE_USE_MODEL_STUDIO)) return 'alibaba'
+  if (isEnvTruthy(process.env.CLAUDE_CODE_USE_XAI) || isEnvTruthy(process.env.CLAUDE_CODE_USE_GROK)) return 'xai'
+  if (isEnvTruthy(process.env.CLAUDE_CODE_USE_META) || isEnvTruthy(process.env.CLAUDE_CODE_USE_MUSE)) return 'meta'
+  if (isEnvTruthy(process.env.CLAUDE_CODE_USE_OLLAMA))    return 'ollama'
+  if (isEnvTruthy(process.env.CLAUDE_CODE_USE_LMSTUDIO))  return 'lmstudio'
+  if (isEnvTruthy(process.env.CLAUDE_CODE_USE_CLINE_PASS) || isEnvTruthy(process.env.CLAUDE_CODE_USE_CLINEPASS)) return 'clinepass'
+  if (isEnvTruthy(process.env.CLAUDE_CODE_USE_CLINE)) return 'cline'
+
+  // 3. Auto-detect OpenCode Zen from known free-tier models if the user passes
+  // them directly (e.g. `tau -m deepseek-v4-flash-free`) so they don't have to
+  // manually set CLAUDE_CODE_USE_OPENCODE=1.
+  const model = process.env.ANTHROPIC_MODEL || ''
+  if (
+    model.includes('deepseek-v4-flash-free') ||
+    model.includes('nemotron-3') ||
+    model.includes('qwen3.6-plus-free') ||
+    model.includes('minimax-m2.5-free') ||
+    model === 'big-pickle'
+  ) {
+    return 'opencode'
+  }
+
+  return 'firstParty'
+}
+
+export function getAPIProvider(): APIProvider {
+  // A spawn can pin its own provider via AsyncLocalStorage — either from the
+  // Agent tool's `provider` param or from an agent definition's `provider:`
+  // frontmatter. It takes precedence over the session snapshot AND the test
+  // bypass so an agent spawned with provider='kiro' routes through Kiro
+  // regardless of what the user has globally selected via /provider.
+  const forced = getForcedProvider()
+  if (forced !== undefined) return forced
+
+  if (process.env.NODE_ENV === 'test') return _resolveAPIProvider()
+  if (_sessionActiveProvider !== null) return _sessionActiveProvider
+  _sessionActiveProvider = _resolveAPIProvider()
+  return _sessionActiveProvider
+}
+
+// Emitted by setActiveProvider when this session moves to a different
+// provider, so state tied to the provider can follow every switch path
+// (/models, favorites, /login, /fallback, surf) from one place.
+const activeProviderChanged = createSignal<[APIProvider]>()
+export const subscribeActiveProviderChange = activeProviderChanged.subscribe
+
+/**
+ * Persist the active provider selection to global config AND update this
+ * session's snapshot. Disk write keeps the choice across restarts;
+ * snapshot update makes the change visible on the next request in this
+ * session without waiting on the config-freshness watcher. Listeners
+ * registered with subscribeActiveProviderChange run after both, and only
+ * when the provider actually changed.
+ */
+export function setActiveProvider(provider: APIProvider): void {
+  const changed = _sessionActiveProvider !== provider
+  _sessionActiveProvider = provider
+  saveGlobalConfig(current => ({
+    ...current,
+    activeProvider: provider,
+  }))
+  if (changed) activeProviderChanged.emit(provider)
+}
+
+/**
+ * Clear the active provider from config AND from this session's snapshot.
+ * Next getAPIProvider() call re-resolves from env vars.
+ */
+export function clearActiveProvider(): void {
+  _sessionActiveProvider = null
+  saveGlobalConfig(current => ({
+    ...current,
+    activeProvider: undefined,
+  }))
+}
+
+/** User-friendly display names for providers */
+export const PROVIDER_DISPLAY_NAMES: Record<APIProvider, string> = {
+  firstParty: 'Anthropic',
+  omniroute: 'OmniRoute Gateway',
+  bedrock: 'AWS Bedrock',
+  vertex: 'Google Vertex AI',
+  foundry: 'Azure Foundry',
+  openai: 'OpenAI',
+  gemini: 'Google Gemini',
+  antigravity: 'Antigravity',
+  openrouter: 'OpenRouter',
+  agentrouter: 'AgentRouter',
+  modelrouter: 'Model Router',
+  vercel: 'Vercel AI Gateway',
+  requesty: 'Requesty',
+  opencode: 'OpenCode Zen',
+  opencodego: 'OpenCode Go',
+  commandcode: 'Command Code',
+  lxd: 'LXD API',
+  mimo: 'Xiaomi MiMo',
+  fireworks: 'Fireworks AI',
+  cloudflare: 'Cloudflare Workers AI',
+  groq: 'Groq',
+  mistral: 'Mistral',
+  nim: 'NVIDIA NIM',
+  deepseek: 'DeepSeek',
+  glm: 'GLM',
+  moonshot: 'Moonshot AI',
+  minimax: 'MiniMax AI',
+  // Short on purpose: this label rides the one-line session status row, and
+  // the spend segment is the first thing dropped when the row overflows. At
+  // 20 characters "Alibaba Model Studio" pushed spend off a 100-column
+  // terminal. "Alibaba" is also what models.dev names the provider.
+  alibaba: 'Alibaba',
+  xai: 'xAI',
+  meta: 'Meta',
+  ollama: 'Ollama',
+  lmstudio: 'LM Studio',
+  cline: 'Cline',
+  clinepass: 'Cline Pass',
+  copilot: 'GitHub Copilot',
+  cursor: 'Cursor',
+  iflow: 'iFlow',
+  kilocode: 'KiloCode',
+  kiro: 'Kiro',
+}
+
+/**
+ * Resolve a human-written provider string to a canonical APIProvider id.
+ *
+ * Agent files are hand-edited, so `provider:` arrives in whatever form the
+ * user copied out of the UI. We accept:
+ *   - the canonical id                 -> "fireworks"
+ *   - the display name from the picker -> "Fireworks AI"
+ *   - anything differing only in case, spaces, dashes or underscores
+ *
+ * Returns undefined when nothing matches, so callers can report the bad value
+ * instead of silently falling back to the session provider (which would run
+ * the agent's model on the wrong lane).
+ */
+const normalizeProviderKey = (value: string): string =>
+  value.toLowerCase().replace(/[^a-z0-9]/g, '')
+
+let _providerLookup: Map<string, APIProvider> | null = null
+
+function getProviderLookup(): Map<string, APIProvider> {
+  if (_providerLookup) return _providerLookup
+  const lookup = new Map<string, APIProvider>()
+  // Canonical ids first so they win any collision with a display name.
+  for (const provider of VALID_PROVIDERS) {
+    lookup.set(normalizeProviderKey(provider), provider)
+  }
+  for (const provider of VALID_PROVIDERS) {
+    const key = normalizeProviderKey(PROVIDER_DISPLAY_NAMES[provider])
+    if (!lookup.has(key)) lookup.set(key, provider)
+  }
+  _providerLookup = lookup
+  return lookup
+}
+
+export function resolveAPIProviderName(value: string): APIProvider | undefined {
+  const trimmed = value.trim()
+  if (trimmed.length === 0) return undefined
+  if (isAPIProvider(trimmed)) return trimmed
+  return getProviderLookup().get(normalizeProviderKey(trimmed))
+}
+
+/** Canonical provider ids, for error messages that list valid choices. */
+export function listAPIProviderNames(): readonly APIProvider[] {
+  return VALID_PROVIDERS
+}
+
+/** Providers available for user selection in /provider and /login.
+ *
+ * `iflow` is hidden from the user-facing pickers after its CLI shutdown
+ * announcement. `modelrouter` is also hidden from /login and /models; backend
+ * support stays intact for compatibility. The canonical picker list lives in
+ * providerRegistry.ts so provider-wide contract tests can import it safely.
+ */
+
+/** Providers that use OpenAI-compatible chat completions API */
+export function isOpenAICompatibleProvider(p: APIProvider): boolean {
+  return ['openai', 'omniroute', 'openrouter', 'agentrouter', 'modelrouter', 'vercel', 'requesty', 'opencode', 'opencodego', 'lxd', 'mimo', 'fireworks', 'cloudflare', 'groq', 'mistral', 'nim', 'deepseek', 'glm', 'moonshot', 'minimax', 'alibaba', 'ollama', 'lmstudio',
+          'cline', 'clinepass', 'copilot', 'iflow', 'kilocode'].includes(p)
+}
+
+/** All non-Anthropic third-party LLM providers */
+export function isThirdPartyProvider(p: APIProvider): boolean {
+  // User-defined custom providers (settings.json `customProviders`) are never
+  // Anthropic-native, so they must follow the third-party fallbacks: model
+  // strings resolve to the firstParty canonical set, and the default
+  // sonnet/haiku ids come from getProviderModelSet()'s generic fallback
+  // instead of an unknown-provider config lookup that returns undefined.
+  if (isCustomProvider(p)) return true
+  return ['openai', 'omniroute', 'gemini', 'antigravity', 'openrouter', 'agentrouter', 'modelrouter', 'vercel', 'requesty', 'opencode', 'opencodego', 'commandcode', 'lxd', 'mimo', 'fireworks', 'cloudflare', 'groq', 'mistral', 'nim', 'deepseek', 'glm', 'moonshot', 'minimax', 'alibaba', 'xai', 'meta', 'ollama', 'lmstudio',
+          'cline', 'clinepass', 'copilot', 'cursor', 'iflow', 'kilocode', 'kiro'].includes(p)
+}
+
+/** Original Anthropic-native providers (firstParty + cloud partners) */
+export function isAnthropicNativeProvider(p: APIProvider): boolean {
+  return ['firstParty', 'bedrock', 'vertex', 'foundry'].includes(p)
+}
+
+/**
+ * Claude 5 support covers the Anthropic-native providers only. Elsewhere a
+ * Claude 5 id keeps the reading it had before that support (claude-opus /
+ * claude-sonnet), so no other provider's requests, prompt or prices move;
+ * OpenCode shapes its Claude rows on its own route.
+ */
+export function claude5SupportApplies(): boolean {
+  return isAnthropicNativeProvider(getAPIProvider())
+}
+
+export function getAPIProviderForStatsig(): AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS {
+  return getAPIProvider() as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS
+}
+
+/**
+ * Check if ANTHROPIC_BASE_URL is a first-party Anthropic API URL.
+ * Returns true if not set (default API) or points to api.anthropic.com
+ * (or api-staging.anthropic.com for ant users).
+ */
+export function isFirstPartyAnthropicBaseUrl(): boolean {
+  const baseUrl = process.env.ANTHROPIC_BASE_URL
+  if (!baseUrl) {
+    return true
+  }
+  try {
+    const host = new URL(baseUrl).host
+    const allowedHosts = ['api.anthropic.com']
+    if (process.env.USER_TYPE === 'ant') {
+      allowedHosts.push('api-staging.anthropic.com')
+    }
+    return allowedHosts.includes(host)
+  } catch {
+    return false
+  }
+}

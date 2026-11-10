@@ -1,0 +1,297 @@
+/**
+ * Cursor protobuf request checks.
+ *
+ * Run via: bun run src/lanes/cursor/protobuf.test.ts
+ */
+
+import {
+  decodeMessage,
+  encodeRequest,
+  encodeVarint,
+  extractFromResponsePayload,
+  parseConnectFrame,
+} from './protobuf.js'
+
+let passed = 0
+let failed = 0
+
+function test(name: string, fn: () => void): void {
+  try {
+    fn()
+    passed++
+    console.log(`  ok  ${name}`)
+  } catch (e: any) {
+    failed++
+    console.log(`  FAIL ${name}: ${e?.message ?? String(e)}`)
+  }
+}
+
+function assert(cond: unknown, hint: string): void {
+  if (!cond) throw new Error(hint)
+}
+
+function decodeBody(body: Uint8Array): string {
+  return new TextDecoder().decode(body)
+}
+
+function concat(...parts: Uint8Array[]): Uint8Array {
+  let total = 0
+  for (const part of parts) total += part.length
+  const out = new Uint8Array(total)
+  let offset = 0
+  for (const part of parts) {
+    out.set(part, offset)
+    offset += part.length
+  }
+  return out
+}
+
+function encodeFieldLen(fieldNum: number, value: string | Uint8Array): Uint8Array {
+  const data = typeof value === 'string' ? new TextEncoder().encode(value) : value
+  return concat(encodeVarint((fieldNum << 3) | 2), encodeVarint(data.length), data)
+}
+
+function encodeFieldVarint(fieldNum: number, value: number): Uint8Array {
+  return concat(encodeVarint((fieldNum << 3) | 0), encodeVarint(value))
+}
+
+function encodeJsonStringValue(value: string): Uint8Array {
+  return encodeFieldLen(3, value)
+}
+
+function encodeJsonStruct(input: Record<string, string>): Uint8Array {
+  return concat(
+    ...Object.entries(input).map(([key, value]) =>
+      encodeFieldLen(
+        1,
+        concat(
+          encodeFieldLen(1, key),
+          encodeFieldLen(2, encodeJsonStringValue(value)),
+        ),
+      )),
+  )
+}
+
+test('Cursor request preserves a provided conversation id', () => {
+  const request = encodeRequest(
+    [{ role: 'user', content: 'hello' }],
+    'auto',
+    [],
+    [],
+    null,
+    { conversationId: 'cursor-conversation-fixed' },
+  )
+  const text = decodeBody(request)
+  assert(text.includes('cursor-conversation-fixed'), 'missing provided conversation id')
+})
+
+test('Cursor request keeps Auto as the native auto model id', () => {
+  const request = encodeRequest(
+    [{ role: 'user', content: 'hello' }],
+    'auto',
+    [],
+    [],
+    null,
+  )
+  const text = decodeBody(request)
+  assert(text.includes('auto'), 'missing auto model id')
+  assert(!text.includes('default'), 'legacy default model id leaked into request')
+})
+
+test('Cursor request encodes assistant tool calls and tool results natively', () => {
+  const request = encodeRequest(
+    [
+      {
+        role: 'assistant',
+        content: [
+          {
+            type: 'tool-call',
+            toolCallId: 'toolu_1',
+            toolName: 'run_terminal_cmd',
+            args: { command: 'echo ok' },
+          },
+        ],
+      },
+      {
+        role: 'tool',
+        content: [
+          {
+            type: 'tool-result',
+            toolCallId: 'toolu_1',
+            toolName: 'run_terminal_cmd',
+            result: 'ok',
+          },
+        ],
+      },
+    ],
+    'auto',
+    [],
+    [],
+    null,
+  )
+  const text = decodeBody(request)
+  assert(text.includes('toolu_1'), 'missing native tool call id')
+  assert(text.includes('run_terminal_cmd'), 'missing native tool name')
+  assert(text.includes('echo ok'), 'missing native tool args')
+  assert(text.includes('ok'), 'missing native tool result')
+})
+
+test('Cursor request marks requested models as built-in Cursor models', () => {
+  const request = encodeRequest(
+    [{ role: 'user', content: 'hello' }],
+    'auto',
+    [],
+    [],
+    null,
+  )
+  const fields = decodeMessage(request)
+  const requestedModel = fields.get(7)?.[0]?.value
+  assert(requestedModel instanceof Uint8Array, 'missing requested_model payload')
+  const requestedModelFields = decodeMessage(requestedModel)
+  assert(
+    requestedModelFields.get(4)?.[0]?.value === 1,
+    'missing built_in_model flag on requested_model',
+  )
+})
+
+test('Cursor parser preserves trailer-frame JSON errors', () => {
+  const payload = new TextEncoder().encode(
+    '{"error":{"message":"Named models unavailable"}}',
+  )
+  const frame = new Uint8Array(5 + payload.length)
+  frame[0] = 0x02
+  frame[1] = (payload.length >>> 24) & 0xff
+  frame[2] = (payload.length >>> 16) & 0xff
+  frame[3] = (payload.length >>> 8) & 0xff
+  frame[4] = payload.length & 0xff
+  frame.set(payload, 5)
+
+  const parsed = parseConnectFrame(frame)
+  assert(parsed != null, 'failed to parse trailer frame')
+  const extracted = extractFromResponsePayload(parsed.payload)
+  assert(
+    extracted.error === 'Named models unavailable',
+    `wrong trailer error: ${JSON.stringify(extracted)}`,
+  )
+})
+
+test('Cursor parser prefers detailed debug text from JSON errors', () => {
+  const payload = new TextEncoder().encode(
+    JSON.stringify({
+      error: {
+        message: 'Error',
+        details: [{
+          debug: {
+            details: {
+              title: 'Internal server error.',
+              detail: 'If the problem persists, email hi@cursor.com.',
+            },
+          },
+        }],
+      },
+    }),
+  )
+
+  const extracted = extractFromResponsePayload(payload)
+  assert(
+    extracted.error === 'Internal server error.\nIf the problem persists, email hi@cursor.com.',
+    `wrong detailed JSON error: ${JSON.stringify(extracted)}`,
+  )
+})
+
+test('Cursor parser prefers top-level title/detail text from JSON errors', () => {
+  const payload = new TextEncoder().encode(
+    JSON.stringify({
+      error: 'ERROR_UNAUTHORIZED',
+      details: {
+        title: 'Unauthorized request.',
+        detail: 'User is unauthorized',
+      },
+    }),
+  )
+
+  const extracted = extractFromResponsePayload(payload)
+  assert(
+    extracted.error === 'Unauthorized request.\nUser is unauthorized',
+    `wrong top-level JSON error: ${JSON.stringify(extracted)}`,
+  )
+})
+
+test('Cursor parser ignores empty JSON trailer envelopes', () => {
+  const extracted = extractFromResponsePayload(new TextEncoder().encode('{}'))
+  assert(
+    extracted.error === null,
+    `empty JSON trailer should be ignored: ${JSON.stringify(extracted)}`,
+  )
+})
+
+test('Cursor parser decodes structured protobuf tool args', () => {
+  const toolCall = concat(
+    encodeFieldLen(1, 'call_taskcreate'),
+    encodeFieldLen(2, 'TaskCreate'),
+    encodeFieldLen(
+      3,
+      encodeJsonStruct({
+        subject: 'Fix cursor workflow',
+        description: 'Restore normal tool calling',
+      }),
+    ),
+    encodeFieldVarint(4, 1),
+  )
+  const payload = encodeFieldLen(2, toolCall)
+
+  const extracted = extractFromResponsePayload(payload)
+  assert(extracted.toolCall?.id === 'call_taskcreate', 'wrong structured tool id')
+  assert(extracted.toolCall?.name === 'TaskCreate', 'wrong structured tool name')
+
+  const args = JSON.parse(extracted.toolCall?.argumentsDelta ?? '{}') as Record<string, unknown>
+  assert(args.subject === 'Fix cursor workflow', 'missing structured subject arg')
+  assert(args.description === 'Restore normal tool calling', 'missing structured description arg')
+  assert(extracted.toolCall?.isLast === true, 'missing structured completion flag')
+})
+
+test('Cursor parser emits structured protobuf args on every frame for snapshot replacement', () => {
+  const firstPayload = encodeFieldLen(
+    2,
+    concat(
+      encodeFieldLen(1, 'call_bash'),
+      encodeFieldLen(2, 'run_shell_command'),
+      encodeFieldLen(
+        3,
+        encodeJsonStruct({
+          command: 'pwd',
+        }),
+      ),
+      encodeFieldVarint(4, 0),
+    ),
+  )
+  const finalPayload = encodeFieldLen(
+    2,
+    concat(
+      encodeFieldLen(1, 'call_bash'),
+      encodeFieldLen(2, 'run_shell_command'),
+      encodeFieldLen(
+        3,
+        encodeJsonStruct({
+          command: 'pwd',
+        }),
+      ),
+      encodeFieldVarint(4, 1),
+    ),
+  )
+
+  const first = extractFromResponsePayload(firstPayload)
+  const final = extractFromResponsePayload(finalPayload)
+
+  // Structured args are now emitted on every frame (not gated on isComplete).
+  // The loop handles deduplication via snapshot replacement.
+  const firstArgs = JSON.parse(first.toolCall?.argumentsDelta ?? '{}') as Record<string, unknown>
+  assert(firstArgs.command === 'pwd', 'non-final frame should still emit structured args')
+
+  const finalArgs = JSON.parse(final.toolCall?.argumentsDelta ?? '{}') as Record<string, unknown>
+  assert(finalArgs.command === 'pwd', 'missing final structured command arg')
+  assert(final.toolCall?.isLast === true, 'missing final structured completion flag')
+})
+
+console.log(`\n${passed} passed, ${failed} failed`)
+if (failed > 0) process.exit(1)

@@ -1,0 +1,36 @@
+{
+  "name": "@right9/oio-installer",
+  "version": "0.1.4",
+  "description": "Install oio globally with its reviewed npm lifecycle scripts allowed for this install only.",
+  "type": "module",
+  "bin": {
+    "oio-installer": "bin/oio-installer.mjs"
+  },
+  "files": [
+    "bin",
+    "lib",
+    "README.md"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=20.19.0 <21.0.0 || >=22.12.0"
+  },
+  "keywords": [
+    "tau",
+    "installer",
+    "cli"
+  ],
+  "author": "right9code",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/right9code/r9oio.git",
+    "directory": "packages/tau-installer"
+  },
+  "homepage": "https://github.com/right9code/r9oio#readme",
+  "bugs": {
+    "url": "https://github.com/right9code/r9oio/issues"
+  }
+}

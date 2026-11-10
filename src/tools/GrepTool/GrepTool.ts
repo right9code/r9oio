@@ -1,0 +1,627 @@
+import { z } from 'zod/v4'
+import type { ValidationResult } from '../../Tool.js'
+import { buildTool, type ToolDef } from '../../Tool.js'
+import { getCwd } from '../../utils/cwd.js'
+import { isENOENT } from '../../utils/errors.js'
+import {
+  FILE_NOT_FOUND_CWD_NOTE,
+  suggestPathUnderCwd,
+} from '../../utils/file.js'
+import { getFsImplementation } from '../../utils/fsOperations.js'
+import { lazySchema } from '../../utils/lazySchema.js'
+import { expandPath, toRelativePath } from '../../utils/path.js'
+import {
+  checkReadPermissionForTool,
+  getFileReadIgnorePatterns,
+} from '../../utils/permissions/filesystem.js'
+import type { PermissionDecision } from '../../utils/permissions/PermissionResult.js'
+import { readDenyExclusionGlobs } from '../../utils/permissions/readDenyGlobs.js'
+import { matchWildcardPattern } from '../../utils/permissions/shellRuleMatching.js'
+import { getGlobExclusionsForPluginCache } from '../../utils/plugins/orphanedPluginFilter.js'
+import { getRipgrepMajorVersion, ripGrep } from '../../utils/ripgrep.js'
+import {
+  fileNameFilterArgs,
+  fileNameOnly,
+  vcsExclusionArgs,
+  withoutDotSlash,
+} from '../../utils/searchGlobs.js'
+import { semanticBoolean } from '../../utils/semanticBoolean.js'
+import { semanticNumber } from '../../utils/semanticNumber.js'
+import { plural } from '../../utils/stringUtils.js'
+import { buildGroupedGrepSummary } from './groupFlood.js'
+import { getGrepIgnoreArgs } from './grepIgnore.js'
+import { GREP_TOOL_NAME, getDescription } from './prompt.js'
+import {
+  getToolUseSummary,
+  renderToolResultMessage,
+  renderToolUseErrorMessage,
+  renderToolUseMessage,
+} from './UI.js'
+
+const inputSchema = lazySchema(() =>
+  z.strictObject({
+    pattern: z
+      .string()
+      .describe(
+        'Ripgrep regular expression',
+      ),
+    path: z
+      .string()
+      .optional()
+      .describe(
+        'File/directory; defaults to cwd',
+      ),
+    glob: z
+      .string()
+      .optional()
+      .describe(
+        'File filter glob, e.g. "*.{ts,tsx}"',
+      ),
+    output_mode: z
+      .enum(['content', 'files_with_matches', 'count'])
+      .optional()
+      .describe(
+        'content=lines, files_with_matches=paths (default), count=counts',
+      ),
+    '-B': semanticNumber(z.number().optional()).describe(
+      'Lines before each match; content mode only',
+    ),
+    '-A': semanticNumber(z.number().optional()).describe(
+      'Lines after each match; content mode only',
+    ),
+    '-C': semanticNumber(z.number().optional()).describe('Alias for context.'),
+    context: semanticNumber(z.number().optional()).describe(
+      'Lines before and after; content mode only',
+    ),
+    '-n': semanticBoolean(z.boolean().optional()).describe(
+      'Show line numbers in content mode; default true',
+    ),
+    '-i': semanticBoolean(z.boolean().optional()).describe(
+      'Case-insensitive search',
+    ),
+    type: z
+      .string()
+      .optional()
+      .describe(
+        'Ripgrep file type, e.g. js, py, rust, go',
+      ),
+    head_limit: semanticNumber(z.number().optional()).describe(
+      'Max lines/entries after offset; default 250, 0 unlimited. Flooded content may become a per-file summary.',
+    ),
+    offset: semanticNumber(z.number().optional()).describe(
+      'Skip N lines/entries before head_limit; default 0',
+    ),
+    multiline: semanticBoolean(z.boolean().optional()).describe(
+      'Allow patterns and `.` to span lines; default false',
+    ),
+    include_ignored: semanticBoolean(z.boolean().optional()).describe(
+      'Also search files excluded by .gitignore/.ignore rules; default false',
+    ),
+  }),
+)
+type InputSchema = ReturnType<typeof inputSchema>
+
+// Default cap on grep results when head_limit is unspecified. Unbounded content-mode
+// greps can fill up to the 20KB persist threshold (~6-24K tokens/grep-heavy session).
+// 250 is generous enough for exploratory searches while preventing context bloat.
+// Pass head_limit=0 explicitly for unlimited.
+const DEFAULT_HEAD_LIMIT = 250
+
+function applyHeadLimit<T>(
+  items: T[],
+  limit: number | undefined,
+  offset: number = 0,
+): { items: T[]; appliedLimit: number | undefined } {
+  // Explicit 0 = unlimited escape hatch
+  if (limit === 0) {
+    return { items: items.slice(offset), appliedLimit: undefined }
+  }
+  const effectiveLimit = limit ?? DEFAULT_HEAD_LIMIT
+  const sliced = items.slice(offset, offset + effectiveLimit)
+  // Only report appliedLimit when truncation actually occurred, so the model
+  // knows there may be more results and can paginate with offset.
+  const wasTruncated = items.length - offset > effectiveLimit
+  return {
+    items: sliced,
+    appliedLimit: wasTruncated ? effectiveLimit : undefined,
+  }
+}
+
+// Format limit/offset information for display in tool results.
+// appliedLimit is only set when truncation actually occurred (see applyHeadLimit),
+// so it may be undefined even when appliedOffset is set — build parts conditionally
+// to avoid "limit: undefined" appearing in user-visible output.
+function formatLimitInfo(
+  appliedLimit: number | undefined,
+  appliedOffset: number | undefined,
+): string {
+  const parts: string[] = []
+  if (appliedLimit !== undefined) parts.push(`limit: ${appliedLimit}`)
+  if (appliedOffset) parts.push(`offset: ${appliedOffset}`)
+  return parts.join(', ')
+}
+
+const outputSchema = lazySchema(() =>
+  z.object({
+    mode: z.enum(['content', 'files_with_matches', 'count']).optional(),
+    numFiles: z.number(),
+    filenames: z.array(z.string()),
+    content: z.string().optional(),
+    numLines: z.number().optional(), // For content mode
+    numMatches: z.number().optional(), // For count mode
+    appliedLimit: z.number().optional(), // The limit that was applied (if any)
+    appliedOffset: z.number().optional(), // The offset that was applied
+  }),
+)
+type OutputSchema = ReturnType<typeof outputSchema>
+
+type Output = z.infer<OutputSchema>
+
+export const GrepTool = buildTool({
+  name: GREP_TOOL_NAME,
+  searchHint: 'search file contents with regex (ripgrep)',
+  // 20K chars - tool result persistence threshold
+  maxResultSizeChars: 20_000,
+  strict: true,
+  async description() {
+    return getDescription()
+  },
+  userFacingName() {
+    return 'Search'
+  },
+  getToolUseSummary,
+  getActivityDescription(input) {
+    const summary = getToolUseSummary(input)
+    return summary ? `Searching for ${summary}` : 'Searching'
+  },
+  get inputSchema(): InputSchema {
+    return inputSchema()
+  },
+  get outputSchema(): OutputSchema {
+    return outputSchema()
+  },
+  isConcurrencySafe() {
+    return true
+  },
+  isReadOnly() {
+    return true
+  },
+  toAutoClassifierInput(input) {
+    return input.path ? `${input.pattern} in ${input.path}` : input.pattern
+  },
+  isSearchOrReadCommand() {
+    return { isSearch: true, isRead: false }
+  },
+  getPath({ path }): string {
+    return path || getCwd()
+  },
+  async preparePermissionMatcher({ pattern }) {
+    return rulePattern => matchWildcardPattern(rulePattern, pattern)
+  },
+  async validateInput({ path }): Promise<ValidationResult> {
+    // If path is provided, validate that it exists
+    if (path) {
+      const fs = getFsImplementation()
+      const absolutePath = expandPath(path)
+
+      // SECURITY: Skip filesystem operations for UNC paths to prevent NTLM credential leaks.
+      if (absolutePath.startsWith('\\\\') || absolutePath.startsWith('//')) {
+        return { result: true }
+      }
+
+      try {
+        await fs.stat(absolutePath)
+      } catch (e: unknown) {
+        if (isENOENT(e)) {
+          const cwdSuggestion = await suggestPathUnderCwd(absolutePath)
+          let message = `Path does not exist: ${path}. ${FILE_NOT_FOUND_CWD_NOTE} ${getCwd()}.`
+          if (cwdSuggestion) {
+            message += ` Did you mean ${cwdSuggestion}?`
+          }
+          return {
+            result: false,
+            message,
+            errorCode: 1,
+          }
+        }
+        throw e
+      }
+    }
+
+    return { result: true }
+  },
+  async checkPermissions(input, context): Promise<PermissionDecision> {
+    const appState = context.getAppState()
+    return checkReadPermissionForTool(
+      GrepTool,
+      input,
+      appState.toolPermissionContext,
+    )
+  },
+  async prompt() {
+    return getDescription()
+  },
+  renderToolUseMessage,
+  renderToolUseErrorMessage,
+  renderToolResultMessage,
+  // SearchResultSummary shows content (mode=content) or filenames.join.
+  // numFiles/numLines/numMatches are chrome ("Found 3 files") — fine to
+  // skip (under-count, not phantom). Glob reuses this via UI.tsx:65.
+  extractSearchText({ mode, content, filenames }) {
+    if (mode === 'content' && content) return content
+    return filenames.join('\n')
+  },
+  mapToolResultToToolResultBlockParam(
+    {
+      mode = 'files_with_matches',
+      numFiles,
+      filenames,
+      content,
+      numLines: _numLines,
+      numMatches,
+      appliedLimit,
+      appliedOffset,
+    },
+    toolUseID,
+  ) {
+    if (mode === 'content') {
+      const limitInfo = formatLimitInfo(appliedLimit, appliedOffset)
+      const resultContent = content || 'No matches found'
+      const finalContent = limitInfo
+        ? `${resultContent}\n\n[Showing results with pagination = ${limitInfo}]`
+        : resultContent
+      return {
+        tool_use_id: toolUseID,
+        type: 'tool_result',
+        content: finalContent,
+      }
+    }
+
+    if (mode === 'count') {
+      const limitInfo = formatLimitInfo(appliedLimit, appliedOffset)
+      const rawContent = content || 'No matches found'
+      const matches = numMatches ?? 0
+      const files = numFiles ?? 0
+      const summary = `\n\nFound ${matches} total ${matches === 1 ? 'occurrence' : 'occurrences'} across ${files} ${files === 1 ? 'file' : 'files'}.${limitInfo ? ` with pagination = ${limitInfo}` : ''}`
+      return {
+        tool_use_id: toolUseID,
+        type: 'tool_result',
+        content: rawContent + summary,
+      }
+    }
+
+    // files_with_matches mode
+    const limitInfo = formatLimitInfo(appliedLimit, appliedOffset)
+    if (numFiles === 0) {
+      return {
+        tool_use_id: toolUseID,
+        type: 'tool_result',
+        content: 'No files found',
+      }
+    }
+    // head_limit has already been applied in call() method, so just show all filenames
+    const result = `Found ${numFiles} ${plural(numFiles, 'file')}${limitInfo ? ` ${limitInfo}` : ''}\n${filenames.join('\n')}`
+    return {
+      tool_use_id: toolUseID,
+      type: 'tool_result',
+      content: result,
+    }
+  },
+  async call(
+    {
+      pattern,
+      path,
+      glob,
+      type,
+      output_mode = 'files_with_matches',
+      '-B': context_before,
+      '-A': context_after,
+      '-C': context_c,
+      context,
+      '-n': show_line_numbers = true,
+      '-i': case_insensitive = false,
+      head_limit,
+      offset = 0,
+      multiline = false,
+      include_ignored = false,
+    },
+    { abortController, getAppState },
+  ) {
+    const absolutePath = path ? expandPath(path) : getCwd()
+    const args = ['--hidden']
+    abortController.signal.throwIfAborted()
+    // Ignore files are honoured unless the caller asks for ignored files too.
+    args.push(...(include_ignored
+      ? ['--no-ignore']
+      : await getGrepIgnoreArgs(
+          absolutePath,
+          await getRipgrepMajorVersion(),
+          abortController.signal,
+        )))
+
+    // Limit line length to prevent base64/minified content from cluttering output
+    args.push('--max-columns', '500')
+
+    // Only apply multiline flags when explicitly requested
+    if (multiline) {
+      args.push('-U', '--multiline-dotall')
+    }
+
+    // Add optional flags
+    if (case_insensitive) {
+      args.push('-i')
+    }
+
+    // Add output mode flags
+    if (output_mode === 'files_with_matches') {
+      args.push('-l')
+    } else if (output_mode === 'count') {
+      args.push('-c')
+    }
+
+    // Add line numbers if requested
+    if (show_line_numbers && output_mode === 'content') {
+      args.push('-n')
+    }
+
+    // Add context flags (-C/context takes precedence over context_before/context_after)
+    if (output_mode === 'content') {
+      if (context !== undefined) {
+        args.push('-C', context.toString())
+      } else if (context_c !== undefined) {
+        args.push('-C', context_c.toString())
+      } else {
+        if (context_before !== undefined) {
+          args.push('-B', context_before.toString())
+        }
+        if (context_after !== undefined) {
+          args.push('-A', context_after.toString())
+        }
+      }
+    }
+
+    // If pattern starts with dash, use -e flag to specify it as a pattern
+    // This prevents ripgrep from interpreting it as a command-line option
+    if (pattern.startsWith('-')) {
+      args.push('-e', pattern)
+    } else {
+      args.push(pattern)
+    }
+
+    // Add type filter if specified
+    if (type) {
+      args.push('--type', type)
+    }
+
+    if (glob) {
+      // Split on commas and spaces, but preserve patterns with braces
+      const globPatterns: string[] = []
+      const rawPatterns = glob.split(/\s+/)
+
+      for (const rawPattern of rawPatterns) {
+        // If pattern contains braces, don't split further
+        if (rawPattern.includes('{') && rawPattern.includes('}')) {
+          globPatterns.push(rawPattern)
+        } else {
+          // Split on commas for patterns without braces
+          globPatterns.push(...rawPattern.split(',').filter(Boolean))
+        }
+      }
+
+      // A positive --glob is an override: one that matches folder names
+      // (`*`, `*.*`, `**`) walks into ignored folders, and an ignored file it
+      // names is searched anyway. Globs that only name files are applied as a
+      // file type instead, which keeps the ignore files (include_ignored is
+      // how to search ignored files). Negations only exclude. Path globs, and
+      // name globs beside one or beside `type`, stay globs so the combination
+      // keeps its meaning.
+      const patterns = globPatterns.filter(Boolean).map(withoutDotSlash)
+      const positive = patterns.filter(p => !p.startsWith('!'))
+      const names = positive.map(fileNameOnly)
+      const asType =
+        !type && names.length > 0 && names.every(name => name !== null)
+      for (const globPattern of asType ? patterns.filter(p => p.startsWith('!')) : patterns) {
+        args.push('--glob', globPattern)
+      }
+      if (asType) {
+        args.push(...fileNameFilterArgs('taugrep', names as string[]))
+      }
+    }
+
+    // VCS metadata, then read-deny rules, after the caller's globs: the last
+    // matching glob wins, so `glob: "*"` no longer re-includes `.git`. The
+    // deny rules are anchored at the searched path, where ripGrep anchors
+    // every glob below. (A file named as the path bypasses all globs.)
+    args.push(...vcsExclusionArgs())
+    const appState = getAppState()
+    for (const denyGlob of readDenyExclusionGlobs(
+      getFileReadIgnorePatterns(appState.toolPermissionContext),
+      absolutePath,
+    )) {
+      args.push('--glob', denyGlob)
+    }
+
+    // Exclude orphaned plugin version directories
+    for (const exclusion of await getGlobExclusionsForPluginCache(
+      absolutePath,
+    )) {
+      args.push('--glob', exclusion)
+    }
+
+    // WSL has severe performance penalty for file reads (3-5x slower on WSL2)
+    // The timeout is handled by ripgrep itself via execFile timeout option
+    // We don't use AbortController for timeout to avoid interrupting the agent loop
+    // If ripgrep times out, it throws RipgrepTimeoutError which propagates up
+    // so Claude knows the search didn't complete (rather than thinking there were no matches)
+    const results = await ripGrep(args, absolutePath, abortController.signal, {
+      strictErrors: true,
+      globsRelativeToTarget: true,
+    })
+
+    if (output_mode === 'content') {
+      // For content mode, results are the actual content lines
+      // Convert absolute paths to relative paths to save tokens
+
+      // Flood grouping: when far more lines match than the display limit,
+      // a flat first-N slice shows a couple of files exhaustively and drops
+      // the rest. Fold the FULL set into a per-file count + line-anchor
+      // digest instead (buildGroupedGrepSummary decides if the flood is
+      // real). Only for plain searches: explicit offset means the model is
+      // deliberately paginating, head_limit=0 means it wants everything,
+      // and context lines (`path-num-content`, `--` separators) or missing
+      // line numbers would defeat the anchor parsing.
+      const wantsContext =
+        context !== undefined ||
+        context_c !== undefined ||
+        context_before !== undefined ||
+        context_after !== undefined
+      if (offset === 0 && head_limit !== 0 && !wantsContext && show_line_numbers) {
+        const grouped = buildGroupedGrepSummary(
+          results,
+          head_limit ?? DEFAULT_HEAD_LIMIT,
+          toRelativePath,
+        )
+        if (grouped) {
+          return {
+            data: {
+              mode: 'content' as const,
+              numFiles: grouped.numFiles,
+              filenames: [],
+              content: grouped.content,
+              numLines: grouped.numLines,
+            },
+          }
+        }
+      }
+
+      // Apply head_limit first — relativize is per-line work, so
+      // avoid processing lines that will be discarded (broad patterns can
+      // return 10k+ lines with head_limit keeping only ~30-100).
+      const { items: limitedResults, appliedLimit } = applyHeadLimit(
+        results,
+        head_limit,
+        offset,
+      )
+
+      const finalLines = limitedResults.map(line => {
+        // Lines have format: /absolute/path:line_content or /absolute/path:num:content
+        const colonIndex = line.indexOf(':')
+        if (colonIndex > 0) {
+          const filePath = line.substring(0, colonIndex)
+          const rest = line.substring(colonIndex)
+          return toRelativePath(filePath) + rest
+        }
+        return line
+      })
+      const output = {
+        mode: 'content' as const,
+        numFiles: 0, // Not applicable for content mode
+        filenames: [],
+        content: finalLines.join('\n'),
+        numLines: finalLines.length,
+        ...(appliedLimit !== undefined && { appliedLimit }),
+        ...(offset > 0 && { appliedOffset: offset }),
+      }
+      return { data: output }
+    }
+
+    if (output_mode === 'count') {
+      // For count mode, pass through raw ripgrep output (filename:count format)
+      // Apply head_limit first to avoid relativizing entries that will be discarded.
+      const { items: limitedResults, appliedLimit } = applyHeadLimit(
+        results,
+        head_limit,
+        offset,
+      )
+
+      // Convert absolute paths to relative paths to save tokens
+      const finalCountLines = limitedResults.map(line => {
+        // Lines have format: /absolute/path:count
+        const colonIndex = line.lastIndexOf(':')
+        if (colonIndex > 0) {
+          const filePath = line.substring(0, colonIndex)
+          const count = line.substring(colonIndex)
+          return toRelativePath(filePath) + count
+        }
+        return line
+      })
+
+      // Parse count output to extract total matches and file count
+      let totalMatches = 0
+      let fileCount = 0
+      for (const line of finalCountLines) {
+        const colonIndex = line.lastIndexOf(':')
+        if (colonIndex > 0) {
+          const countStr = line.substring(colonIndex + 1)
+          const count = parseInt(countStr, 10)
+          if (!isNaN(count)) {
+            totalMatches += count
+            fileCount += 1
+          }
+        }
+      }
+
+      const output = {
+        mode: 'count' as const,
+        numFiles: fileCount,
+        filenames: [],
+        content: finalCountLines.join('\n'),
+        numMatches: totalMatches,
+        ...(appliedLimit !== undefined && { appliedLimit }),
+        ...(offset > 0 && { appliedOffset: offset }),
+      }
+      return { data: output }
+    }
+
+    // For files_with_matches mode (default)
+    // Use allSettled so a single ENOENT (file deleted between ripgrep's scan
+    // and this stat) does not reject the whole batch. Failed stats sort as mtime 0.
+    const stats = await Promise.allSettled(
+      results.map(_ => getFsImplementation().stat(_)),
+    )
+    const sortedMatches = results
+      // Sort by modification time
+      .map((_, i) => {
+        const r = stats[i]!
+        return [
+          _,
+          r.status === 'fulfilled' ? (r.value.mtimeMs ?? 0) : 0,
+        ] as const
+      })
+      .sort((a, b) => {
+        if (process.env.NODE_ENV === 'test') {
+          // In tests, we always want to sort by filename, so that results are deterministic
+          return a[0].localeCompare(b[0])
+        }
+        const timeComparison = b[1] - a[1]
+        if (timeComparison === 0) {
+          // Sort by filename as a tiebreaker
+          return a[0].localeCompare(b[0])
+        }
+        return timeComparison
+      })
+      .map(_ => _[0])
+
+    // Apply head_limit to sorted file list (like "| head -N")
+    const { items: finalMatches, appliedLimit } = applyHeadLimit(
+      sortedMatches,
+      head_limit,
+      offset,
+    )
+
+    // Convert absolute paths to relative paths to save tokens
+    const relativeMatches = finalMatches.map(toRelativePath)
+
+    const output = {
+      mode: 'files_with_matches' as const,
+      filenames: relativeMatches,
+      numFiles: relativeMatches.length,
+      ...(appliedLimit !== undefined && { appliedLimit }),
+      ...(offset > 0 && { appliedOffset: offset }),
+    }
+
+    return {
+      data: output,
+    }
+  },
+} satisfies ToolDef<InputSchema, Output>)

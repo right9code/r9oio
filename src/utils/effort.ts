@@ -1,0 +1,419 @@
+// biome-ignore-all assist/source/organizeImports: ANT-ONLY import markers must not be reordered
+import {
+  getEffortEnvOverride,
+  convertEffortValueToLevel,
+  type EffortLevel,
+  type EffortValue,
+} from './effortValue.js'
+export {
+  EFFORT_LEVELS,
+  isEffortLevel,
+  parseEffortValue,
+  getEffortEnvOverride,
+  isValidNumericEffort,
+  convertEffortValueToLevel,
+  type EffortLevel,
+  type EffortValue,
+} from './effortValue.js'
+import { isUltrathinkEnabled } from './thinking.js'
+import { getInitialSettings } from './settings/settings.js'
+import { isProSubscriber, isMaxSubscriber, isTeamSubscriber } from './auth.js'
+import { getFeatureValue_CACHED_MAY_BE_STALE } from 'src/services/analytics/growthbook.js'
+import { claude5SupportApplies, getAPIProvider, isThirdPartyProvider } from './model/providers.js'
+import { get3PModelCapabilityOverride } from './model/modelSupportOverrides.js'
+import { parseAntigravityClaudeTier } from './model/antigravityClaudeTiers.js'
+import { getOpenAIReasoningLevel, modelSupportsReasoning } from './model/openaiReasoning.js'
+import {
+  getCommandCodeEffort,
+  supportsCommandCodeEffortSelection,
+} from './model/commandCodeThinking.js'
+import { isEnvTruthy } from './envUtils.js'
+import { getProviderEffort } from './model/providerEffort.js'
+
+// @[MODEL LAUNCH]: Add the new model to the allowlist if it supports the effort parameter.
+export function modelSupportsEffort(model: string): boolean {
+  const m = model.toLowerCase()
+  if (isEnvTruthy(process.env.CLAUDE_CODE_ALWAYS_ENABLE_EFFORT)) {
+    return true
+  }
+  // Antigravity's request carries no effort field; its Claude 5.5 ids name the
+  // level instead (see getAntigravityTierEffort).
+  if (getAPIProvider() === 'antigravity') {
+    return false
+  }
+  const supported3P = get3PModelCapabilityOverride(model, 'effort')
+  if (supported3P !== undefined) {
+    return supported3P
+  }
+  // Supported by the current Claude 4 and 5 model picker surface (Claude 5 on
+  // the Anthropic providers only; this reads the raw id, not getCanonicalName).
+  if (
+    (m.includes('opus-5') && claude5SupportApplies())
+    || m.includes('opus-4-8')
+    || m.includes('opus-4-7')
+    || m.includes('opus-4-6')
+    || m.includes('sonnet-5')
+    || m.includes('sonnet-4-6')
+  ) {
+    return true
+  }
+  // Exclude any other known legacy models (haiku, older opus/sonnet variants)
+  if (m.includes('haiku') || m.includes('sonnet') || m.includes('opus')) {
+    return false
+  }
+
+  // IMPORTANT: Do not change the default effort support without notifying
+  // the model launch DRI and research. This is a sensitive setting that can
+  // greatly affect model quality and bashing.
+
+  // Default to true for unknown model strings on 1P.
+  // Do not default to true for 3P as they have different formats for their
+  // model strings (ex. anthropics/claude-code#30795)
+  return getAPIProvider() === 'firstParty'
+}
+
+/**
+ * The level an Antigravity Claude 5.5 id runs at, e.g. 'low' for
+ * `claude-sonnet-5-5-low`, or undefined off Antigravity and for its other
+ * models. On Antigravity the id is the only effort control.
+ */
+export function getAntigravityTierEffort(model: string): EffortLevel | undefined {
+  if (getAPIProvider() !== 'antigravity') return undefined
+  return parseAntigravityClaudeTier(model)?.effort
+}
+
+// @[MODEL LAUNCH]: Add the new model to the allowlist if it supports 'max' effort.
+export function modelSupportsMaxEffort(model: string): boolean {
+  const supported3P = get3PModelCapabilityOverride(model, 'max_effort')
+  if (supported3P !== undefined) {
+    return supported3P
+  }
+  const normalized = model.toLowerCase()
+  if (
+    normalized.includes('opus-5')
+    || normalized.includes('opus-4-8')
+    || normalized.includes('opus-4-7')
+    || normalized.includes('opus-4-6')
+    || normalized.includes('sonnet-5')
+    || normalized.includes('sonnet-4-6')
+  ) {
+    return true
+  }
+  if (process.env.USER_TYPE === 'ant' && resolveAntModel(model)) {
+    return true
+  }
+  return false
+}
+
+// @[MODEL LAUNCH]: Add the new model to the allowlist if it supports 'xhigh' effort.
+export function modelSupportsXHighEffort(model: string): boolean {
+  const normalized = model.toLowerCase()
+  if (
+    normalized.includes('opus-5')
+    || normalized.includes('opus-4-8')
+    || normalized.includes('opus-4-7')
+    || normalized.includes('sonnet-5')
+  ) {
+    return true
+  }
+  if (process.env.USER_TYPE === 'ant' && resolveAntModel(model)) {
+    return true
+  }
+  return false
+}
+
+// 'ultracode' is a tau-local top effort tier, exposed ONLY on Claude Opus 4.8
+// reached over the native Anthropic Messages API (firstParty + Bedrock/Vertex/
+// Foundry — all of which flow through services/api/claude.ts, where
+// configureEffortParams() maps 'ultracode' to the strongest real effort on the
+// wire). Third-party providers (Copilot, Cursor, OpenRouter, ModelRouter, …)
+// reach Claude through their own effort/reasoning systems and must never see
+// this tier, so we exclude them explicitly. The Anthropic API has no
+// 'ultracode' effort of its own.
+export function modelSupportsUltracodeEffort(model: string): boolean {
+  if (isThirdPartyProvider(getAPIProvider())) {
+    return false
+  }
+  return model.toLowerCase().includes('opus-4-8')
+}
+
+/**
+ * Numeric values are model-default only and not persisted.
+ * Model support is checked at request time, not when saving preferences.
+ * Write sites call this before saving to settings so the Zod schema
+ * (which only accepts string levels) never rejects a write.
+ */
+export function toPersistableEffort(
+  value: EffortValue | undefined,
+): EffortLevel | undefined {
+  if (value === 'low' || value === 'medium' || value === 'high' || value === 'xhigh' || value === 'max') {
+    return value
+  }
+  if (
+    value === 'ultracode' &&
+    process.env.USER_TYPE === 'ant'
+  ) {
+    return value
+  }
+  return undefined
+}
+
+export function getInitialEffortSetting(): EffortLevel | undefined {
+  return toPersistableEffort(getInitialSettings().effortLevel)
+}
+
+/**
+ * Decide what effort level (if any) to persist when the user selects a model
+ * in ModelPicker. Keeps an explicit prior /effort choice sticky even when it
+ * matches the picked model's default, while letting purely-default and
+ * session-ephemeral effort (CLI --effort, EffortCallout default) fall through
+ * to undefined so it follows future model-default changes.
+ *
+ * priorPersisted must come from userSettings on disk
+ * (getSettingsForSource('userSettings')?.effortLevel), NOT merged settings
+ * (project/policy layers would leak into the user's global settings.json)
+ * and NOT AppState.effortValue (includes session-scoped sources that
+ * deliberately do not write to settings.json).
+ */
+export function resolvePickerEffortPersistence(
+  picked: EffortLevel | undefined,
+  modelDefault: EffortLevel,
+  priorPersisted: EffortLevel | undefined,
+  toggledInPicker: boolean,
+): EffortLevel | undefined {
+  const hadExplicit = priorPersisted !== undefined || toggledInPicker
+  return hadExplicit || picked !== modelDefault ? picked : undefined
+}
+
+/**
+ * Resolve the effort value that will actually be sent to the API for a given
+ * model, following the full precedence chain:
+ *   env CLAUDE_CODE_EFFORT_LEVEL → appState.effortValue → model default
+ *
+ * Returns undefined when no effort parameter should be sent (env set to
+ * 'unset', or no default exists for the model).
+ */
+export function resolveAppliedEffort(
+  model: string,
+  appStateEffortValue: EffortValue | undefined,
+): EffortValue | undefined {
+  const envOverride = getEffortEnvOverride()
+  if (envOverride === null) {
+    return undefined
+  }
+  if (!modelSupportsEffort(model)) {
+    return undefined
+  }
+  const resolved =
+    envOverride ?? appStateEffortValue ?? getDefaultEffortForModel(model)
+  // 'ultracode' only takes effect on first-party Opus 4.8. On every other model
+  // it degrades to the strongest effort that model does support, so a sticky
+  // 'ultracode' selection never leaks an invalid value onto another model/provider.
+  if (resolved === 'ultracode' && !modelSupportsUltracodeEffort(model)) {
+    return modelSupportsMaxEffort(model)
+      ? 'max'
+      : modelSupportsXHighEffort(model)
+        ? 'xhigh'
+        : 'high'
+  }
+  if (resolved === 'xhigh' && !modelSupportsXHighEffort(model)) {
+    return modelSupportsMaxEffort(model) ? 'max' : 'high'
+  }
+  // API rejects 'max' on unsupported models - downgrade to 'high'.
+  if (resolved === 'max' && !modelSupportsMaxEffort(model)) {
+    return 'high'
+  }
+  return resolved
+}
+
+/**
+ * Resolve the effort level to show the user. Wraps resolveAppliedEffort
+ * with the 'high' fallback (what the API uses when no effort param is sent).
+ * Single source of truth for the status bar and /effort output (CC-1088).
+ *
+ * For third-party providers: returns the provider-native effort when
+ * applicable (OpenAI reasoning), otherwise falls back to 'high'.
+ */
+export function getDisplayedEffortLevel(
+  model: string,
+  appStateEffort: EffortValue | undefined,
+): EffortLevel {
+  const tierEffort = getAntigravityTierEffort(model)
+  if (tierEffort) return tierEffort
+  const provider = getAPIProvider()
+  if (provider === 'commandcode' && supportsCommandCodeEffortSelection(model)) {
+    const effort = getCommandCodeEffort(model)
+    return effort === 'default' ? 'high' : effort
+  }
+  // OpenAI reasoning models have their own effort system
+  if (provider === 'openai' && modelSupportsReasoning(model)) {
+    return getOpenAIReasoningLevel(model, appStateEffort ?? null)
+  }
+  // Other third-party providers don't use Anthropic effort
+  if (isThirdPartyProvider(provider)) {
+    return 'high'
+  }
+  const resolved = resolveAppliedEffort(model, appStateEffort) ?? 'high'
+  return convertEffortValueToLevel(resolved)
+}
+
+/**
+ * Build the ` with {level} effort` suffix shown in Logo/Spinner.
+ * Returns empty string if the user hasn't explicitly set an effort value.
+ * Delegates to resolveAppliedEffort() so the displayed level matches what
+ * the API actually receives (including max→high clamp for non-Opus models).
+ *
+ * For third-party providers: shows the provider-native effort when
+ * applicable (e.g. OpenAI reasoning level), otherwise no suffix —
+ * Anthropic's effort system doesn't apply to them.
+ */
+export function getEffortSuffix(
+  model: string,
+  effortValue: EffortValue | undefined,
+): string {
+  const provider = getAPIProvider()
+  const native = getProviderEffort(provider, model, effortValue ?? null)
+  if (native) {
+    if (!native.supported || native.value === undefined || native.value === 'default') return ''
+    return native.label.startsWith('thinking ') ? ` with ${native.label}` : ` with ${native.label} effort`
+  }
+  // OpenAI reasoning models use their own effort system
+  if (provider === 'openai' && modelSupportsReasoning(model)) {
+    const level = getOpenAIReasoningLevel(model, effortValue ?? null)
+    return ` with ${level} effort`
+  }
+  // Other third-party providers don't use Anthropic effort — no suffix
+  if (isThirdPartyProvider(provider)) return ''
+  if (effortValue === undefined) return ''
+  const resolved = resolveAppliedEffort(model, effortValue)
+  if (resolved === undefined) return ''
+  return ` with ${convertEffortValueToLevel(resolved)} effort`
+}
+
+/**
+ * Get user-facing description for effort levels
+ *
+ * @param level The effort level to describe
+ * @returns Human-readable description
+ */
+export function getEffortLevelDescription(level: EffortLevel): string {
+  switch (level) {
+    case 'low':
+      return 'Quick, straightforward implementation with minimal overhead'
+    case 'medium':
+      return 'Balanced approach with standard implementation and testing'
+    case 'high':
+      return 'Comprehensive implementation with extensive testing and documentation'
+    case 'xhigh':
+      return 'Extra high reasoning for supported models'
+    case 'max':
+      return 'Maximum capability with deepest reasoning'
+    case 'ultracode':
+      return 'Ultracode — maximum reasoning, Claude Opus 4.8 only'
+  }
+}
+
+/**
+ * Get user-facing description for effort values (both string and numeric)
+ *
+ * @param value The effort value to describe
+ * @returns Human-readable description
+ */
+export function getEffortValueDescription(value: EffortValue): string {
+  if (process.env.USER_TYPE === 'ant' && typeof value === 'number') {
+    return `[ANT-ONLY] Numeric effort value of ${value}`
+  }
+
+  if (typeof value === 'string') {
+    return getEffortLevelDescription(value)
+  }
+  return 'Balanced approach with standard implementation and testing'
+}
+
+export type OpusDefaultEffortConfig = {
+  enabled: boolean
+  dialogTitle: string
+  dialogDescription: string
+}
+
+const OPUS_DEFAULT_EFFORT_CONFIG_DEFAULT: OpusDefaultEffortConfig = {
+  enabled: true,
+  dialogTitle: 'We recommend medium effort for Opus',
+  dialogDescription:
+    'Effort determines how long Claude thinks for when completing your task. We recommend medium effort for most tasks to balance speed and intelligence and maximize rate limits. Use ultrathink to trigger high effort when needed.',
+}
+
+export function getOpusDefaultEffortConfig(): OpusDefaultEffortConfig {
+  const config = getFeatureValue_CACHED_MAY_BE_STALE(
+    'tengu_grey_step2',
+    OPUS_DEFAULT_EFFORT_CONFIG_DEFAULT,
+  )
+  return {
+    ...OPUS_DEFAULT_EFFORT_CONFIG_DEFAULT,
+    ...config,
+  }
+}
+
+// @[MODEL LAUNCH]: Update the default effort levels for new models
+export function getDefaultEffortForModel(
+  model: string,
+): EffortValue | undefined {
+  if (process.env.USER_TYPE === 'ant') {
+    const config = getAntModelOverrideConfig()
+    const isDefaultModel =
+      config?.defaultModel !== undefined &&
+      model.toLowerCase() === config.defaultModel.toLowerCase()
+    if (isDefaultModel && config?.defaultModelEffortLevel) {
+      return config.defaultModelEffortLevel
+    }
+    const antModel = resolveAntModel(model)
+    if (antModel) {
+      if (antModel.defaultEffortLevel) {
+        return antModel.defaultEffortLevel
+      }
+      if (antModel.defaultEffortValue !== undefined) {
+        return antModel.defaultEffortValue
+      }
+    }
+    // Always default ants to undefined/high
+    return undefined
+  }
+
+  // IMPORTANT: Do not change the default effort level without notifying
+  // the model launch DRI and research. Default effort is a sensitive setting
+  // that can greatly affect model quality and bashing.
+
+  // Claude Opus 5.5 runs at medium when a request names no effort (Opus 5
+  // runs at high). Naming it keeps the level Tau shows equal to the level
+  // the API applies, instead of the 'high' fallback the display assumes.
+  if (model.toLowerCase().includes('opus-5-5') && claude5SupportApplies()) {
+    return 'medium'
+  }
+
+  // Default effort on current Opus models to medium for Pro.
+  // Max/Team also get medium when the tengu_grey_step2 config is enabled.
+  if (
+    model.toLowerCase().includes('opus-4-8')
+    || model.toLowerCase().includes('opus-4-7')
+    || model.toLowerCase().includes('opus-4-6')
+  ) {
+    if (isProSubscriber()) {
+      return 'medium'
+    }
+    if (
+      getOpusDefaultEffortConfig().enabled &&
+      (isMaxSubscriber() || isTeamSubscriber())
+    ) {
+      return 'medium'
+    }
+  }
+
+  // When ultrathink feature is on, default effort to medium (ultrathink bumps to high)
+  if (isUltrathinkEnabled() && modelSupportsEffort(model)) {
+    return 'medium'
+  }
+
+  // Fallback to undefined, which means we don't set an effort level. This
+  // should resolve to high effort level in the API.
+  return undefined
+}
