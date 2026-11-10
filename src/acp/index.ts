@@ -4,18 +4,18 @@ import { TauEngineBackend } from './tauBackend.js'
 import { TauAcpAgent } from './agent.js'
 
 /**
- * Start the Tau ACP agent server over stdio (the `tau acp` subcommand).
+ * Start the OIO ACP agent server over stdio (the `tau acp` subcommand).
  *
  * The editor (Zed, JetBrains 2026.1+, the VS Code ACP Client extension, …)
  * spawns this process and speaks JSON-RPC over stdin/stdout. Resolves when the
  * connection closes.
  *
  * IMPORTANT: stdout is the protocol channel — nothing else may write to it.
- * All diagnostics must go to stderr (or a log file). Callers must ensure Tau's
+ * All diagnostics must go to stderr (or a log file). Callers must ensure OIO's
  * loggers are not pointed at stdout before invoking this.
  *
  * @param backend  The agent engine. Defaults to {@link TauEngineBackend},
- *                 which runs the real Tau agent (via a headless subprocess).
+ *                 which runs the real OIO agent (via a headless subprocess).
  *                 Pass {@link EchoBackend} to exercise the protocol without
  *                 invoking the model.
  */
@@ -39,7 +39,7 @@ export function runAcpServer(
   const fromClient = new ReadableStream<Uint8Array>({
     start(controller) {
       process.stdin.on('data', (chunk: Buffer | string) => {
-        // Tau's startup may have put stdin in string mode (setEncoding('utf8')),
+        // OIO's startup may have put stdin in string mode (setEncoding('utf8')),
         // in which case 'data' yields strings, not Buffers. new Uint8Array(str)
         // would silently produce a zero-filled array, so encode strings to
         // bytes explicitly. Buffers are copied into a plain Uint8Array.

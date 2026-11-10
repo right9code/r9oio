@@ -171,7 +171,7 @@ export type ToolSearchMode = 'tst' | 'tst-auto' | 'standard'
 
 /**
  * Native non-Anthropic lanes have their own tool-loading path. This is not
- * Anthropic `defer_loading` / `tool_reference` support: Tau keeps ToolSearch
+ * Anthropic `defer_loading` / `tool_reference` support: OIO keeps ToolSearch
  * available, filters deferred schemas before the native request, then loads
  * matched schemas into later native tool/function declarations.
  *

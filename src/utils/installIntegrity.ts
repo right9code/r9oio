@@ -14,7 +14,7 @@
  * installed tree via the package's own dependency-free
  * scripts/verify-deps.mjs. A healthy launcher remains in place until npm has
  * successfully replaced it, so a network/install failure does not needlessly
- * strand the existing Tau installation without its command.
+ * strand the existing OIO installation without its command.
  */
 
 import { existsSync } from 'fs'
@@ -152,7 +152,7 @@ async function classifyShim(
 
 /**
  * Remove only dangling `tau`/`claudex` launcher shims in the global bin dir.
- * A healthy Tau-owned launcher is intentionally preserved until npm succeeds;
+ * A healthy OIO-owned launcher is intentionally preserved until npm succeeds;
  * removing it here would turn a network or install failure into a broken
  * existing command. A later, confirmed EEXIST failure has its own narrowly
  * scoped removal-and-retry path below.
@@ -206,7 +206,7 @@ export function extractEexistPath(npmOutput: string): string | null {
 }
 
 /**
- * Remove an EEXIST-conflicting Tau shim and its sibling variants.
+ * Remove an EEXIST-conflicting OIO shim and its sibling variants.
  * Refuse paths outside the expected global bin directory and foreign files.
  */
 export async function removeConflictingShim(
@@ -231,7 +231,7 @@ export async function removeConflictingShim(
 
   if (!expectedPaths.has(normalizeForComparison(basePath))) {
     logForDebugging(
-      `installIntegrity: refused EEXIST path outside Tau's global bin directory: ${filePath}`,
+      `installIntegrity: refused EEXIST path outside OIO's global bin directory: ${filePath}`,
     )
     return false
   }

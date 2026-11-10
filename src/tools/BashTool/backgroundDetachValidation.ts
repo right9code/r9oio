@@ -7,7 +7,7 @@ import {
 /**
  * Detect commands that detach a process with a raw `&`.
  *
- * Detached processes are invisible to Tau's task tracking — they cannot be
+ * Detached processes are invisible to OIO's task tracking — they cannot be
  * listed or stopped later, and they keep holding ports and file locks (the
  * classic source of "Device or resource busy" retry loops when the model
  * later tries to restart a server or delete its database).
@@ -476,7 +476,7 @@ export function buildDetachedBackgroundValidationMessage(
   const cliDetachPattern = detectCliDetachPattern(command)
   if (cliDetachPattern === null) return null
 
-  return `Blocked: ${cliDetachPattern}. Detached containers are untracked - Tau cannot stop them later and they can keep ports and files locked. Remove Docker detach flags such as \`-d\`, \`--detach\`, \`docker compose up -d\`, and \`docker run -d\`; run the foreground form with run_in_background: true instead.`
+  return `Blocked: ${cliDetachPattern}. Detached containers are untracked - OIO cannot stop them later and they can keep ports and files locked. Remove Docker detach flags such as \`-d\`, \`--detach\`, \`docker compose up -d\`, and \`docker run -d\`; run the foreground form with run_in_background: true instead.`
 }
 
 function hasUnquotedForegroundStdinTopology(command: string): boolean {

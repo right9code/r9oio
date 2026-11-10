@@ -3,7 +3,7 @@
  * TAU_ANTIGRAVITY_TRAJECTORY=0 turns it off.
  *
  * The native Antigravity client tags every generation with its conversation's
- * trajectory. Google accepts the same tags from Tau, though they did not by
+ * trajectory. Google accepts the same tags from OIO, though they did not by
  * themselves stop the cold follow-ups seen on 3.8 Flash. This sends only the
  * parts whose names, formats and lifetimes are verified against the native
  * client:

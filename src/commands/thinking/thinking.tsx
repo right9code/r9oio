@@ -63,7 +63,7 @@ function showHelp(
     `  ${chalk.dim('thinking=off + any model')}            ${chalk.blue('->')} No thinking param sent`,
     '',
     chalk.dim('Thinking allows the model to reason step-by-step before answering.'),
-    chalk.dim('Supported: Tau 4+ (1P), DeepSeek Reasoner, Kimi K2 Thinking.'),
+    chalk.dim('Supported: OIO 4+ (1P), DeepSeek Reasoner, Kimi K2 Thinking.'),
   ]
   onDone(lines.join('\n'), { display: 'system' })
 }
@@ -135,7 +135,7 @@ function ApplyThinkingAndClose({
       if (isThirdPartyProvider(provider)) {
         lines.push(
           chalk.dim(
-            'Thinking-capable models: DeepSeek Reasoner, Kimi K2 Thinking, Tau 4+ (via OpenRouter).',
+            'Thinking-capable models: DeepSeek Reasoner, Kimi K2 Thinking, OIO 4+ (via OpenRouter).',
           ),
         )
       }

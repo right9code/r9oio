@@ -2,7 +2,7 @@
  * Decides what a phone on the same Wi-Fi can dial to reach this session.
  *
  * lan.ts reads this machine's adapters; this module decides whether any of
- * them is reachable at all, which depends on where Tau runs:
+ * them is reachable at all, which depends on where OIO runs:
  *
  *   Windows, macOS, Linux, WSL 1  the adapters are the machine's own.
  *   WSL 2, mirrored networking    the distro shares Windows' adapters.

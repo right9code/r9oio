@@ -5,12 +5,12 @@ import { Box, Text, useAnimationFrame } from '../../ink.js'
 import { getInitialSettings } from '../../utils/settings/settings.js'
 import { hueToRgb, toRGBColor } from '../Spinner/utils.js'
 
-// Tau brand hue range: violet (270) → cyan (180) → green (120), cycling
+// OIO brand hue range: violet (270) → cyan (180) → green (120), cycling
 const TAU_HUE_START = 270  // violet
 const TAU_HUE_RANGE = 150  // sweeps 270→120 then back
 const CYCLE_MS = 3000      // full cycle period
 
-// Settled color: electric cyan-mint (Tau brand)
+// Settled color: electric cyan-mint (OIO brand)
 const SETTLED_COLOR = toRGBColor({ r: 120, g: 255, b: 220 })
 
 function tauPulse(time: number): { r: number; g: number; b: number } {

@@ -1,10 +1,10 @@
 import type { ContentBlock, ToolKind } from '@agentclientprotocol/sdk'
 
 /**
- * Translation helpers between ACP wire types and Tau-facing shapes.
+ * Translation helpers between ACP wire types and OIO-facing shapes.
  *
  * Inbound only for now: ACP prompt content blocks → a plain prompt string.
- * (Outbound SDKMessage → session/update mapping lives in the real Tau backend,
+ * (Outbound SDKMessage → session/update mapping lives in the real OIO backend,
  * where the SDKMessage stream originates.)
  */
 
@@ -55,7 +55,7 @@ export function promptToText(blocks: ContentBlock[]): string {
 }
 
 /**
- * Best-effort mapping from a Tau tool name to an ACP {@link ToolKind}, used to
+ * Best-effort mapping from a OIO tool name to an ACP {@link ToolKind}, used to
  * pick the icon/affordance the editor renders. Falls back to "other".
  */
 export function toolKindFromName(toolName: string): ToolKind {

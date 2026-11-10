@@ -104,7 +104,7 @@ function tokenCount(value: unknown): number {
 /**
  * The gateway reports OpenAI-style usage: `prompt_tokens` includes cache
  * reads (`prompt_tokens_details.cached_tokens`) and cache writes
- * (`cache_creation_input_tokens`), which is how Cline's SDK prices it. Tau
+ * (`cache_creation_input_tokens`), which is how Cline's SDK prices it. OIO
  * counts the three separately, Anthropic style.
  */
 export function clineUsageFromRaw(raw: RawClineUsage | null): NormalizedUsage {

@@ -1,7 +1,7 @@
 /**
  * OpenCode Zen / Go routing: every row goes to the gateway route the official
  * client uses for it, in that route's wire format, and the reply comes back
- * as the Anthropic stream Tau consumes.
+ * as the Anthropic stream OIO consumes.
  *
  * Run: bun run src/lanes/openai-compat/opencode_routes.test.ts
  */

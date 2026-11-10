@@ -18,7 +18,7 @@
  *   glm-5.2         Default / None / Minimal / … / Max     (effort only)
  *   qwen3-max       (no chip — the row does not reason)
  *
- * `Default` is a Tau-side stop meaning "no per-model override": the session's
+ * `Default` is a OIO-side stop meaning "no per-model override": the session's
  * own thinking setting drives the row, through whichever fields it published.
  * It is where every row starts, and it is what makes `/thinking` reach this
  * provider at all — Model Studio turns thinking ON by default on the hybrid
@@ -42,7 +42,7 @@ import { selectInheritedEffort, type EffortFallback } from './effortInheritance.
 import { getAlibabaModelMeta } from './alibabaCatalog.js'
 
 /**
- * One stop on a model's ladder. Either a Tau-side stop (`default`, `off`,
+ * One stop on a model's ladder. Either a OIO-side stop (`default`, `off`,
  * `on`) or a `reasoning_effort` value the model itself published — which is
  * why this is a string rather than a closed union: the values come from the
  * catalogue at runtime and differ per model.

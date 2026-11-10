@@ -1,7 +1,7 @@
 /**
- * Tau hints protocol.
+ * OIO hints protocol.
  *
- * CLIs and SDKs running under Tau can emit a self-closing
+ * CLIs and SDKs running under OIO can emit a self-closing
  * `<claude-code-hint />` tag to stderr (merged into stdout by the shell
  * tools). The harness scans tool output for these tags, strips them before
  * the output reaches the model, and surfaces an install prompt to the

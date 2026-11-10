@@ -7,7 +7,7 @@
  * (Anthropic, Alibaba Qwen, MiniMax) cache only what carries `cache_control`,
  * so without a marker every turn is a full-price miss.
  *
- * Tau's shared layer marks the Anthropic-format request, but those markers do
+ * OIO's shared layer marks the Anthropic-format request, but those markers do
  * not survive the conversion to chat-completions, so the lane places its own.
  * The shapes are the ones Cline's SDK sends to this same endpoint
  * (sdk/packages/llms: routing/anthropic-compatible.ts, providers/ai-sdk.ts):

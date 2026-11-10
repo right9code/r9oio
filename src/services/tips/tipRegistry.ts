@@ -341,7 +341,7 @@ const externalTips: Tip[] = [
   {
     id: 'paste-images-mac',
     content: async () =>
-      'Paste images into Tau using control+v (not cmd+v!)',
+      'Paste images into OIO using control+v (not cmd+v!)',
     cooldownSessions: 10,
     isRelevant: async () => getPlatform() === 'macos',
   },
@@ -423,7 +423,7 @@ const externalTips: Tip[] = [
   {
     id: 'desktop-app',
     content: async () =>
-      'Run Tau locally or remotely using the desktop app: clau.de/desktop',
+      'Run OIO locally or remotely using the desktop app: clau.de/desktop',
     cooldownSessions: 15,
     isRelevant: async () => getPlatform() !== 'linux',
   },
@@ -431,7 +431,7 @@ const externalTips: Tip[] = [
     id: 'desktop-shortcut',
     content: async ctx => {
       const blue = color('suggestion', ctx.theme)
-      return `Continue your session in Tau Desktop with ${blue('/desktop')}`
+      return `Continue your session in OIO Desktop with ${blue('/desktop')}`
     },
     cooldownSessions: 15,
     isRelevant: async () => false,
@@ -446,7 +446,7 @@ const externalTips: Tip[] = [
   {
     id: 'mobile-app',
     content: async () =>
-      '/mobile to use Tau from the Claude app on your phone',
+      '/mobile to use OIO from the Claude app on your phone',
     cooldownSessions: 15,
     isRelevant: async () => true,
   },

@@ -19,7 +19,7 @@
  *   openai/gpt-5.5-chat      does not reason — no chip
  *
  * Sending an effort a model has not published is a 400 from the upstream, and
- * `low/medium/high` — the only values Tau's own thinking budget speaks — is not
+ * `low/medium/high` — the only values OIO's own thinking budget speaks — is not
  * even a subset of every ladder (`["max","high","low"]` has no `medium`). So
  * the ladder is read per model out of OpenRouter's own catalogue and rendered
  * verbatim, the same way alibabaCatalog.ts reads models.dev.
@@ -87,7 +87,7 @@ interface CacheFile {
  * Only the ORDER is stated here — never which values a model has. OpenRouter
  * publishes its own lists strongest-first, and a value this table has never
  * heard of still rides along (appended in the order OpenRouter listed it), so
- * a new rung appears on the chip without a Tau release.
+ * a new rung appears on the chip without a OIO release.
  */
 const EFFORT_RANK: Readonly<Record<string, number>> = {
   none: 0,

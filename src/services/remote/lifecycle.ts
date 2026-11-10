@@ -98,7 +98,7 @@ export class WslNatError extends Error {
   constructor(readonly networkingMode: string) {
     const label = networkingMode === 'nat' ? 'NAT' : networkingMode
     super(
-      `Tau is running inside WSL 2 with ${label} networking, which hides it from your Wi-Fi.`,
+      `OIO is running inside WSL 2 with ${label} networking, which hides it from your Wi-Fi.`,
     )
     this.name = 'WslNatError'
   }

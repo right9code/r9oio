@@ -439,7 +439,7 @@ export type AnimationBox = {
  *
  * The encoder is synchronous JavaScript, and a frame of real content keeps it
  * busy for tens to hundreds of milliseconds. On the main thread every one of
- * those is a stall in typing and in every other frame Tau draws. Where the
+ * those is a stall in typing and in every other frame OIO draws. Where the
  * worker cannot run — the `sixel` package cannot be resolved from here, or the
  * runtime refuses workers — frames are encoded on the main thread instead, one
  * at a time, each followed by a pause as long as it took, so the main thread is

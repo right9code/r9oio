@@ -95,7 +95,7 @@ function Web({
           logEvent('tengu_remote_setup_result', {
             result: 'not_signed_in' as SafeString
           });
-          onDone('Not signed in to Tau. Run /login first.');
+          onDone('Not signed in to OIO. Run /login first.');
           return;
         case 'gh_not_installed':
         case 'gh_not_authenticated':
@@ -153,13 +153,13 @@ function Web({
     return <LoadingState message="Checking login status…" />;
   }
   if (step.name === 'uploading') {
-    return <LoadingState message="Connecting GitHub to Tau…" />;
+    return <LoadingState message="Connecting GitHub to OIO…" />;
   }
   const token = step.token;
-  return <Dialog title="Connect Tau on the web to GitHub?" onCancel={handleCancel} hideInputGuide>
+  return <Dialog title="Connect OIO on the web to GitHub?" onCancel={handleCancel} hideInputGuide>
       <Box flexDirection="column">
         <Text>
-          Tau on the web requires connecting to your GitHub account to clone
+          OIO on the web requires connecting to your GitHub account to clone
           and push code on your behalf.
         </Text>
         <Text dimColor>

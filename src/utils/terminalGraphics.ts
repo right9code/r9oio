@@ -342,7 +342,7 @@ let da1Params: readonly number[] | null = null
  * Whether DA1 was answered by an old Windows console host instead of the
  * terminal.
  *
- * On Windows, ConPTY sits between Tau and the terminal, and so it does for WSL
+ * On Windows, ConPTY sits between OIO and the terminal, and so it does for WSL
  * and SSH sessions opened from that terminal. Before Windows Terminal 1.22 it
  * answered DA1 itself, instantly, while passing the pixel-size queries on — so
  * the DA1 barrier closes before the terminal's own replies arrive. Worse, it
@@ -507,7 +507,7 @@ export function fitGraphicsToCells(
  *
  * Ids are a shared namespace across every client writing to the terminal, and
  * transmitting with an id already in use replaces that image. Starting from a
- * random point in the low 24 bits keeps two Tau sessions — or Tau beside any
+ * random point in the low 24 bits keeps two OIO sessions — or OIO beside any
  * other image-drawing program — from silently clobbering each other, which is
  * the failure the protocol warns about for clients that just count from 1.
  */

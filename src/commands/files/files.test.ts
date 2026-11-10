@@ -124,7 +124,7 @@ await test('empty cache', async () => {
 
 await test('header counts every tracked file', async () => {
   const value = await run(cacheWith(all))
-  assert.equal(value.split('\n')[0], `Files Tau counts as read (${all.length}):`)
+  assert.equal(value.split('\n')[0], `Files OIO counts as read (${all.length}):`)
 })
 
 await test('sorted: project-relative, ~ under home, absolute elsewhere', async () => {

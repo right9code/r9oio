@@ -30,11 +30,11 @@ export function ThinkingToggle(t0) {
     t1 = [{
       value: "true",
       label: "Enabled",
-      description: "Tau will think before responding"
+      description: "OIO will think before responding"
     }, {
       value: "false",
       label: "Disabled",
-      description: "Tau will respond without extended thinking"
+      description: "OIO will respond without extended thinking"
     }];
     $[0] = t1;
   } else {

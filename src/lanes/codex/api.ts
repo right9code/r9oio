@@ -466,9 +466,9 @@ export class CodexApiClient {
   }
 
   /**
-   * Adopt the outer Tau session/conversation id as Codex's cache affinity
+   * Adopt the outer OIO session/conversation id as Codex's cache affinity
    * key. Native codex uses one conversation_id for `prompt_cache_key`,
-   * `session_id`, and `x-client-request-id`; using Tau's session id keeps
+   * `session_id`, and `x-client-request-id`; using OIO's session id keeps
    * those bytes stable across shim re-instantiation and resume paths.
    */
   setSessionCacheKey(sessionId: string | undefined): void {

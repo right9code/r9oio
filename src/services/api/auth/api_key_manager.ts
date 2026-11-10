@@ -99,7 +99,7 @@ export function saveProviderKey(provider: string, key: string): void {
 /**
  * Load a stored API key for a provider.
  * Pass `{ fresh: true }` when a caller must observe credentials changed by
- * another Tau process instead of using this process's short-lived snapshot.
+ * another OIO process instead of using this process's short-lived snapshot.
  * Returns null if no key is stored.
  */
 export function loadProviderKey(provider: string, options?: { fresh?: boolean }): string | null {

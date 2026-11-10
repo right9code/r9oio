@@ -1,7 +1,7 @@
 /**
  * OpenRouter transformer.
  *
- * - Injects OpenRouter app-attribution headers so rankings credit Tau
+ * - Injects OpenRouter app-attribution headers so rankings credit OIO
  *   under the CLI agent category.
  * - cache_control is PASSED THROUGH on OpenRouter broadly. OpenRouter's chat
  *   schema accepts cache_control on content parts and function tools, and

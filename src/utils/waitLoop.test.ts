@@ -110,7 +110,7 @@ test('reading the log counts as checking the task, whatever the path style', () 
 })
 
 test('a check on the task counts even when its output changed', () => {
-  // A progressing log is still polling: Tau reports the finish either way.
+  // A progressing log is still polling: OIO reports the finish either way.
   const verdicts = run([0, 1, 2].map(i => [
     call('TaskOutput', { task_id: install.id }, `Resolved ${i * 100} packages`),
   ]))
@@ -214,25 +214,25 @@ test('real work after a nudge restarts the countdown', () => {
 const withRepeatReminder = (result: string) =>
   `${result}\n\n<system-reminder>\nYou have called Bash 3 times in a row with identical arguments.\n</system-reminder>`
 
-test("Tau's own reminder in a result does not make an unchanged answer look new", () => {
+test("OIO's own reminder in a result does not make an unchanged answer look new", () => {
   const plain = socketCount('8')
   const reminded = { ...plain, resultText: withRepeatReminder('8') }
   const verdicts = run([[plain], [plain], [reminded], [plain], [reminded], [plain]])
   assertEqual(actions(verdicts), 'none,none,nudge,none,none,stop')
 })
 
-test('with nothing running, a repeat Tau already reminded about gets no second message', () => {
+test('with nothing running, a repeat OIO already reminded about gets no second message', () => {
   const status = call('Bash', { command: 'gh run view 123' }, '{"status":"in_progress"}')
   const reminded = { ...status, resultText: withRepeatReminder(status.resultText) }
-  // Back to back: the 3rd result carries Tau's reminder, so the guard stays quiet.
+  // Back to back: the 3rd result carries OIO's reminder, so the guard stays quiet.
   assertEqual(actions(run([[status], [status], [reminded], [status]], () => [])), 'none,none,none,none')
-  // In a cycle Tau's reminder never fires (it counts consecutive calls only); the guard does.
+  // In a cycle OIO's reminder never fires (it counts consecutive calls only); the guard does.
   const other = call('Read', { file_path: 'a.ts' }, 'same')
   const cycle = run([[status], [other], [status], [other], [status]], () => [])
   assertEqual(actions(cycle), 'none,none,none,none,nudge')
 })
 
-test('while waiting, the nudge goes even if Tau reminded: only it says a notification is coming', () => {
+test('while waiting, the nudge goes even if OIO reminded: only it says a notification is coming', () => {
   const plain = socketCount('8')
   const reminded = { ...plain, resultText: withRepeatReminder('8') }
   const verdicts = run([[plain], [plain], [reminded]])

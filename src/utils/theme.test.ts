@@ -18,7 +18,7 @@ function contrast(a: string, b: string): number {
 
 afterEach(() => setPowerModeTheme('normal', { animate: false }))
 
-describe('Tau themes', () => {
+describe('OIO themes', () => {
   test('offers exactly the three requested palettes', () => {
     expect(THEME_NAMES).toEqual(['dark', 'catppuccin-macchiato', 'light'])
   })

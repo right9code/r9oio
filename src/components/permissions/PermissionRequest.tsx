@@ -124,18 +124,18 @@ export type ToolUseConfirm<Input extends AnyObject = AnyObject> = {
 function getNotificationMessage(toolUseConfirm: ToolUseConfirm): string {
   const toolName = toolUseConfirm.tool.userFacingName(toolUseConfirm.input as never);
   if (toolUseConfirm.tool === ExitPlanModeV2Tool) {
-    return 'Tau needs your approval for the plan';
+    return 'OIO needs your approval for the plan';
   }
   if (toolUseConfirm.tool === EnterPlanModeTool) {
-    return 'Tau wants to enter plan mode';
+    return 'OIO wants to enter plan mode';
   }
   if (feature('REVIEW_ARTIFACT') && toolUseConfirm.tool === ReviewArtifactTool) {
-    return 'Tau needs your approval for a review artifact';
+    return 'OIO needs your approval for a review artifact';
   }
   if (!toolName || toolName.trim() === '') {
-    return 'Tau needs your attention';
+    return 'OIO needs your attention';
   }
-  return `Tau needs your permission to use ${toolName}`;
+  return `OIO needs your permission to use ${toolName}`;
 }
 
 // TODO: Move this to Tool.renderPermissionRequest

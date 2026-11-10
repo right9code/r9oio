@@ -198,7 +198,7 @@ function EnableBypassDialog({
     >
       <Box flexDirection="column" gap={1}>
         <Text>
-          Tau will not ask for your approval before running potentially
+          OIO will not ask for your approval before running potentially
           dangerous commands.
         </Text>
         <Text>

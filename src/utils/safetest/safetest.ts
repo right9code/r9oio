@@ -154,7 +154,7 @@ export async function runSafetestFromArgs(
       output: [
         'Safetest is not logged in to E2B yet.',
         '',
-        'Run /login, pick "E2B Security", and Tau will open the dashboard so',
+        'Run /login, pick "E2B Security", and OIO will open the dashboard so',
         'you can paste your API key. After that, /safetest works with no extra setup.',
       ].join('\n'),
       ranSandbox: false,

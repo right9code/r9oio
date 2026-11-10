@@ -534,7 +534,7 @@ const CURSOR_EXTRA_TOOL_REGISTRY: LaneToolRegistration[] = [
       properties: {
         command: { type: 'string', description: 'Shell command to execute. Do not include raw shell backgrounding with &, nohup, disown, echo $!, docker compose up -d, or docker run -d.' },
         description: { type: 'string', description: 'Brief description for the command.' },
-        is_background: { type: 'boolean', description: 'Set true for long-running servers/watchers, port-forwards, tunnels, and foreground container runs. Tau tracks and can stop the background task; remove shell-level detaching from command.' },
+        is_background: { type: 'boolean', description: 'Set true for long-running servers/watchers, port-forwards, tunnels, and foreground container runs. OIO tracks and can stop the background task; remove shell-level detaching from command.' },
       },
       required: ['command'],
     },

@@ -4,7 +4,7 @@
  * Unlike most providers, LXD publishes the effort ladder per model in its
  * own `/v1/models` document (`capabilities.reasoning_efforts`), so there is
  * no ladder hardcoded here -- `lxdEffortLevelsFor` reads it out of
- * `lxdCatalog` and simply prepends the Tau-side "Default" stop (send no
+ * `lxdCatalog` and simply prepends the OIO-side "Default" stop (send no
  * `reasoning_effort` field at all and let LXD's own default stand).
  *
  * That means the chip is genuinely different per row, which is what the API
@@ -44,7 +44,7 @@ export function lxdEffortLevelsFor(model: string): readonly LxdEffort[] {
   return ['default', ...efforts]
 }
 
-/** Whether Tau should expose a selectable thinking effort for this model. */
+/** Whether OIO should expose a selectable thinking effort for this model. */
 export function supportsLxdEffortSelection(model: string): boolean {
   return lxdEffortLevelsFor(model).length > 1
 }
@@ -138,7 +138,7 @@ export function cycleLxdEffort(
 /**
  * The value to put on the wire, or null when the row should carry no
  * `reasoning_effort` field at all ("Default" -- let LXD decide). 'default' is
- * a Tau-side stop, never a wire value, so it is excluded from the return type.
+ * a OIO-side stop, never a wire value, so it is excluded from the return type.
  */
 export function resolveLxdRequestEffort(
   model: string,

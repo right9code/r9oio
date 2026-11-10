@@ -160,7 +160,7 @@ export function refuseWithCurrentContent(
     display !== undefined
       ? ''
       : ' (the line-number prefixes are not part of the file)'
-  return `${lead} Tau read it for you now${scope}, which counts as your Read. ${redo}${note}:\n${shown}`
+  return `${lead} OIO read it for you now${scope}, which counts as your Read. ${redo}${note}:\n${shown}`
 }
 
 /**

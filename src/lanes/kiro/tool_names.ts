@@ -1,24 +1,24 @@
 /**
- * Bidirectional tool name mapping between Tau (Anthropic-format)
+ * Bidirectional tool name mapping between OIO (Anthropic-format)
  * tool names and Kiro's native tool names.
  *
  * Kiro models are post-trained on their native tool names (shell, read,
- * write, grep, glob, web_search, web_fetch, etc.). Tau uses
+ * write, grep, glob, web_search, web_fetch, etc.). OIO uses
  * Anthropic-format names (Bash, Read, Write, Grep, Glob, WebSearch,
  * WebFetch, etc.). This module maps between the two so:
  *
  *   1. Tools sent to the CodeWhisperer API use Kiro-native names.
- *   2. Tool calls returned by Kiro are mapped back to Tau names
+ *   2. Tool calls returned by Kiro are mapped back to OIO names
  *      before passing to context.executeTool().
  *
  * NOTE: Only 1:1 mappings are listed here. Tools that would create
  * duplicates (e.g. PowerShell → shell when Bash → shell already exists)
  * are excluded — the dedup logic in _buildToolSpecs handles those.
  * Edit is kept as-is because Kiro has no equivalent (Kiro's "write"
- * covers both create and edit, but Tau separates them).
+ * covers both create and edit, but OIO separates them).
  */
 
-/** Tau tool name → Kiro native tool name */
+/** OIO tool name → Kiro native tool name */
 const CLAUDEX_TO_KIRO: Record<string, string> = {
   // Shell — Bash on Unix, PowerShell on Windows; only one is active
   Bash:        'shell',
@@ -41,10 +41,10 @@ const CLAUDEX_TO_KIRO: Record<string, string> = {
 
 const SHELL_TOOL_NAMES = new Set(['Bash', 'PowerShell'])
 
-/** Kiro native tool name → Tau tool name (reverse map) */
+/** Kiro native tool name → OIO tool name (reverse map) */
 const KIRO_TO_CLAUDEX: Record<string, string> = {}
 for (const [claudex, kiro] of Object.entries(CLAUDEX_TO_KIRO)) {
-  // First Tau name wins (Bash beats PowerShell for 'shell')
+  // First OIO name wins (Bash beats PowerShell for 'shell')
   if (!(kiro in KIRO_TO_CLAUDEX)) {
     KIRO_TO_CLAUDEX[kiro] = claudex
   }
@@ -80,7 +80,7 @@ export function sanitizeKiroToolName(name: string): string {
 }
 
 /**
- * Map a Tau tool name to the Kiro-native name the model was trained
+ * Map a OIO tool name to the Kiro-native name the model was trained
  * on, sanitized to Kiro's allowed shape. Returns the (sanitized) original
  * name if no mapping exists (e.g. MCP tools, Edit which has no Kiro equivalent).
  */
@@ -89,9 +89,9 @@ export function toKiroToolName(claudexName: string): string {
 }
 
 /**
- * Build a session reverse map (Kiro-sanitized name → Tau name) from the live
+ * Build a session reverse map (Kiro-sanitized name → OIO name) from the live
  * tool list, so tool calls Kiro returns map back exactly even when the outgoing
- * name was sanitized. First Tau name wins on collision (mirrors the spec-build
+ * name was sanitized. First OIO name wins on collision (mirrors the spec-build
  * dedup in request.ts).
  */
 export function buildKiroToolNameReverseMap(
@@ -135,7 +135,7 @@ export function isKiroShellCandidate(claudexName: string): boolean {
 }
 
 /**
- * Map a Kiro-native tool name back to the Tau tool name for
+ * Map a Kiro-native tool name back to the OIO tool name for
  * execution. Returns the original name if no mapping exists.
  */
 export function toClaudexToolName(

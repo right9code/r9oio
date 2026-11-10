@@ -8,7 +8,7 @@
  * multi-turn). This route sends everything that keeps the prefix cache
  * hitting:
  *
- *   - `prompt_cache_key` and the `x-grok-conv-id` header, both the stable Tau
+ *   - `prompt_cache_key` and the `x-grok-conv-id` header, both the stable OIO
  *     session id, so every request of a conversation reaches the server that
  *     holds its cache (xAI caches per server).
  *   - Encrypted reasoning requested (`include: ["reasoning.encrypted_content"]`
@@ -19,11 +19,11 @@
  *     item, every tool's full schema up front in a per-conversation order that
  *     only ever appends, and history that is replayed byte-for-byte.
  *
- * Tools: every tool Tau offers, built-in and MCP, goes out with its whole
+ * Tools: every tool OIO offers, built-in and MCP, goes out with its whole
  * contract — the Codex lane's deterministic schema sanitizer (local $refs
  * inlined, the root forced to an object as xAI's tool grammar requires), a
  * STRICT PARAMETERS summary in each description, and `strict: false` so
- * optional fields stay optional. Tau validates every call against the full
+ * optional fields stay optional. OIO validates every call against the full
  * schema before it runs.
  */
 
@@ -122,7 +122,7 @@ const TOOL_ORDER_LIMIT = 256
 const toolOrders = new Map<string, Map<string, XaiFunctionTool>>()
 
 /**
- * Per-conversation tool order. Tau lists tools sorted, so an MCP server that
+ * Per-conversation tool order. OIO lists tools sorted, so an MCP server that
  * connects mid-conversation would insert its tools in the middle of the block
  * and void the cache behind them. A conversation keeps the order its tools
  * were first sent in: a new tool is appended, and a tool keeps its first
@@ -162,7 +162,7 @@ function isQuarantined(tool: XaiFunctionTool): boolean {
 
 /**
  * The MCP tool a 400 names, when xAI could not compile its schema into a tool
- * grammar. Built-in tools are never left out: a rejection there is a Tau bug
+ * grammar. Built-in tools are never left out: a rejection there is a OIO bug
  * and must surface.
  */
 export function findRejectedXaiTool(errorText: string, tools: readonly XaiFunctionTool[]): XaiFunctionTool | undefined {
@@ -179,14 +179,14 @@ export function findRejectedXaiTool(errorText: string, tools: readonly XaiFuncti
 const TOOL_USE_PREFIX = 'toolu_xai_'
 const ENCODED_PREFIX = 'b64_'
 
-/** A Tau tool_use id for an xAI call id. Reversible, deterministic. */
+/** A OIO tool_use id for an xAI call id. Reversible, deterministic. */
 export function tauToolUseIdForXaiCall(callId: string): string {
   return /^[A-Za-z0-9_-]+$/.test(callId) && !callId.startsWith(ENCODED_PREFIX)
     ? `${TOOL_USE_PREFIX}${callId}`
     : `${TOOL_USE_PREFIX}${ENCODED_PREFIX}${Buffer.from(callId, 'utf8').toString('base64url')}`
 }
 
-/** The call id xAI issued for a Tau tool_use id (ids from other routes pass through). */
+/** The call id xAI issued for a OIO tool_use id (ids from other routes pass through). */
 export function xaiCallIdForToolUse(toolUseId: string): string {
   if (!toolUseId.startsWith(TOOL_USE_PREFIX)) return toolUseId
   const rest = toolUseId.slice(TOOL_USE_PREFIX.length)
@@ -296,7 +296,7 @@ function replayedReasoning(block: ProviderContentBlock, model: string, seen: Set
 }
 
 /**
- * Tau's history as Responses input items. Assistant turns replay their
+ * OIO's history as Responses input items. Assistant turns replay their
  * encrypted reasoning where it sat on the wire — before the message or call
  * that followed it — and only for the model that produced it.
  */
@@ -479,7 +479,7 @@ interface PendingCall {
 }
 
 /**
- * Responses stream events → the Anthropic IR Tau consumes. Encrypted
+ * Responses stream events → the Anthropic IR OIO consumes. Encrypted
  * reasoning rides on the blocks as `_codex_reasoning` (the Codex lane's
  * state, scoped by model id): on the thinking block that showed it, and on
  * the next text or tool block, so it survives a transcript that drops
@@ -577,7 +577,7 @@ export class XaiResponsesStream {
     const decoded = decodeToolArguments(call.args || '{}')
     const index = this.nextIndex++
     // One start, one complete argument delta, one stop: input inline on the
-    // start would leave Tau's accumulator empty.
+    // start would leave OIO's accumulator empty.
     out.push({
       type: 'content_block_start',
       index,
@@ -766,7 +766,7 @@ export class XaiResponsesStream {
     const out: AnthropicStreamEvent[] = []
     this.start(out)
     for (const outputIndex of [...this.open.keys()]) this.close(out, outputIndex)
-    // Responses reports the whole prompt; Tau's buckets are additive.
+    // Responses reports the whole prompt; OIO's buckets are additive.
     const fresh = Math.max(0, this.inputTokens - this.cachedTokens)
     out.push({
       type: 'message_delta',

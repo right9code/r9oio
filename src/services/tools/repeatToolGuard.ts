@@ -108,7 +108,7 @@ function detailedReminder(
 /**
  * Record one tool call and return a reminder when it crosses a threshold.
  *
- * Called once per tool call from `runToolUse`, which Tau invokes before the
+ * Called once per tool call from `runToolUse`, which OIO invokes before the
  * permission check - so a denied call still counts, and a model hammering a
  * denied call is exactly the loop worth breaking.
  *

@@ -61,7 +61,7 @@ export const CANCEL_PICK_SCRIPT =
  */
 export function buildPickScript(hint: string, timeoutMs: number = PICK_TIMEOUT_MS): string {
   const ask = hint.replace(/\s+/g, " ").trim().slice(0, 120) || "Click the element you mean";
-  const message = `Tau: ${ask}   (Esc cancels, Up arrow picks the parent)`;
+  const message = `OIO: ${ask}   (Esc cancels, Up arrow picks the parent)`;
   return `(function () {
   var MESSAGE = ${JSON.stringify(message)};
   var TIMEOUT = ${Math.max(1000, Math.round(timeoutMs))};

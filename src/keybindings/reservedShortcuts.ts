@@ -11,7 +11,7 @@ export type ReservedShortcut = {
 }
 
 /**
- * Shortcuts that cannot be rebound - they are hardcoded in Tau.
+ * Shortcuts that cannot be rebound - they are hardcoded in OIO.
  */
 export const NON_REBINDABLE: ReservedShortcut[] = [
   {

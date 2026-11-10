@@ -161,7 +161,7 @@ export class GeminiLane implements Lane {
         : (system ?? []).map(b => b.text).join('\n\n')
 
     // Cache discipline: split stable (cache-eligible) from volatile
-    // (per-turn) sections at the Tau `__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__`
+    // (per-turn) sections at the OIO `__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__`
     // marker. Everything before the marker is stable prefix (tools list,
     // agent persona, instructions); everything after is volatile
     // (git status, env, memory) and must live INSIDE the conversation
@@ -1509,7 +1509,7 @@ function geminiSchemaFamily(model: string): GeminiSchemaFamily {
 // a server that fixes its schema is offered again. Process-lifetime and
 // only ever grows, so the tool block changes once per rejection and then
 // stays byte-stable for the prompt cache. Built-in tools are never
-// quarantined — a rejection there is a Tau bug and must surface.
+// quarantined — a rejection there is a OIO bug and must surface.
 
 const quarantinedDeclarations = new Map<string, string>()
 
@@ -1884,7 +1884,7 @@ function buildAuthErrorMessage(err: any, model?: string): string {
       lines.push(
         'This model only routes through the Antigravity quota pool.',
         'A 404 here means the Antigravity backend rejected the endpoint or wire model before generation started.',
-        'Tau sends Gemini 3.5 Flash through the model keys returned by Antigravity quota discovery and keeps the selected thinking level.',
+        'OIO sends Gemini 3.5 Flash through the model keys returned by Antigravity quota discovery and keeps the selected thinking level.',
         'If this continues, run `/login antigravity` to refresh the Antigravity account or pick another model temporarily.',
       )
     } else {
@@ -1904,7 +1904,7 @@ function buildAuthErrorMessage(err: any, model?: string): string {
       '#25609). Google\'s backend auto-binds an inaccessible project ID',
       'to the account. The only reliable client-side fixes:',
       '  1. Set `GOOGLE_CLOUD_PROJECT=<your-project-id>` (or',
-      '     `GEMINI_CLOUD_PROJECT`) and restart Tau — Tau will',
+      '     `GEMINI_CLOUD_PROJECT`) and restart OIO — OIO will',
       '     skip the auto-discovered project and use yours instead.',
       '     (Grab a project id from console.cloud.google.com on the same',
       '     Google account you logged in with.)',
@@ -1976,7 +1976,7 @@ function buildQuotaErrorMessage(err: any, model?: string): string {
 
   if (isAntigravityModel) {
     lines.push(
-      'Tau retried this request and, when possible, marked the selected account/model family for rotation.',
+      'OIO retried this request and, when possible, marked the selected account/model family for rotation.',
       'This can happen even when the usage page shows remaining quota, because the backend can throttle an endpoint or request window separately.',
       'What to do:',
       '  1. Wait for the Antigravity request window or backend capacity to recover, or',
@@ -2007,7 +2007,7 @@ function extractGoogleErrorMessage(body: unknown): string | null {
 
 // ─── System-prompt stable/volatile split ─────────────────────────
 //
-// Tau emits `__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__` as a separator
+// OIO emits `__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__` as a separator
 // between cacheable (stable) and per-turn (volatile) content. When the
 // caller forwards a flat system string to the lane, we split on that
 // marker so our `cachedContents` body sees only stable bytes and the

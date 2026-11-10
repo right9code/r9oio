@@ -5,7 +5,7 @@
  * its tools: `strict: false`, with the tool's own schema. Strict mode cannot
  * say "optional": it makes every field required-or-null, and models then fill
  * optional fields with guesses (a worktree nobody asked for, a document engine
- * the server refuses) instead of leaving them out. Tau validates every call
+ * the server refuses) instead of leaving them out. OIO validates every call
  * against the tool's full schema before running it, so a bad call still comes
  * back as an error the model can fix.
  *
@@ -40,7 +40,7 @@ const JSON_SCHEMA_TYPES = new Set(['string', 'number', 'integer', 'boolean', 'ob
 /**
  * Keywords left off the wire: identifiers, metadata the model does not need,
  * and validation the backend checks with a different regex dialect (a
- * JavaScript `pattern` can be refused). Native Codex drops the same ones. Tau
+ * JavaScript `pattern` can be refused). Native Codex drops the same ones. OIO
  * still validates every call against the tool's full schema.
  */
 const OMITTED_KEYWORDS = new Set([

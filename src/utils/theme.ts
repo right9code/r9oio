@@ -130,7 +130,7 @@ export type ThemeSetting = (typeof THEME_SETTINGS)[number]
 const darkTheme: Theme = {
   autoAccept: 'rgb(190,130,255)', // Electric violet (saturated)
   bashBorder: 'rgb(255,95,205)', // Hot magenta neon
-  claude: 'rgb(120,255,220)', // Electric cyan-mint (Tau signature)
+  claude: 'rgb(120,255,220)', // Electric cyan-mint (OIO signature)
   claudeShimmer: 'rgb(170,255,235)', // Brighter electric cyan shimmer
   claudeBlue_FOR_SYSTEM_SPINNER: 'rgb(140,180,255)', // Electric cobalt for spinner hat
   claudeBlueShimmer_FOR_SYSTEM_SPINNER: 'rgb(185,215,255)', // Bright electric blue shimmer
@@ -217,14 +217,14 @@ const darkTheme: Theme = {
   backgroundPanel: 'rgb(40,45,62)', // userMessageBackground
   backgroundElement: 'rgb(40,46,62)', // messageActionsBackground
   backgroundMenu: 'rgb(50,48,64)', // bashMessageBackgroundColor
-  // Brand accent — soft monochrome grey→off-white (inherited by Tau dark)
+  // Brand accent — soft monochrome grey→off-white (inherited by OIO dark)
   brand: 'rgb(156,156,163)',
   brandDim: 'rgb(104,104,112)',
   brandBright: 'rgb(204,204,209)',
 }
 
 /**
- * Tau default dark theme: a calm monochrome palette — near-black background,
+ * OIO default dark theme: a calm monochrome palette — near-black background,
  * zinc greys, soft-white text — where brightness (not hue) carries emphasis.
  * Easy on the eyes for long sessions; the wordmark renders its own grey→white
  * gradient. Same `dark` setting name for existing users.
@@ -321,9 +321,9 @@ const tauDarkTheme: Theme = {
 /** Labels shared by /theme and /config. Only three palettes are offered. */
 export const THEME_LABELS: Record<ThemeSetting, string> = {
   auto: 'Auto (match terminal)',
-  dark: 'Tau dark',
+  dark: 'OIO dark',
   'catppuccin-macchiato': 'Catppuccin Macchiato',
-  light: 'Tau white',
+  light: 'OIO white',
 }
 
 /** Retired settings still load safely, without appearing in the picker. */
@@ -428,7 +428,7 @@ const lightTheme: Theme = {
 }
 
 /** Official Macchiato palette: https://catppuccin.com/palette/#macchiato
- * Tau's silver wordmark and the bronze/gold power-mode overlays stay metallic.
+ * OIO's silver wordmark and the bronze/gold power-mode overlays stay metallic.
  */
 const macchiatoTheme: Theme = {
   ...tauDarkTheme,

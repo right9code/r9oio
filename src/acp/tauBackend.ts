@@ -9,17 +9,17 @@ import type {
 import { toolKindFromName } from './convert.js'
 
 /**
- * The real Tau engine backend for ACP.
+ * The real OIO engine backend for ACP.
  *
- * Rather than re-deriving Tau's ~1000-line headless bootstrap (tool pool, app
- * state, MCP, model/auth), this drives Tau's own headless `stream-json` mode —
+ * Rather than re-deriving OIO's ~1000-line headless bootstrap (tool pool, app
+ * state, MCP, model/auth), this drives OIO's own headless `stream-json` mode —
  * the same way the Claude Agent SDK drives the CLI. The child inherits the
  * user's config and `/login` auth automatically. Its SDKMessage stdout is
  * translated into ACP `session/update` notifications.
  *
  * PERSISTENT CHILD (the key to responsiveness): one long-lived child is spawned
  * per ACP session and each prompt turn is written to its stdin as a streaming
- * `user` message. The full Tau cold start (provider/auth/tool bootstrap) is
+ * `user` message. The full OIO cold start (provider/auth/tool bootstrap) is
  * therefore paid ONCE per session instead of once per turn — every turn after
  * the first lands on a warm process. Continuity is automatic (the child keeps
  * the conversation in-process), so no `--resume` dance is needed. Cancel uses
@@ -35,7 +35,7 @@ import { toolKindFromName } from './convert.js'
  *  - `TAU_ACP_NO_USAGE=1`— suppress the per-turn cache/token footer.
  */
 
-/** Structural shapes of the stream-json messages Tau emits (loose on purpose). */
+/** Structural shapes of the stream-json messages OIO emits (loose on purpose). */
 type ContentBlock = {
   type: string
   text?: string
@@ -99,7 +99,7 @@ type PendingTurn = {
   finish: (reason: StopReason) => void
 }
 
-/** One long-lived Tau child + the parsing/turn state bound to it. */
+/** One long-lived OIO child + the parsing/turn state bound to it. */
 type ChildSession = {
   cwd: string
   proc: ChildProcess
@@ -543,7 +543,7 @@ export class TauEngineBackend implements TauAcpBackend {
   }
 }
 
-/** Map Tau's result stop_reason onto an ACP {@link StopReason}. */
+/** Map OIO's result stop_reason onto an ACP {@link StopReason}. */
 function mapStopReason(reason: string | undefined): StopReason {
   switch (reason) {
     case 'end_turn':

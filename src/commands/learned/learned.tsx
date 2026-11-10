@@ -17,7 +17,7 @@ type WizardProps = {
 }
 
 const ACTION_RUNNING_MSG: Record<LearnedAction, string> = {
-  view: 'Showing what Tau has learned…',
+  view: 'Showing what OIO has learned…',
   learn: 'Reviewing this session for lessons…',
   edit: 'Opening a lesson to edit…',
   delete: 'Choosing a lesson to delete…',

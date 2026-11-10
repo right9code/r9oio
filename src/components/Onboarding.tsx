@@ -28,11 +28,11 @@ export function Onboarding({ onDone }: Props): React.ReactNode {
     <Box flexDirection="column">
       <Box flexDirection="column" marginX={1} marginBottom={1} gap={1}>
         <Text bold color="claude">
-          Tau setup
+          OIO setup
         </Text>
         <Box width={70}>
           <Text dimColor>
-            Choose the terminal theme for Tau. You can connect an AI
+            Choose the terminal theme for OIO. You can connect an AI
             provider later with /login or /provider.
           </Text>
         </Box>

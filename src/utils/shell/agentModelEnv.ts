@@ -43,7 +43,7 @@ export function getAgentModelEnv(
     // own provider inside its run, and the model-based routing is the same
     // call client.ts and claude.ts make.
     const provider = resolveEffectiveAPIProvider(getAPIProvider(), model)
-    // Only Anthropic-native requests carry one effort level Tau can name;
+    // Only Anthropic-native requests carry one effort level OIO can name;
     // other providers keep their own per-model reasoning settings.
     const effort = isAnthropicNativeProvider(provider)
       ? resolveAppliedEffort(model, appState.effortValue)

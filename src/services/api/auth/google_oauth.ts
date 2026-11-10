@@ -140,7 +140,7 @@ function generateCodeChallenge(verifier: string): string {
 }
 
 /**
- * Convert Google's response into Tau's persistent token shape.
+ * Convert Google's response into OIO's persistent token shape.
  *
  * Google's refresh-token grant normally returns only a new access token. Keep
  * the refresh token that authorized that grant instead of replacing it with an
@@ -184,7 +184,7 @@ function _buildAuthorizationUrl(
  *
  * Unlike Gemini CLI, Antigravity registers a fixed HTTPS redirect. Google's
  * callback page displays the authorization code for the user to paste back
- * into Tau, so no localhost listener is involved.
+ * into OIO, so no localhost listener is involved.
  */
 export function initiateAntigravityOAuth(): AntigravityOAuthHandles {
   const cfg = _configFor('antigravity')
@@ -328,7 +328,7 @@ async function _exchangeAndPersistGoogleCode(
   if (type === 'antigravity' && !stored.refreshToken) {
     throw new Error(
       'Google did not return a refresh token for persistent Antigravity login. '
-      + 'Remove Tau from your Google account connections, then run `/login antigravity` again.',
+      + 'Remove OIO from your Google account connections, then run `/login antigravity` again.',
     )
   }
   saveProviderKey(cfg.storageKey, JSON.stringify(stored))

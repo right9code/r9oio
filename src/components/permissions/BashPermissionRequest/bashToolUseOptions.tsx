@@ -65,7 +65,7 @@ export function bashToolUseOptions({
       type: 'input',
       label: 'Yes',
       value: 'yes',
-      placeholder: 'and tell Tau what to do next',
+      placeholder: 'and tell OIO what to do next',
       onChange: onAcceptFeedbackChange,
       allowEmptySubmitToCancel: true
     });
@@ -132,7 +132,7 @@ export function bashToolUseOptions({
   options.push({
     label: 'Yes, dangerously skip permissions for this session',
     value: 'yes-bypass-permissions',
-    description: bypassPermissionsDisabled ? 'Disabled by settings or policy.' : 'Tau will stop asking before running tools.',
+    description: bypassPermissionsDisabled ? 'Disabled by settings or policy.' : 'OIO will stop asking before running tools.',
     disabled: bypassPermissionsDisabled
   });
   if (noInputMode) {
@@ -140,7 +140,7 @@ export function bashToolUseOptions({
       type: 'input',
       label: 'No',
       value: 'no',
-      placeholder: 'and tell Tau what to do differently',
+      placeholder: 'and tell OIO what to do differently',
       onChange: onRejectFeedbackChange,
       allowEmptySubmitToCancel: true
     });

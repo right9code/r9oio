@@ -6,7 +6,7 @@ import { selectInheritedEffort, type EffortFallback } from './effortInheritance.
 
 /**
  * One stop on a Cline model's thinking ladder: an effort value the model
- * publishes on models.dev, or one of two Tau-side stops. `none` is where every
+ * publishes on models.dev, or one of two OIO-side stops. `none` is where every
  * model starts: it turns thinking off where the model allows that, and
  * otherwise leaves the model's own default in charge. `on` switches thinking
  * on for a model that publishes the switch but no effort ladder.
@@ -24,7 +24,7 @@ export type ClineEffort =
 export type ClineWireEffort = Exclude<ClineEffort, 'none' | 'on'>
 
 /**
- * The ladder for a model models.dev does not describe: the five stops Tau
+ * The ladder for a model models.dev does not describe: the five stops OIO
  * offered for every Cline model before ladders were per model.
  */
 export const CLINE_EFFORT_LEVELS: readonly ClineEffort[] = [
@@ -175,7 +175,7 @@ function ladderFromMeta(meta: ClineModelMeta): ClineThinkingLadder | null {
  * the model's own `reasoning_options` on models.dev when models.dev describes
  * the model (clineModelsDevCatalog.ts), so glm-5.3 on Cline Pass cycles
  * Default/Low/High/Max and never offers an Off it would refuse. A model
- * models.dev does not describe keeps the five stops Tau offered before, when
+ * models.dev does not describe keeps the five stops OIO offered before, when
  * the old id check calls it a thinking model.
  */
 export function getClineThinkingLadder(model: string): ClineThinkingLadder | null {

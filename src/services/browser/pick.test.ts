@@ -44,7 +44,7 @@ test("compiles whatever the hint holds", () => {
 
 test("the hint is one line of at most 120 characters", () => {
   const script = buildPickScript(`  ${"x".repeat(300)}\n\n  `, 5000);
-  assert(script.includes(`Tau: ${"x".repeat(120)}   (Esc`), "hint not trimmed to one line of 120");
+  assert(script.includes(`OIO: ${"x".repeat(120)}   (Esc`), "hint not trimmed to one line of 120");
   assert(!script.includes("x".repeat(121)), "hint longer than 120 kept");
 });
 

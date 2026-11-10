@@ -70,7 +70,7 @@ export const syncHookResponseSchema = lazySchema(() =>
     terminalSequence: z
       .string()
       .describe(
-        'Allowlisted terminal escape sequence (OSC 0/1/2/9/99/777 or BEL) for Tau to emit',
+        'Allowlisted terminal escape sequence (OSC 0/1/2/9/99/777 or BEL) for OIO to emit',
       )
       .optional(),
     hookSpecificOutput: z

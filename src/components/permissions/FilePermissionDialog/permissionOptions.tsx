@@ -79,7 +79,7 @@ export function getFilePermissionOptions({
       type: 'input',
       label: 'Yes',
       value: 'yes',
-      placeholder: 'and tell Tau what to do next',
+      placeholder: 'and tell OIO what to do next',
       onChange: onAcceptFeedbackChange,
       allowEmptySubmitToCancel: true,
       option: {
@@ -107,7 +107,7 @@ export function getFilePermissionOptions({
   // persisted permission rules.
   if ((inClaudeFolder || inGlobalClaudeFolder) && operationType !== 'read') {
     options.push({
-      label: 'Yes, and allow Tau to edit its own settings for this session',
+      label: 'Yes, and allow OIO to edit its own settings for this session',
       value: 'yes-claude-folder',
       option: {
         type: 'accept-session',
@@ -155,7 +155,7 @@ export function getFilePermissionOptions({
   options.push({
     label: 'Yes, dangerously skip permissions for this session',
     value: 'yes-bypass-permissions',
-    description: bypassPermissionsDisabled ? 'Disabled by settings or policy.' : 'Tau will stop asking before running tools.',
+    description: bypassPermissionsDisabled ? 'Disabled by settings or policy.' : 'OIO will stop asking before running tools.',
     disabled: bypassPermissionsDisabled,
     option: {
       type: 'bypass-permissions'
@@ -168,7 +168,7 @@ export function getFilePermissionOptions({
       type: 'input',
       label: 'No',
       value: 'no',
-      placeholder: 'and tell Tau what to do differently',
+      placeholder: 'and tell OIO what to do differently',
       onChange: onRejectFeedbackChange,
       allowEmptySubmitToCancel: true,
       option: {

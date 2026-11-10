@@ -253,7 +253,7 @@ function Pairing({
               <Text dimColor>
                 To stay on Wi-Fi: switch WSL to mirrored networking (Windows 11 22H2+) and allow
                 port 7777 in the Hyper-V firewall, or forward port 7777 from Windows and start
-                Tau with TAU_REMOTE_HOST set to the Wi-Fi address of this PC.
+                OIO with TAU_REMOTE_HOST set to the Wi-Fi address of this PC.
               </Text>
             </Box>
           )}

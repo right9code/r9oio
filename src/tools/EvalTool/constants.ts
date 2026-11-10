@@ -1,6 +1,6 @@
 /**
  * Eval tool — a persistent Python kernel with a loopback bridge back into
- * Tau's own tools.
+ * OIO's own tools.
  *
  * Naming: this is deliberately NOT called "REPL". `src/bridge/replBridge.ts`,
  * `src/replLauncher.tsx` and `src/screens/REPL.tsx` already use "REPL" to mean

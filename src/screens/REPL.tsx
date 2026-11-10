@@ -306,7 +306,7 @@ const HISTORY_STUB = {
   maybeLoadOlder: (_: ScrollBoxHandle) => {}
 };
 // Window after a user-initiated scroll during which type-into-empty does NOT
-// repin to bottom. Josh Rosen's workflow: Tau emits long output → scroll
+// repin to bottom. Josh Rosen's workflow: OIO emits long output → scroll
 // up to read the start → start typing → before this fix, snapped to bottom.
 // https://anthropic.slack.com/archives/C07VBSHV7EV/p1773545449871739
 const RECENT_SCROLL_REPIN_WINDOW_MS = 3000;
@@ -834,7 +834,7 @@ export function REPL({
     void performStartupChecks(setAppState);
   }, [setAppState, isRemoteSession]);
 
-  // Allow Tau in Chrome MCP to send prompts through MCP notifications
+  // Allow OIO in Chrome MCP to send prompts through MCP notifications
   // and sync permission mode changes to the Chrome extension
   usePromptsFromClaudeInChrome(isRemoteSession ? EMPTY_MCP_CLIENTS : mcpClients, toolPermissionContext.mode);
 
@@ -1074,7 +1074,7 @@ export function REPL({
   } | null>(null);
 
   // Track local JSX commands separately so tools can't overwrite them.
-  // This enables "immediate" commands (like /btw) to persist while Tau is processing.
+  // This enables "immediate" commands (like /btw) to persist while OIO is processing.
   const localJSXCommandRef = useRef<{
     jsx: React.ReactNode | null;
     shouldHidePromptInput: boolean;
@@ -1180,7 +1180,7 @@ export function REPL({
   // here because onQueryImpl reads them (background session description,
   // haiku title extraction gate).
 
-  // Prevent macOS from sleeping while Tau is working
+  // Prevent macOS from sleeping while OIO is working
   useEffect(() => {
     if (isLoading && !isWaitingForApproval && !isShowingLocalJSXCommand) {
       startPreventSleep();
@@ -2017,7 +2017,7 @@ export function REPL({
   const loadedNestedMemoryPathsRef = useRef(new Set<string>());
 
   // Helper to restore read file state from messages (used for resume flows)
-  // This allows Tau to edit files that were read in previous sessions
+  // This allows OIO to edit files that were read in previous sessions
   const restoreReadFileState = useCallback((messages: MessageType[], cwd: string) => {
     const extracted = extractReadFilesFromMessages(messages, cwd, READ_FILE_STATE_CACHE_SIZE);
     readFileState.current = mergeFileStateCaches(readFileState.current, extracted);
@@ -2781,7 +2781,7 @@ export function REPL({
       }
     }
 
-    // Mark onboarding as complete when any user message is sent to Tau
+    // Mark onboarding as complete when any user message is sent to OIO
     void maybeMarkProjectOnboardingComplete();
 
     // Extract a session title from the first real user message. One-shot
@@ -2790,7 +2790,7 @@ export function REPL({
     // which was broken by SessionStart hook messages (prepended via
     // useDeferredHookMessages) and attachment messages (appended by
     // processTextPrompt) — both pushed length past 1 on turn one, so the
-    // title silently fell through to the "Tau" default.
+    // title silently fell through to the "OIO" default.
     if (!titleDisabled && !sessionTitle && !agentTitle && !haikuTitleAttemptedRef.current) {
       const firstUserMessage = newMessages.find(m => m.type === 'user' && !m.isMeta);
       const text = firstUserMessage?.type === 'user' ? getContentText(firstUserMessage.message.content) : null;
@@ -3305,7 +3305,7 @@ export function REPL({
     voiceMode?: boolean;
   }) => {
     if (options?.voiceMode && activeRemote.isRemoteMode) {
-      throw new Error('Voice delegation requires a local Tau agent session.');
+      throw new Error('Voice delegation requires a local OIO agent session.');
     }
     // Re-pin scroll to bottom on submit so the user always sees the new
     // exchange (matches OpenCode's auto-scroll behavior).
@@ -3317,7 +3317,7 @@ export function REPL({
     }
 
     // Handle immediate commands - these bypass the queue and execute right away
-    // even while Tau is processing. Commands opt-in via `immediate: true`.
+    // even while OIO is processing. Commands opt-in via `immediate: true`.
     // Commands triggered via keybindings are always treated as immediate.
     if (!options?.voiceMode && !speculationAccept && input.trim().startsWith('/')) {
       // Expand [Pasted text #N] refs so immediate commands (e.g. /btw) receive
@@ -4091,9 +4091,9 @@ export function REPL({
     }
   }, [submitCount]);
 
-  // Show notification when Tau is done responding and user is idle
+  // Show notification when OIO is done responding and user is idle
   useEffect(() => {
-    // Don't set up notification if Tau is busy
+    // Don't set up notification if OIO is busy
     if (isLoading) return;
 
     // Only enable notifications after the first new interaction in this session
@@ -4107,7 +4107,7 @@ export function REPL({
       // Check if user has interacted since the response ended
       const lastUserInteraction = getLastInteractionTime();
       if (lastUserInteraction > lastQueryCompletionTime) {
-        // User has interacted since Tau finished - they're not idle, don't notify
+        // User has interacted since OIO finished - they're not idle, don't notify
         return;
       }
 
@@ -4117,7 +4117,7 @@ export function REPL({
       // Use ref to get current dialog state, avoiding stale closure
       focusedInputDialogRef.current === undefined && idleTimeSinceResponse >= getGlobalConfig().messageIdleNotifThresholdMs) {
         void sendNotification({
-          message: 'Tau is waiting for your input',
+          message: 'OIO is waiting for your input',
           notificationType: 'idle_prompt'
         }, terminal);
       }
@@ -4241,7 +4241,7 @@ export function REPL({
           const text = getContentText(message.message.content);
           return text ? [`${message.type}: ${text}`] : [];
         }).join('\n');
-        return `Tau workspace: ${getProjectRoot()}\nRecent conversation:\n${recent.slice(-12000)}`;
+        return `OIO workspace: ${getProjectRoot()}\nRecent conversation:\n${recent.slice(-12000)}`;
       }
     });
     const unsubscribe = subscribeLiveVoice(() => {
@@ -4350,7 +4350,7 @@ export function REPL({
   useEffect(() => {
     const handleSuspend = () => {
       // Print suspension instructions
-      process.stdout.write(`\nTau has been suspended. Run \`fg\` to bring Tau back.\nNote: ctrl + z now suspends Tau, ctrl + _ undoes input.\n`);
+      process.stdout.write(`\nTau has been suspended. Run \`fg\` to bring OIO back.\nNote: ctrl + z now suspends OIO, ctrl + _ undoes input.\n`);
     };
     const handleResume = () => {
       // Force complete component tree replacement instead of terminal clear
@@ -4817,7 +4817,7 @@ export function REPL({
                   it would sit at the last visible transcript row right above
                   the ▔ divider, showing "❯ /config" as redundant clutter
                   (the modal IS the /config UI). Outside modals it stays so
-                  the user sees their input echoed while Tau processes. */}
+                  the user sees their input echoed while OIO processes. */}
               {!disabled && placeholderText && !centeredModal && <UserTextMessage param={{
           text: placeholderText,
           type: 'text'

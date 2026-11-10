@@ -1,7 +1,7 @@
 /**
  * Mark failed tool results in their text, for lane wires that cannot flag them.
  *
- * Tau records a failed tool call as a tool_result with `is_error: true`. The
+ * OIO records a failed tool call as a tool_result with `is_error: true`. The
  * Anthropic wire carries that flag, and so do Kiro (`status: 'error'`) and
  * Cursor (`isError`). OpenAI-style tool messages, the Responses API's
  * function_call_output and Gemini's functionResponse have no such field, so

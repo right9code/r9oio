@@ -1,7 +1,7 @@
 // biome-ignore-all assist/source/organizeImports: ANT-ONLY import markers must not be reordered
 /**
  * Hooks are user-defined shell commands that can be executed at various points
- * in Tau's lifecycle.
+ * in OIO's lifecycle.
  */
 import { basename } from 'path'
 import { spawn, type ChildProcessWithoutNullStreams } from 'child_process'
@@ -604,7 +604,7 @@ function processHookJSONOutput({
     json.hookSpecificOutput?.hookEventName === 'PreToolUse' &&
     json.hookSpecificOutput.permissionDecision === 'defer'
   ) {
-    const message = `Hook ${hookName} requested a deferred tool call, but Tau does not support the deferred-call resume protocol.`
+    const message = `Hook ${hookName} requested a deferred tool call, but OIO does not support the deferred-call resume protocol.`
     logForDebugging(
       message,
       { level: 'warn' },
@@ -771,7 +771,7 @@ function processHookJSONOutput({
       case 'PostToolUse':
         result.additionalContext = json.hookSpecificOutput.additionalContext
         if (json.hookSpecificOutput.classifierContext !== undefined) {
-          const warning = 'Tau ignored classifierContext: hook-provided classifier context is not implemented.'
+          const warning = 'OIO ignored classifierContext: hook-provided classifier context is not implemented.'
           logForDebugging(warning, { level: 'warn' })
           result.systemMessage = result.systemMessage ? `${result.systemMessage}\n${warning}` : warning
         }
@@ -1140,7 +1140,7 @@ async function execCommandHook(
     const gitBashPath = isWindows ? findGitBashPath() : null
     if (isWindows && !gitBashPath) {
       throw new Error(
-        `Hook "${hook.command}" needs Git Bash. Install Git for Windows and restart Tau.`,
+        `Hook "${hook.command}" needs Git Bash. Install Git for Windows and restart OIO.`,
       )
     }
     const shell = isWindows ? gitBashPath! : true

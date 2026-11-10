@@ -1,7 +1,7 @@
 /**
  * Literal search inside a persisted tool output.
  *
- * When a tool result is too large to inline, Tau parks it on disk and hands the
+ * When a tool result is too large to inline, OIO parks it on disk and hands the
  * model a path. Until now the only way back in was a byte or line range, so
  * finding one stack trace in a 60 KB build log meant guessing offsets: probe,
  * miss, probe again. Each probe costs a turn and leaves the irrelevant slice

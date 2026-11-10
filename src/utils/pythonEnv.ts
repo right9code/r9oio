@@ -320,7 +320,7 @@ const scriptPaths = new Map<string, string>()
 
 /**
  * Write a Python script tau ships to a path under the OS temp dir named by
- * its content hash, so a Tau upgrade writes a new file instead of changing
+ * its content hash, so a OIO upgrade writes a new file instead of changing
  * one a running process may be reading. Returns the path.
  */
 export function ensurePythonScript(name: string, source: string): string {

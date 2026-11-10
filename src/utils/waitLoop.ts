@@ -2,7 +2,7 @@
  * Waiting-loop guard.
  *
  * A background task is running and the model wants its result. Instead of
- * waiting for the <task-notification> Tau sends when the task finishes, it
+ * waiting for the <task-notification> OIO sends when the task finishes, it
  * checks again: TaskOutput, a read of the task's log, a process or socket
  * probe, the same status command. Every check succeeds and reports "still
  * running", so nothing treats it as a failure and toolLedger's thrash detector
@@ -177,14 +177,14 @@ type Observation = {
   subject: WaitLoopSubject
   /** What a repeat must match to count. Absent for a task: every check counts. */
   state?: string
-  /** The result carried a reminder Tau appended to it (repeatToolGuard). */
+  /** The result carried a reminder OIO appended to it (repeatToolGuard). */
   reminded?: boolean
 }
 
 const SYSTEM_REMINDER = /\s*<system-reminder>[\s\S]*?<\/system-reminder>\s*/g
 
 /**
- * A result without the reminders Tau appends to it. They are Tau's words, not
+ * A result without the reminders OIO appends to it. They are OIO's words, not
  * the tool's: repeatToolGuard adds one on the 3rd and 5th identical call, which
  * would make an unchanged answer look new.
  */
@@ -301,7 +301,7 @@ export class WaitLoopGuard {
         track.count >= this.#nudgeAt &&
         !(this.#armedRound !== null && waitChecks.includes(track)),
     )
-    // With nothing to wait for, a call whose own result already carries Tau's
+    // With nothing to wait for, a call whose own result already carries OIO's
     // repeat reminder has been told; a second message would only echo it.
     // While waiting, the nudge still goes: it is what says a notification is coming.
     for (const track of due) {
@@ -452,7 +452,7 @@ const CHECKS = `${TASK_OUTPUT_TOOL_NAME}, reading its output file, sleeping, or 
 
 function waitAdvice(audience: WaitLoopAudience, what: string): string {
   return audience.canWaitForNotification
-    ? `Tau sends you a ${NOTIFICATION} when it finishes, so stop checking on it (${CHECKS}). If this request has other work left, do that. Otherwise tell the user ${what}, and end your turn.`
+    ? `OIO sends you a ${NOTIFICATION} when it finishes, so stop checking on it (${CHECKS}). If this request has other work left, do that. Otherwise tell the user ${what}, and end your turn.`
     : `Stop polling it (${CHECKS}). If you need its result, wait for it once with ${TASK_OUTPUT_TOOL_NAME} (block: true, timeout up to ${TASK_OUTPUT_MAX_TIMEOUT_MS} ms). Otherwise report ${what}, and finish.`
 }
 
@@ -496,13 +496,13 @@ export function buildWaitLoopFinalInstruction(
 ): string {
   const lead = `you kept checking on ${describeSubject(finding.subject)} after being asked to stop. Do not call any more tools; they will not run.`
   if (!audience.canWaitForNotification) {
-    return `Tau is ending this run: ${lead} Reply with your result so far: what you found, and what is still running.`
+    return `OIO is ending this run: ${lead} Reply with your result so far: what you found, and what is still running.`
   }
   const status =
     finding.waitingOn.length > 0
       ? `what is done, what is still running, and that you will pick it up when its ${NOTIFICATION} arrives`
       : 'what is done, and what is blocking you'
-  return `Tau is ending this turn: ${lead} Reply to the user with a short status: ${status}.`
+  return `OIO is ending this turn: ${lead} Reply to the user with a short status: ${status}.`
 }
 
 /** The result of each call the model made anyway in its final response. */
@@ -515,12 +515,12 @@ export function buildWaitLoopNotRunResult(
     running === null
       ? ''
       : audience.canWaitForNotification
-        ? ` ${running}; Tau sends a ${NOTIFICATION} when it finishes.`
+        ? ` ${running}; OIO sends a ${NOTIFICATION} when it finishes.`
         : ` ${running}.`
-  return `Not run: Tau ended this turn because you kept checking on ${describeSubject(finding.subject)} instead of waiting.${tail}`
+  return `Not run: OIO ended this turn because you kept checking on ${describeSubject(finding.subject)} instead of waiting.${tail}`
 }
 
-/** What the user sees when Tau ends the turn. */
+/** What the user sees when OIO ends the turn. */
 export function buildWaitLoopStopNotice(
   finding: WaitLoopFinding,
   audience: WaitLoopAudience,

@@ -77,7 +77,7 @@ function authorityRelativeFileUrlPath(input: string): string | null {
  *
  * The WHATWG URL parser treats `file://.tau/artifacts/x.html` as a URL whose
  * host is `.tau`. In practice, agents and humans often mean a workspace-relative
- * local artifact path. Resolve those relative-looking forms against Tau's cwd
+ * local artifact path. Resolve those relative-looking forms against OIO's cwd
  * while preserving standard absolute file URLs and Windows UNC file URLs.
  */
 export function resolveLocalFileUrlTarget(

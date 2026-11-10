@@ -291,7 +291,7 @@ async function main(): Promise<void> {
 
         const page = await fetch(`http://${state.host}:${state.port}/`)
         eq(page.status, 200, 'page status')
-        assert((await page.text()).includes('Tau Remote'), 'page body')
+        assert((await page.text()).includes('OIO Remote'), 'page body')
 
         const hello = await new Promise<string>((resolve, reject) => {
           const ws = new WebSocket(

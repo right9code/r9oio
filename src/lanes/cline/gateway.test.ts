@@ -138,7 +138,7 @@ const FEED = {
   ],
 }
 
-// The chat-completions history the lane builds from a Tau turn: the system
+// The chat-completions history the lane builds from a OIO turn: the system
 // prompt, two user turns, and a tool loop after each.
 function conversation(): OpenAIMessage[] {
   return [
@@ -192,7 +192,7 @@ async function main(): Promise<void> {
       assert(model.provider === 'Cline Pass', `${model.id} provider=${model.provider}`)
       assert(model.tags?.includes('thinking') && model.tags.includes('pro'), `${model.id} tags=${model.tags}`)
     }
-    assert(!ids.some(id => id.startsWith('cline-free/')), 'free-bucket models must not be offered in Tau')
+    assert(!ids.some(id => id.startsWith('cline-free/')), 'free-bucket models must not be offered in OIO')
   })
 
   await test('feed and catalog also parse from the success/data envelope', () => {

@@ -21,7 +21,7 @@ import { REPO_CONTEXT_SCOUT_TOOL_NAME } from './constants.js'
 const DESCRIPTION =
   'Preflight a coding task by combining repo retrieval, workflow detection, git changes, and risk. Read-only.'
 
-const PROMPT = `Run a lightweight preflight scout for a coding task. This combines Tau-native repo retrieval, project workflow detection, git change summary, and risk-based review guidance. It is read-only and does not edit files, run tests, or spawn agents.
+const PROMPT = `Run a lightweight preflight scout for a coding task. This combines OIO-native repo retrieval, project workflow detection, git change summary, and risk-based review guidance. It is read-only and does not edit files, run tests, or spawn agents.
 
 Use before unfamiliar edits, broad refactors, provider/lane work, token/cache/tool-output changes, or agentic workflow changes. Keep follow-up reads focused on the returned files and checks.`
 

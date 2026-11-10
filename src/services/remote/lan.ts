@@ -12,7 +12,7 @@
  * name. Name scoring only decides when there is no default route, or when the
  * default route is a VPN.
  *
- * Whether the chosen address is reachable at all depends on where Tau runs
+ * Whether the chosen address is reachable at all depends on where OIO runs
  * (WSL 2 hides it behind a virtual switch); reach.ts owns that question.
  */
 

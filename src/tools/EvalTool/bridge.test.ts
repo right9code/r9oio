@@ -5,7 +5,7 @@
  * Run via: bun run src/tools/EvalTool/bridge.test.ts
  *
  * This is the load-bearing path of the whole feature — `tool.Read(...)` typed
- * inside a cell has to reach a Tau tool, respect its permission decision, and
+ * inside a cell has to reach a OIO tool, respect its permission decision, and
  * come back as Python data. Everything else is plumbing around it.
  */
 
@@ -48,7 +48,7 @@ async function asyncTest(name: string, fn: () => Promise<void>): Promise<void> {
   }
 }
 
-/** A stand-in for a Tau tool: just enough surface for the bridge to drive it. */
+/** A stand-in for a OIO tool: just enough surface for the bridge to drive it. */
 function fakeTool(name: string, run: (input: Record<string, unknown>) => string) {
   return {
     name,
@@ -133,7 +133,7 @@ async function main(): Promise<void> {
   console.log('\ntool bridge (python -> host -> tool -> python)')
 
   for (const model of ['gpt-6-sol', 'gpt-5.6-luna']) {
-    await asyncTest(`${model}: Codex aliases adapt inputs and return Tau results`, async () => {
+    await asyncTest(`${model}: Codex aliases adapt inputs and return OIO results`, async () => {
       const seen: Array<{ name: string; input: Record<string, unknown> }> = []
       const read = {
         ...fakeTool('Read', input => {
@@ -167,10 +167,10 @@ async function main(): Promise<void> {
           'assert not any("apply_patch" in name or "list_directory" in name for name in names)',
         ].join('\n'), { timeoutMs: 20_000 })
         assert(outcome.ok, outcome.error?.traceback ?? 'alias cell failed')
-        assert(JSON.stringify(seen[0]?.input) === JSON.stringify(seen[1]?.input), 'read alias differs from Tau call')
+        assert(JSON.stringify(seen[0]?.input) === JSON.stringify(seen[1]?.input), 'read alias differs from OIO call')
         assert(seen[2]?.input.workdir === process.cwd(), 'shell directory did not adapt to workdir')
         assert(seen[3]?.input.glob === '*.ts', 'search include did not adapt to glob')
-        assert(calls.map(call => call.name).join(',') === 'Read,Read,Bash,Grep', 'calls did not retain Tau identities')
+        assert(calls.map(call => call.name).join(',') === 'Read,Read,Bash,Grep', 'calls did not retain OIO identities')
       })
     })
   }
@@ -192,11 +192,11 @@ async function main(): Promise<void> {
   await asyncTest('exact tool names win over native aliases', async () => {
     await withBridge({
       provider: 'openai',
-      tools: [fakeTool('Read', () => 'Tau Read'), fakeTool('read_file', () => 'exact name')],
+      tools: [fakeTool('Read', () => 'OIO Read'), fakeTool('read_file', () => 'exact name')],
     }, async kernel => {
       const outcome = await kernel.execute([
         'assert tool.read_file(file_path="x") == "exact name"',
-        'assert tool.Read(file_path="x") == "Tau Read"',
+        'assert tool.Read(file_path="x") == "OIO Read"',
         'assert "read_file" in tool.list() and "read_file (Read)" not in tool.list()',
       ].join('\n'), { timeoutMs: 20_000 })
       assert(outcome.ok, outcome.error?.traceback ?? 'exact name lost')

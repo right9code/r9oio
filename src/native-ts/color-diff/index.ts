@@ -337,7 +337,7 @@ function buildTheme(themeName: string, mode: ColorMode): Theme {
       modifyEnabled: true,
       foreground: rgb(202, 211, 245),
       // ColorDiff output is emitted as ANSI and can contain a default
-      // background reset. Keep that reset aligned with Tau's canvas so
+      // background reset. Keep that reset aligned with OIO's canvas so
       // context lines do not reveal the terminal's black backdrop.
       background: rgb(36, 39, 58),
       scopes: MACCHIATO_SCOPES,

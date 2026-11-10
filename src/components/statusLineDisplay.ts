@@ -1,7 +1,7 @@
 /**
  * Which of the two status rows the prompt renders.
  *
- * Tau has two of them, and they occupy the same visual slot:
+ * OIO has two of them, and they occupy the same visual slot:
  *   - the legacy `statusLine` row (StatusLine.tsx) — stdout of a user-supplied
  *     shell command, configured in settings.json;
  *   - the built-in session bar (PromptInputStatusBar.tsx) — cwd,

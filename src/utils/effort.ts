@@ -384,7 +384,7 @@ export function getDefaultEffortForModel(
   // that can greatly affect model quality and bashing.
 
   // Claude Opus 5.5 runs at medium when a request names no effort (Opus 5
-  // runs at high). Naming it keeps the level Tau shows equal to the level
+  // runs at high). Naming it keeps the level OIO shows equal to the level
   // the API applies, instead of the 'high' fallback the display assumes.
   if (model.toLowerCase().includes('opus-5-5') && claude5SupportApplies()) {
     return 'medium'

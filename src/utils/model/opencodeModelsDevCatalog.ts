@@ -31,7 +31,7 @@
  *   maxInputTokens         `limit.input`, when a separate prompt cap exists
  *
  * Nothing here names a model, so a row OpenCode adds tomorrow is described on
- * the next refresh without a Tau release.
+ * the next refresh without a OIO release.
  *
  * Same discipline as clineModelsDevCatalog.ts: lookups are synchronous and
  * read only memory or the file on disk, the picker refreshes that file (once
@@ -62,7 +62,7 @@ const FETCH_TIMEOUT_MS = 20_000
 const RETRY_BASE_MS = 5 * 60_000
 const RETRY_CAP_MS = 60 * 60_000
 
-/** Tau provider id to the models.dev block that describes it. */
+/** OIO provider id to the models.dev block that describes it. */
 const SOURCES = {
   opencode: 'opencode',
   opencodego: 'opencode-go',
@@ -119,7 +119,7 @@ export interface CacheFile {
 }
 
 // Order only. Which values a model has always comes from the catalogue; a
-// value outside this list is not one Tau can send, so it is left out.
+// value outside this list is not one OIO can send, so it is left out.
 const EFFORT_RANK: Readonly<Record<string, number>> = {
   none: 0,
   minimal: 1,

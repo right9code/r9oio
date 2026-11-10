@@ -113,7 +113,7 @@ function Install({
 
         // Check specifically for lock failure
         if (result.lockFailed) {
-          throw new Error('Could not install - another process is currently installing Tau. Please try again in a moment.');
+          throw new Error('Could not install - another process is currently installing OIO. Please try again in a moment.');
         }
 
         // If we couldn't get the version, there might be an issue
@@ -210,12 +210,12 @@ function Install({
   useEffect(() => {
     if (state.type === 'success') {
       // Give success message time to render before exiting
-      setTimeout(onDone, 2000, 'Tau installation completed successfully', {
+      setTimeout(onDone, 2000, 'OIO installation completed successfully', {
         display: 'system' as const
       });
     } else if (state.type === 'error') {
       // Give error message time to render before exiting
-      setTimeout(onDone, 3000, 'Tau installation failed', {
+      setTimeout(onDone, 3000, 'OIO installation failed', {
         display: 'system' as const
       });
     }
@@ -226,7 +226,7 @@ function Install({
       {state.type === 'cleaning-npm' && <Text color="warning">Cleaning up old npm installations...</Text>}
 
       {state.type === 'installing' && <Text color="claude">
-          Installing Tau native build {state.version}...
+          Installing OIO native build {state.version}...
         </Text>}
 
       {state.type === 'setting-up' && <Text color="claude">Setting up launcher and shell integration...</Text>}
@@ -237,7 +237,7 @@ function Install({
           <Box>
             <StatusIcon status="success" withSpace />
             <Text color="success" bold>
-              Tau successfully installed!
+              OIO successfully installed!
             </Text>
           </Box>
           <Box marginLeft={2} flexDirection="column" gap={1}>
@@ -279,7 +279,7 @@ function Install({
 export const install = {
   type: 'local-jsx' as const,
   name: 'install',
-  description: 'Install Tau native build',
+  description: 'Install OIO native build',
   argumentHint: '[options]',
   async call(onDone: (result: string, options?: {
     display?: CommandResultDisplay;

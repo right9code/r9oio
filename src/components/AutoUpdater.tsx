@@ -120,7 +120,7 @@ export function AutoUpdater({
         return;
       } else {
         // Never guess for an unknown installation (for example pnpm/yarn).
-        // Guessing "global npm" can create a second Tau that is not the one
+        // Guessing "global npm" can create a second OIO that is not the one
         // first on PATH. The interactive `tau update` command can diagnose it.
         logForDebugging('AutoUpdater: Skipping unknown installation type');
         onChangeIsUpdating(false);

@@ -544,7 +544,7 @@ export class ClineLane implements Lane {
     const outboundMessages = decideImageSupport(params.providerHint, params.model)
       ? params.messages
       : substituteUnsendableMedia(params.messages)
-    // Tau's Anthropic-shaped cache markers do not survive this conversion.
+    // OIO's Anthropic-shaped cache markers do not survive this conversion.
     // The lane places Cline's own when sending (see prompt_cache.ts).
     const messages = anthropicMessagesToOpenAI(outboundMessages, system)
     // models.dev supplies the thinking stops and output caps the body is
@@ -799,7 +799,7 @@ export class ClineLane implements Lane {
     const workosToken = clineBearerToken(auth.token)
     headers.Authorization = `Bearer ${workosToken}`
     headers.workos = workosToken
-    // Cline's clients stamp every request of a task with X-Task-ID. Tau sends
+    // Cline's clients stamp every request of a task with X-Task-ID. OIO sends
     // its stable conversation id (services/api/cacheAffinity.ts) so the
     // gateway keeps one conversation together.
     const taskId = sessionId?.trim()

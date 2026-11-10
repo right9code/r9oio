@@ -60,7 +60,7 @@ export class QueryWatcher {
       const content = fs.readFileSync(filePath, 'utf-8')
       // Look for unresolved questions marked with [QUERY], [DOUBT], or status: pending
       if (content.includes('[QUERY') || content.includes('[DOUBT') || content.includes('status: pending') || content.includes('status: open')) {
-        this.triggerDesktopAlert('Tau: Servant Worker has a Question', 'A worker logged a doubt in _queries.md awaiting input.')
+        this.triggerDesktopAlert('OIO: Servant Worker has a Question', 'A worker logged a doubt in _queries.md awaiting input.')
         if (this.callback) {
           this.callback(content, filePath)
         }

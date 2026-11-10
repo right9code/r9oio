@@ -198,9 +198,9 @@ Bash autonomy: run them yourself. Skill tool: use relevant skills; Only use list
  * Codex tool-usage rules, in Codex's concise native tone. They name no
  * tools: the request's tool list is the whole inventory (this lane never
  * defers schemas), and a name written here either repeats that list or
- * points GPT models at a Codex-native tool Tau does not send (apply_patch,
+ * points GPT models at a Codex-native tool OIO does not send (apply_patch,
  * exec, update_plan, ...), which costs failed calls and tool hunts through
- * the shell. Tau's prompt still says Read/Bash where this lane sends
+ * the shell. OIO's prompt still says Read/Bash where this lane sends
  * read_file/shell; the "same job" rule maps those without listing them.
  * Static text, so it never moves the cached prefix.
  */

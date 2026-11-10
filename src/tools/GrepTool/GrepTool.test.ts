@@ -91,7 +91,7 @@ async function loadSearchTools() {
         for (const [filter, name, contents] of stubs) {
           builder.onResolve({ filter }, args => {
             // Names such as errors.js and cwd.js also occur in dependencies.
-            // Only replace Tau services; third-party code stays intact.
+            // Only replace OIO services; third-party code stays intact.
             if (args.importer.replaceAll('\\', '/').includes('/node_modules/')) return
             return { path: name, namespace: 'grep-test-service' }
           })

@@ -445,7 +445,7 @@ function metricMatchesModel(label: string, model: string): boolean {
  * over its display label.
  *
  * Antigravity labels its rows with Google's own `displayName`, which is not
- * the id a request is made with and is not Tau's to keep stable. Matching on
+ * the id a request is made with and is not OIO's to keep stable. Matching on
  * the label alone meant a row could stop being findable the moment the vendor
  * reworded it - and a miss is not harmless here, because the caller then falls
  * back to the fetch-time headline, which is the TIGHTEST pool across every

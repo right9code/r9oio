@@ -5,9 +5,9 @@ import { isSmallTierGroqModel } from '../lanes/openai-compat/groq_tool_policy.js
 import { isNimFastToolFilterActive } from '../lanes/openai-compat/nim_tool_policy.js'
 
 /**
- * Providers routed through Tau's Gemini or OpenAI-compatible lanes. These
+ * Providers routed through OIO's Gemini or OpenAI-compatible lanes. These
  * lanes implement tool discovery client-side: undeclared schemas stay in
- * Tau, ToolSearch records the selected names, and the selected schemas are
+ * OIO, ToolSearch records the selected names, and the selected schemas are
  * appended on the following request.
  *
  * Keep this list narrower than `isThirdPartyProvider()`. A provider belongs
@@ -43,7 +43,7 @@ export function providerSupportsClientSideToolDiscovery(
 }
 
 /**
- * Providers whose prompt cache is an EXACT PREFIX cache that Tau cannot
+ * Providers whose prompt cache is an EXACT PREFIX cache that OIO cannot
  * re-anchor once it breaks.
  *
  * Client-side discovery rewrites the tool array mid-session: every ToolSearch
@@ -55,11 +55,11 @@ export function providerSupportsClientSideToolDiscovery(
  * content, with the collapses landing within three turns of a ToolSearch
  * call (mimo 75%, fireworks 50%, deepseek 44%).
  *
- * Two shapes qualify, and neither gives Tau a breakpoint to re-anchor on:
+ * Two shapes qualify, and neither gives OIO a breakpoint to re-anchor on:
  *   - automatic/implicit prefix caching (deepseek, mimo, alibaba, whose
  *     Model Studio implicit cache is always on and cannot be disabled, glm,
  *     whose Z.ai context cache is implicit, and minimax, which matches tools,
- *     then system, then messages on its own). Tau freezes the environment
+ *     then system, then messages on its own). OIO freezes the environment
  *     block of glm and minimax for that cache (direct_history.ts); a load
  *     rewrote the tool block in front of it anyway.
  *   - a session-pinned `prompt_cache_key` reusing one backend's KV cache
@@ -111,7 +111,7 @@ export function providerModelSupportsClientSideToolDiscovery(
   model?: string,
 ): boolean {
   if (!providerSupportsClientSideToolDiscovery(provider)) return false
-  // Rewriting the tool array would void a prefix cache Tau cannot re-anchor.
+  // Rewriting the tool array would void a prefix cache OIO cannot re-anchor.
   if (providerUsesExactPrefixCache(provider)) return false
   // NIM prunes to a fixed fast subset before the lazy selector. Keeping
   // ToolSearch active there would advertise/select schemas the transformer
@@ -127,7 +127,7 @@ export function providerModelSupportsClientSideToolDiscovery(
 }
 
 /**
- * True only when Tau has a verified discovery transport for this provider.
+ * True only when OIO has a verified discovery transport for this provider.
  * Everything else gets full schemas. This is the central safety fallback:
  * adding a provider never silently opts it into name-only tools.
  */

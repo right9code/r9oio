@@ -193,8 +193,8 @@ const resolveProvider: Record<ShellType, () => Promise<ShellProvider>> = {
     if (config) return config.provider
     throw new Error(
       getPlatform() === 'windows'
-        ? 'Git Bash is required for Bash commands. Install Git for Windows and restart Tau.'
-        : 'No suitable shell found. Install bash and restart Tau.',
+        ? 'Git Bash is required for Bash commands. Install Git for Windows and restart OIO.'
+        : 'No suitable shell found. Install bash and restart OIO.',
     )
   },
   powershell: getPsProvider,
@@ -403,7 +403,7 @@ export async function exec(
     const childProcess = spawn(spawnBinary, shellArgs, {
       // withAgentEnv adds AI_AGENT and TAU_SESSION_ID (plus TAU_PROVIDER,
       // TAU_MODEL and TAU_EFFORT for a model's own tool call) and drops
-      // inherited copies, such as a parent Tau's.
+      // inherited copies, such as a parent OIO's.
       env: withAgentEnv({
         ...baseEnv,
         // Shell tools redirect stdout/stderr to files. On Windows, native

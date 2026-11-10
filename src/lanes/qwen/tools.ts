@@ -7,7 +7,7 @@
  * {type:'function', function:{name,description,parameters}}).
  *
  * Tool names match qwen-code reference where available; adaptInput /
- * adaptOutput bridge the native parameter shape to Tau's shared
+ * adaptOutput bridge the native parameter shape to OIO's shared
  * tool implementations.
  */
 
@@ -106,7 +106,7 @@ export const QWEN_TOOL_REGISTRY: LaneToolRegistration[] = [
         description: { type: 'string' },
         is_background: {
           type: 'boolean',
-          description: 'Set true for long-running servers/watchers, port-forwards, tunnels, and foreground container runs. Tau tracks and can stop the background task; remove shell-level detaching from command.',
+          description: 'Set true for long-running servers/watchers, port-forwards, tunnels, and foreground container runs. OIO tracks and can stop the background task; remove shell-level detaching from command.',
         },
       },
       required: ['command'],

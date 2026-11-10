@@ -25,7 +25,7 @@ type ParentMessage = Parameters<CanUseToolFn>[3]
 
 /**
  * Loopback HTTP bridge: `tool.<name>(args)` inside the kernel becomes a real
- * Tau tool call here.
+ * OIO tool call here.
  *
  * Permission model, stated plainly because it differs from the main loop:
  *
@@ -139,8 +139,8 @@ function resolveBridgeTool(entry: RegisteredBridgeSession, name: string): {
   tool: Tool
   alias?: LaneToolRegistration
 } | undefined {
-  // Exact Tau names always win, including a custom tool whose name happens
-  // to match a lane-native name. Preserve existing Tau aliases as well.
+  // Exact OIO names always win, including a custom tool whose name happens
+  // to match a lane-native name. Preserve existing OIO aliases as well.
   const known = entry.tools.find(tool => tool.name === name) ?? findToolByName(entry.tools, name)
   if (known) return { tool: known }
   const alias = entry.nativeAliases.get(name)

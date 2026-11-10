@@ -38,7 +38,7 @@ export function preparePluginHookFile(
     onUnsupported({
       path: 'modules',
       message:
-        'This plugin uses hook modules (hooks.json "modules"), which this version of Tau does not support. ' +
+        'This plugin uses hook modules (hooks.json "modules"), which this version of OIO does not support. ' +
         'Its JavaScript/TypeScript mod hooks will not run. Declarative hooks in the same file are still loaded. ' +
         'Use a plugin version with declarative hooks or a host that supports the Claude Code mod runtime.',
     })

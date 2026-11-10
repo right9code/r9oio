@@ -1,5 +1,5 @@
 /**
- * Environment variables that tell a shell command which Tau session started
+ * Environment variables that tell a shell command which OIO session started
  * it and, for the model's own Bash/PowerShell tool calls, which provider,
  * model and effort the calling agent uses. Scripts, git hooks and CLIs can
  * read them. They live only in the spawned process's environment, never in a
@@ -27,7 +27,7 @@ export const AI_AGENT_NAME = 'tau'
 export type AgentModelEnv = {
   provider: string
   model: string
-  /** Set only when Tau knows the effort level the request actually uses. */
+  /** Set only when OIO knows the effort level the request actually uses. */
   effort?: string
 }
 
@@ -36,8 +36,8 @@ const OWNED_NAMES: ReadonlySet<string> = new Set(Object.values(AGENT_ENV))
 /**
  * Returns a copy of `env` carrying this session's agent variables.
  *
- * Every inherited value of an owned name is dropped first, so a Tau started
- * from another Tau's shell never reports its parent's session or model. On
+ * Every inherited value of an owned name is dropped first, so a OIO started
+ * from another OIO's shell never reports its parent's session or model. On
  * Windows, names are case-insensitive (PowerShell reads an inherited
  * `tau_model` as `$env:TAU_MODEL`), so copies in any letter case are dropped
  * there. Without `agentModel`, TAU_PROVIDER, TAU_MODEL and TAU_EFFORT stay

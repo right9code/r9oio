@@ -184,7 +184,7 @@ export async function startOpenAIOAuthFlow(): Promise<{
       if (refused.length) {
         throw new Error(
           `Port ${port} is held by ${describeOwners(refused)}. OpenAI only accepts this exact port, ` +
-          `so close that process and run /login again. Tau will not terminate it for you.`,
+          `so close that process and run /login again. OIO will not terminate it for you.`,
         )
       }
       if (freed) {
@@ -605,7 +605,7 @@ function renderSuccessPage(): string {
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>Signed in - Tau</title>
+  <title>Signed in - OIO</title>
   <style>
     :root { color-scheme: light dark; }
     * { box-sizing: border-box; }
@@ -640,7 +640,7 @@ function renderSuccessPage(): string {
   <main class="card">
     <div class="check">&#10003;</div>
     <h1>Signed in</h1>
-    <p>You can close this window and return to Tau.</p>
+    <p>You can close this window and return to OIO.</p>
   </main>
   <script>setTimeout(function(){ try { window.close() } catch (_) {} }, 1500);</script>
 </body>
@@ -652,7 +652,7 @@ function renderErrorPage(msg: string): string {
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>Authentication failed - Tau</title>
+  <title>Authentication failed - OIO</title>
   <style>
     body {
       font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
@@ -667,7 +667,7 @@ function renderErrorPage(msg: string): string {
 <body>
   <h1>Authentication failed</h1>
   <p>${escapeHtml(msg)}</p>
-  <p>Return to Tau and run <code>/login</code> to try again.</p>
+  <p>Return to OIO and run <code>/login</code> to try again.</p>
 </body>
 </html>`
 }

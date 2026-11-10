@@ -4,7 +4,7 @@
  */
 
 /**
- * A session ID uniquely identifies a Tau session.
+ * A session ID uniquely identifies a OIO session.
  * Returned by getSessionId().
  */
 export type SessionId = string & { readonly __brand: 'SessionId' }

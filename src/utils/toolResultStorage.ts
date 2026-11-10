@@ -266,7 +266,7 @@ function isAllowedToolResultPath(path: string): boolean {
 }
 
 /**
- * The whole project-local `.oio` directory is Tau-managed output space
+ * The whole project-local `.oio` directory is OIO-managed output space
  * (artifacts, diff-artifacts, mermaid, specs, and files the session itself
  * wrote there). Restricting retrieval to a hardcoded subdirectory list made
  * models loop on "Path must point inside …" for files they had just created
@@ -293,7 +293,7 @@ function isAllowedSavedTauOutputPath(path: string): boolean {
 
 /**
  * Git Bash / MSYS-style absolute paths (`/c/Users/…`, `/cygdrive/c/…`) come
- * back from models verbatim for paths Tau printed in Windows form. `resolve()`
+ * back from models verbatim for paths OIO printed in Windows form. `resolve()`
  * would misroot them at `<cwd drive>:\c\…`, so convert them first. Non-drive
  * POSIX paths (e.g. `/tmp/x`) are left alone.
  */
@@ -375,7 +375,7 @@ type ResolvedSavedOutputPath =
   | { ok: false; error: string }
 
 const PATH_NOT_ALLOWED_ERROR =
-  'Path must point inside a Tau tool-results directory, a project-local .oio directory, or a Tau-managed task output file. ' +
+  'Path must point inside a OIO tool-results directory, a project-local .oio directory, or a OIO-managed task output file. ' +
   'For ordinary project files, use the Read tool instead.'
 
 async function resolveByPath(rawPath: string): Promise<ResolvedSavedOutputPath> {

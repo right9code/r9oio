@@ -60,7 +60,7 @@ export function ConsoleOAuthFlow({
   const settings = getSettings_DEPRECATED() || {};
   const forceLoginMethod = forceLoginMethodProp ?? settings.forceLoginMethod;
   const orgUUID = settings.forceLoginOrgUUID;
-  const forcedMethodMessage = forceLoginMethod === 'claudeai' ? 'Login method pre-selected: Subscription Plan (Tau Pro/Max)' : forceLoginMethod === 'console' ? 'Login method pre-selected: API Usage Billing (Anthropic Console)' : null;
+  const forcedMethodMessage = forceLoginMethod === 'claudeai' ? 'Login method pre-selected: Subscription Plan (OIO Pro/Max)' : forceLoginMethod === 'console' ? 'Login method pre-selected: API Usage Billing (Anthropic Console)' : null;
   const terminal = useTerminalNotification();
   const [oauthStatus, setOAuthStatus] = useState<OAuthStatus>(() => {
     if (mode === 'setup-token') {
@@ -81,7 +81,7 @@ export function ConsoleOAuthFlow({
   const [cursorOffset, setCursorOffset] = useState(0);
   const [oauthService] = useState(() => new OAuthService());
   const [loginWithClaudeAi, setLoginWithClaudeAi] = useState(() => {
-    // Use Tau AI auth for setup-token mode to support user:inference scope
+    // Use OIO AI auth for setup-token mode to support user:inference scope
     return mode === 'setup-token' || forceLoginMethod === 'claudeai';
   });
   // After a few seconds we suggest the user to copy/paste url if the
@@ -241,7 +241,7 @@ export function ConsoleOAuthFlow({
           state: 'success'
         });
         void sendNotification({
-          message: 'Tau login successful',
+          message: 'OIO login successful',
           notificationType: 'auth_success'
         }, terminal);
       }
@@ -364,7 +364,7 @@ function OAuthStatusMessage(t0) {
   switch (oauthStatus.state) {
     case "idle":
       {
-        const t1 = startingMessage ? startingMessage : "Tau can be used with your Tau subscription or billed based on API usage through your Console account.";
+        const t1 = startingMessage ? startingMessage : "OIO can be used with your OIO subscription or billed based on API usage through your Console account.";
         let t2;
         if ($[0] !== t1) {
           t2 = <Text bold={true}>{t1}</Text>;
@@ -460,7 +460,7 @@ function OAuthStatusMessage(t0) {
         let t2;
         let t3;
         if ($[13] === Symbol.for("react.memo_cache_sentinel")) {
-          t2 = <Text>Tau supports Amazon Bedrock, Microsoft Foundry, and Vertex AI. Set the required environment variables, then restart Tau.</Text>;
+          t2 = <Text>OIO supports Amazon Bedrock, Microsoft Foundry, and Vertex AI. Set the required environment variables, then restart OIO.</Text>;
           t3 = <Text>If you are part of an enterprise organization, contact your administrator for setup instructions.</Text>;
           $[13] = t2;
           $[14] = t3;
@@ -554,7 +554,7 @@ function OAuthStatusMessage(t0) {
       {
         let t1;
         if ($[37] === Symbol.for("react.memo_cache_sentinel")) {
-          t1 = <Box flexDirection="column" gap={1}><Box><Spinner /><Text>Creating API key for Tau…</Text></Box></Box>;
+          t1 = <Box flexDirection="column" gap={1}><Box><Spinner /><Text>Creating API key for OIO…</Text></Box></Box>;
           $[37] = t1;
         } else {
           t1 = $[37];

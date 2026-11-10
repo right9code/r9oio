@@ -77,7 +77,7 @@ test('shows the file with line numbers and records a full read', () => {
     REDO,
   )
   assert(message?.startsWith('File has not been read yet, so nothing was changed.'), String(message))
-  assert(message?.includes('Tau read it for you now, which counts as your Read.'), 'says it counts as a read')
+  assert(message?.includes('OIO read it for you now, which counts as your Read.'), 'says it counts as a read')
   assert(message?.includes('(the line-number prefixes are not part of the file):\n'), 'explains the prefixes')
   assert(message?.includes('1\tone') && message.includes('2\ttwo'), 'shows numbered lines')
   const state = ctx.readFileState.get(FILE)

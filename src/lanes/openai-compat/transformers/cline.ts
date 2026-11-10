@@ -7,7 +7,7 @@
  *
  * Extra request headers: `workos:<token>` identifies the OAuth session,
  * `X-Title` / `HTTP-Referer` show up in Cline's analytics so free-tier
- * usage attributes back to Tau (matching the reference executor at
+ * usage attributes back to OIO (matching the reference executor at
  * reference/9router-master/open-sse/executors/cline.js).
  */
 

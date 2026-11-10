@@ -56,7 +56,7 @@ export function describeEmptyClineResponse(model: string, body: string): string 
 
 function clineErrorHint(body: string, lowered: string, model: string): string | null {
   if (lowered.includes(PRODUCT_SURFACE_MARKER)) {
-    return `${model} is one of Cline's free models. Cline serves its free models only inside the Cline IDE extension and CLI, not through the Cline API that Tau uses, so it refused this request. Pick a paid Cline model or a Cline Pass model with /models.`
+    return `${model} is one of Cline's free models. Cline serves its free models only inside the Cline IDE extension and CLI, not through the Cline API that OIO uses, so it refused this request. Pick a paid Cline model or a Cline Pass model with /models.`
   }
   if (NOT_SUBSCRIBED_MARKERS.some(marker => lowered.includes(marker))) {
     return 'This Cline account has no Cline Pass subscription, so Cline Pass models are not available to it. Subscribe to Cline Pass in your Cline account, or use the Cline provider with usage billing.'

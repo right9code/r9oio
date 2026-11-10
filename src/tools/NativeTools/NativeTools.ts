@@ -279,8 +279,8 @@ function formatSysinfo(json: string): string {
 
 function nativeUnavailableText(error: unknown): string {
   return error instanceof Error
-    ? `Native Tau helper unavailable: ${error.message}`
-    : 'Native Tau helper unavailable.'
+    ? `Native OIO helper unavailable: ${error.message}`
+    : 'Native OIO helper unavailable.'
 }
 
 export const NativeGitSummaryTool = buildTool({
@@ -290,7 +290,7 @@ export const NativeGitSummaryTool = buildTool({
   maxResultSizeChars: 20_000,
   isEnabled: isNativeTauToolsAvailable,
   async description() {
-    return 'Return a concise read-only Git repository summary using Tau native go-git integration.'
+    return 'Return a concise read-only Git repository summary using OIO native go-git integration.'
   },
   async prompt() {
     return 'Use for read-only Git context: current branch, HEAD, recent commits, and worktree status. Return the concise formatted summary, not raw JSON.'
@@ -346,7 +346,7 @@ export const NativeSysInfoTool = buildTool({
   maxResultSizeChars: 20_000,
   isEnabled: isNativeTauToolsAvailable,
   async description() {
-    return 'Return a concise sanitized local system/resource summary using Tau native gopsutil integration.'
+    return 'Return a concise sanitized local system/resource summary using OIO native gopsutil integration.'
   },
   async prompt() {
     return 'Use when local resource context matters, especially CPU, memory, disk, load, or process count. Return the concise formatted summary, not raw JSON.'

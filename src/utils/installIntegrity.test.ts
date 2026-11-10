@@ -67,7 +67,7 @@ function createTarget(root: string, packageName: string): string {
 function createTauTarget(fixture: Fixture): string {
   const target = join(fixture.packageRoot, 'dist', 'cli.mjs')
   mkdirSync(dirname(target), { recursive: true })
-  writeFileSync(target, '// healthy Tau launcher target\n')
+  writeFileSync(target, '// healthy OIO launcher target\n')
   return target
 }
 
@@ -114,15 +114,15 @@ async function test(name: string, run: () => Promise<void> | void) {
 
 console.log('launcher safety:')
 
-await test('updater preflight preserves a healthy Tau launcher', () =>
+await test('updater preflight preserves a healthy OIO launcher', () =>
   withFixture(async fixture => {
     const launcher = createLauncher(fixture, 'tau', createTauTarget(fixture))
     await cleanStaleBinShims(fixture.prefix, false, TAU_PACKAGE)
-    assert(entryExists(launcher), 'healthy Tau launcher was removed before npm ran')
+    assert(entryExists(launcher), 'healthy OIO launcher was removed before npm ran')
   }),
 )
 
-await test('updater preflight preserves a healthy absolute-path Tau launcher', () =>
+await test('updater preflight preserves a healthy absolute-path OIO launcher', () =>
   withFixture(async fixture => {
     const externalRoot = join(fixture.prefix, 'external-install')
     const target = createTarget(externalRoot, TAU_PACKAGE)
@@ -132,7 +132,7 @@ await test('updater preflight preserves a healthy absolute-path Tau launcher', (
     await cleanStaleBinShims(fixture.prefix, false, TAU_PACKAGE)
     assert(
       entryExists(launcher),
-      'healthy absolute-path Tau launcher was mistaken for dangling',
+      'healthy absolute-path OIO launcher was mistaken for dangling',
     )
   }),
 )
@@ -149,7 +149,7 @@ await test('updater preflight removes a dangling launcher', () =>
   }),
 )
 
-await test('package preinstall preserves healthy Tau and foreign launchers', () =>
+await test('package preinstall preserves healthy OIO and foreign launchers', () =>
   withFixture(fixture => {
     const tauLauncher = createLauncher(fixture, 'tau', createTauTarget(fixture))
     const foreignTarget = createTarget(
@@ -161,7 +161,7 @@ await test('package preinstall preserves healthy Tau and foreign launchers', () 
 
     cleanDanglingBinShims(fixture.binDir, TAU_PACKAGE)
 
-    assert(entryExists(tauLauncher), 'preinstall removed the healthy Tau launcher')
+    assert(entryExists(tauLauncher), 'preinstall removed the healthy OIO launcher')
     assert(entryExists(foreignLauncher), 'preinstall removed a healthy foreign launcher')
   }),
 )
@@ -178,7 +178,7 @@ await test('package preinstall removes only a dangling launcher', () =>
   }),
 )
 
-await test('confirmed EEXIST retry removes a healthy Tau-owned conflict', () =>
+await test('confirmed EEXIST retry removes a healthy OIO-owned conflict', () =>
   withFixture(async fixture => {
     const launcher = createLauncher(fixture, 'tau', createTauTarget(fixture))
     const removed = await removeConflictingShim(
@@ -187,8 +187,8 @@ await test('confirmed EEXIST retry removes a healthy Tau-owned conflict', () =>
       false,
       TAU_PACKAGE,
     )
-    assert(removed, 'confirmed Tau-owned conflict was not removed')
-    assert(!entryExists(launcher), 'Tau-owned conflict still exists')
+    assert(removed, 'confirmed OIO-owned conflict was not removed')
+    assert(!entryExists(launcher), 'OIO-owned conflict still exists')
   }),
 )
 
@@ -225,7 +225,7 @@ await test('confirmed EEXIST retry preserves a healthy foreign launcher', () =>
   }),
 )
 
-await test('confirmed EEXIST retry refuses a Tau launcher outside the global bin', () =>
+await test('confirmed EEXIST retry refuses a OIO launcher outside the global bin', () =>
   withFixture(async fixture => {
     const outsideDir = join(fixture.prefix, 'outside')
     mkdirSync(outsideDir, { recursive: true })
@@ -254,7 +254,7 @@ await test('confirmed EEXIST retry refuses a Tau launcher outside the global bin
   }),
 )
 
-await test('non-Windows EEXIST paths do not alias .cmd onto the Tau launcher', () => {
+await test('non-Windows EEXIST paths do not alias .cmd onto the OIO launcher', () => {
   if (process.platform === 'win32') return
   return withFixture(async fixture => {
     const launcher = createLauncher(fixture, 'tau', createTauTarget(fixture))
@@ -264,12 +264,12 @@ await test('non-Windows EEXIST paths do not alias .cmd onto the Tau launcher', (
       false,
       TAU_PACKAGE,
     )
-    assert(!removed, 'a non-Windows .cmd path was treated as the Tau launcher')
-    assert(entryExists(launcher), 'the healthy Unix Tau launcher was removed')
+    assert(!removed, 'a non-Windows .cmd path was treated as the OIO launcher')
+    assert(entryExists(launcher), 'the healthy Unix OIO launcher was removed')
   })
 })
 
-await test('a package-name mention alone is not proof of Tau ownership', () =>
+await test('a package-name mention alone is not proof of OIO ownership', () =>
   withFixture(async fixture => {
     const launcher = launcherPath(fixture, 'tau')
     writeFileSync(launcher, `echo documentation for ${TAU_PACKAGE}\n`)

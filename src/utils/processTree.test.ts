@@ -71,7 +71,7 @@ test('Windows spawns System32 taskkill.exe by absolute path, without a shell', (
   assert(file === 'D:\\Windows\\System32\\taskkill.exe', `wrong file: ${file}`)
   assert(same(args, ['/PID', '1234', '/T', '/F']), `wrong args: ${JSON.stringify(args)}`)
   assert(!('shell' in options), 'no shell option may be set')
-  assert(options.detached === true, 'taskkill must be detached to outlive Tau')
+  assert(options.detached === true, 'taskkill must be detached to outlive OIO')
   assert(options.windowsHide === true, 'taskkill must not open a window')
   assert(options.stdio === 'ignore', 'taskkill output must be ignored')
   assert(f.treeKillCalls.length === 0, 'tree-kill must not run on Windows')

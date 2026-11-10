@@ -175,7 +175,7 @@ async function ensureShadowRepo(projectCwd: string): Promise<string | null> {
   }
   const configs: Array<[string, string]> = [
     ['user.email', 'snapshot@tau.local'],
-    ['user.name', 'Tau Snapshot'],
+    ['user.name', 'OIO Snapshot'],
     // Disable filesystem monitor in the shadow repo so we never spawn a
     // watchman/fsmonitor daemon for it.
     ['core.fsmonitor', 'false'],

@@ -1,7 +1,7 @@
 /**
  * How full the context window is, as both status rows report it.
  *
- * Tau has two rows that show this: the built-in session bar
+ * OIO has two rows that show this: the built-in session bar
  * (PromptInputStatusBar) and a user's `statusLine` command, which receives it
  * as `context_window` JSON. They used to be computed separately and drifted:
  * the command got the provider's count of the last prompt, while the bar

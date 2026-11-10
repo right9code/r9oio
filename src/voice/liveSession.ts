@@ -251,22 +251,22 @@ export class LiveVoiceSession {
     this.armDelegationTimeout(event.item.id)
     if (!this.capture) this.update({ phase: 'working' })
     if (!this.bridge) {
-      this.finish('Tau is not ready to accept this request. Ask again once the prompt is ready.', event.item.id)
+      this.finish('OIO is not ready to accept this request. Ask again once the prompt is ready.', event.item.id)
       return
     }
     try {
       Promise.resolve(this.bridge.submit(request, event.item.id)).catch(error => {
-        this.finish(`Tau could not submit the request: ${error instanceof Error ? error.message : String(error)}`, event.item.id)
+        this.finish(`OIO could not submit the request: ${error instanceof Error ? error.message : String(error)}`, event.item.id)
       })
     } catch (error) {
-      this.finish(`Tau could not submit the request: ${error instanceof Error ? error.message : String(error)}`, event.item.id)
+      this.finish(`OIO could not submit the request: ${error instanceof Error ? error.message : String(error)}`, event.item.id)
     }
   }
   private armDelegationTimeout(requestId: string): void {
     clearTimeout(this.delegationTimers.get(requestId))
     const timer = setTimeout(() => {
       this.delegationTimers.delete(requestId)
-      this.finish('Tau never reported a result for this request, so it was given up on. Tell the user to check the terminal and ask again.', requestId)
+      this.finish('OIO never reported a result for this request, so it was given up on. Tell the user to check the terminal and ask again.', requestId)
     }, DELEGATION_IDLE_TIMEOUT_MS)
     timer.unref?.()
     this.delegationTimers.set(requestId, timer)

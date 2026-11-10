@@ -112,14 +112,14 @@ export function ThemePicker({
     <Box flexDirection="column" gap={1}>
       <Box flexDirection="column" gap={1}>
         {showIntroText ? (
-          <Text>Configure Tau.</Text>
+          <Text>Configure OIO.</Text>
         ) : (
           <Text bold color="permission">
             Theme
           </Text>
         )}
         <Box flexDirection="column">
-          <Text bold>Choose the terminal theme for Tau</Text>
+          <Text bold>Choose the terminal theme for OIO</Text>
           {helpText && !showHelpTextBelow && <Text dimColor>{helpText}</Text>}
         </Box>
         <Select

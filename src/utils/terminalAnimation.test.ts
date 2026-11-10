@@ -7,7 +7,7 @@
  * animation stopped for the session; a frame queued before the last one was
  * taken makes a slow terminal fall further behind with every frame. The files
  * are made here with the image processor itself, so the decoder under test is
- * the one Tau ships.
+ * the one OIO ships.
  *
  * Run via: bun run src/utils/terminalAnimation.test.ts
  */

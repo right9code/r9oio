@@ -60,7 +60,7 @@ const PROMPTS: Record<LearnedAction, () => string> = {
     return `${header()}
 
 ## Task: show what I've learned
-List every active lesson — the \`origin: learned\` files in the active memory dir — as concise bullet points (one per lesson, its general takeaway). These are what Tau actually uses. If there are none, say so.
+List every active lesson — the \`origin: learned\` files in the active memory dir — as concise bullet points (one per lesson, its general takeaway). These are what OIO actually uses. If there are none, say so.
 
 Then check \`${stagingDir}\` for any leftover staged proposals from the old two-step flow. If any exist, list them separately under **Leftover proposals** and offer to either **activate** them (move the file into the active dir + add a \`MEMORY.md\` pointer) or **delete** them. If the dir is empty or missing, ignore it. Otherwise change nothing.
 
@@ -100,7 +100,7 @@ List the active lessons (\`origin: learned\` files) as a **numbered list**, one 
 ${SHARED_RULES}`,
 }
 
-export const HELP_TEXT = `/learned — review and manage what Tau learns automatically.
+export const HELP_TEXT = `/learned — review and manage what OIO learns automatically.
 
 Usage:
   /learned            open the menu (navigate with ↑/↓, Enter to pick, Esc to cancel)

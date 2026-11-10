@@ -86,7 +86,7 @@ export function IdeOnboardingDialog(t0) {
   }
   let t9;
   if ($[11] === Symbol.for("react.memo_cache_sentinel")) {
-    t9 = <Text>• Tau has context of {t8}{" "}and <Text color="suggestion">⧉ selected lines</Text></Text>;
+    t9 = <Text>• OIO has context of {t8}{" "}and <Text color="suggestion">⧉ selected lines</Text></Text>;
     $[11] = t9;
   } else {
     t9 = $[11];
@@ -100,7 +100,7 @@ export function IdeOnboardingDialog(t0) {
   }
   let t11;
   if ($[13] === Symbol.for("react.memo_cache_sentinel")) {
-    t11 = <Text>• Review Tau's changes{" "}{t10}{" "}<Text color="diffRemovedWord">-22</Text> in the comfort of your IDE</Text>;
+    t11 = <Text>• Review OIO's changes{" "}{t10}{" "}<Text color="diffRemovedWord">-22</Text> in the comfort of your IDE</Text>;
     $[13] = t11;
   } else {
     t11 = $[13];

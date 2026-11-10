@@ -54,7 +54,7 @@ export async function stopTask(
       throw new StopTaskError(
         ended.kind === 'recorded'
           ? `Task ${taskId} is not running (${describeTaskOutcome(ended.outcome)})`
-          : `Task ${taskId} is not running in this Tau process`,
+          : `Task ${taskId} is not running in this OIO process`,
         'not_running',
       )
     }

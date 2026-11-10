@@ -87,7 +87,7 @@ function auraText(
 }
 
 /**
- * Compact Tau sigil. The exported name stays Clawd so existing layout and
+ * Compact OIO sigil. The exported name stays Clawd so existing layout and
  * animation wiring can migrate without touching every caller in this pass.
  *
  * Animated when uncontrolled: the ember aura cycles, a brighter light-sweep

@@ -40,7 +40,7 @@ function getBackgroundUsageNote(): string | null {
   if (isEnvTruthy(process.env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS)) {
     return null
   }
-  return 'For servers/watchers/tunnels/port-forwards and other long-lived work, set `run_in_background: true`. Never detach inside `command` with `&`, `nohup`, `disown`, `echo $!`, `docker compose up -d`, or `docker run -d`; Tau tracks completion.'
+  return 'For servers/watchers/tunnels/port-forwards and other long-lived work, set `run_in_background: true`. Never detach inside `command` with `&`, `nohup`, `disown`, `echo $!`, `docker compose up -d`, or `docker run -d`; OIO tracks completion.'
 }
 
 function getCommitAndPRInstructions(): string {
@@ -233,7 +233,7 @@ export function getSimplePrompt(): string {
           'Use the Monitor tool to stream events from a background process (each stdout line is a notification). For one-shot "wait until done," use Bash with run_in_background instead.',
         ]
       : []),
-    'Use `run_in_background` for long work; Tau reports completion, so do not poll.',
+    'Use `run_in_background` for long work; OIO reports completion, so do not poll.',
     ...(feature('MONITOR_TOOL')
       ? [
           '`sleep N` as the first command with N ≥ 2 is blocked. If you need a delay (rate limiting, deliberate pacing), keep it under 2 seconds.',
@@ -252,7 +252,7 @@ export function getSimplePrompt(): string {
     'Before file creation or project build/test/package commands, verify the target directory and relevant manifest exist. Never guess paths.',
     'Run commands directly; `plan_only: true` requires an explicit user request for a dry-run plan, never routine preflight for Python/package/build/test/cleanup commands.',
     `\`timeout\` is milliseconds; default ${getDefaultTimeoutMs()}, maximum ${getMaxTimeoutMs()}.`,
-    'For charts/plots/images, print one `data:image/png;base64,...` URI as the entire stdout; Tau renders it inline and sends you the image. Prefer this to ASCII plots (plotext). With matplotlib, use Agg and savefig to an in-memory buffer.',
+    'For charts/plots/images, print one `data:image/png;base64,...` URI as the entire stdout; OIO renders it inline and sends you the image. Prefer this to ASCII plots (plotext). With matplotlib, use Agg and savefig to an in-memory buffer.',
     ...(backgroundNote !== null ? [backgroundNote] : []),
     'Shell correctness:',
     commandBestPractices,

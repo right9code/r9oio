@@ -159,7 +159,7 @@ export default class App extends PureComponent<Props, State> {
     if (this.unclaimedResponsesLogged >= MAX_UNCLAIMED_RESPONSE_LOGS) return;
     this.unclaimedResponsesLogged++;
     const detail = response.type === 'pixelSize' ? `${response.kind} size ${response.width}x${response.height}px` : response.type === 'xtversion' ? `XTVERSION "${response.name}"` : response.type === 'da1' ? `DA1 [${response.params.join(',')}]` : response.type;
-    logForDebugging(`terminal reply arrived with nothing waiting for it: ${detail}. Usually it came after the DA1 reply that closed its query batch, meaning something between Tau and the terminal answered DA1 first (an old Windows ConPTY does)`);
+    logForDebugging(`terminal reply arrived with nothing waiting for it: ${detail}. Usually it came after the DA1 reply that closed its query batch, meaning something between OIO and the terminal answered DA1 first (an old Windows ConPTY does)`);
   }
 
   // Multi-click tracking for double/triple-click text selection. A click
@@ -673,7 +673,7 @@ export default class App extends PureComponent<Props, State> {
       this.props.stdout.write(SHOW_CURSOR + DFE + DISABLE_MOUSE_TRACKING);
     }
 
-    // Emit suspend event for Tau to handle. Mostly just has a notification
+    // Emit suspend event for OIO to handle. Mostly just has a notification
     this.internal_eventEmitter.emit('suspend');
 
     // Set up resume handler
@@ -694,7 +694,7 @@ export default class App extends PureComponent<Props, State> {
         this.props.stdout.write(EFE);
       }
 
-      // Emit resume event for Tau to handle
+      // Emit resume event for OIO to handle
       this.internal_eventEmitter.emit('resume');
       process.removeListener('SIGCONT', resumeHandler);
     };

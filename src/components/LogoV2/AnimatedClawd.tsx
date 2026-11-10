@@ -21,7 +21,7 @@ function hold(pose: ClawdPose, offset: number, frames: number): Frame[] {
   }))
 }
 
-// Tau sigil animations with a subtle aura shimmer.
+// OIO sigil animations with a subtle aura shimmer.
 // Jump: crouch, spring up with arms-up. Twice.
 const GHOST_JUMP: readonly Frame[] = [
   ...hold('default', 1, 3), // crouch
@@ -41,7 +41,7 @@ const GHOST_LOOK: readonly Frame[] = [
   ...hold('default', 0, 2),
 ]
 
-// Tau float: gentle bobbing motion for the compact sigil.
+// OIO float: gentle bobbing motion for the compact sigil.
 const GHOST_FLOAT: readonly Frame[] = [
   ...hold('default', 0, 4),
   ...hold('default', 1, 3), // dip down slightly
@@ -65,12 +65,12 @@ const IDLE: Frame = {
 const FRAME_MS = 70
 // Idle shimmer: cycle the aura while the sigil only bobs occasionally.
 const IDLE_SWIM_MS = 420
-// Height accommodates the Tau sigil plus one cell of headroom for
+// Height accommodates the OIO sigil plus one cell of headroom for
 // the bob animation so the row above never clips.
 const CLAWD_HEIGHT = 8
 
 /**
- * Tau sigil with click-triggered animations (jump, look-around, float)
+ * OIO sigil with click-triggered animations (jump, look-around, float)
  * plus a subtle idle hover when at rest.
  * Container height is fixed at CLAWD_HEIGHT so surrounding layout never shifts.
  */

@@ -104,7 +104,7 @@ function storedChoice(): VisionModelChoice | null {
   }
 }
 
-/** The describer Tau will use, or null when nothing is configured for it. */
+/** The describer OIO will use, or null when nothing is configured for it. */
 export function resolveVisionModel(): VisionModelChoice | null {
   if (process.env.TAU_VISION_DISABLED === '1') return null
   try {

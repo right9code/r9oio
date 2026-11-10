@@ -15,7 +15,7 @@
  * so it survives any Windows console code page. Python 3.8 syntax at most:
  * this runs on whatever interpreter the user has.
  */
-export const PYTHON_DOCS_SOURCE = String.raw`"""Tau's local document reader. Run by tau, never imported."""
+export const PYTHON_DOCS_SOURCE = String.raw`"""OIO's local document reader. Run by tau, never imported."""
 import datetime
 import json
 import os

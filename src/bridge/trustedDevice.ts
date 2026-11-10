@@ -147,7 +147,7 @@ export async function enrollTrustedDevice(): Promise<void> {
         device_id?: string
       }>(
         `${baseUrl}/api/auth/trusted_devices`,
-        { display_name: `Tau on ${hostname()} · ${process.platform}` },
+        { display_name: `OIO on ${hostname()} · ${process.platform}` },
         {
           headers: {
             Authorization: `Bearer ${accessToken}`,

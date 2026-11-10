@@ -86,7 +86,7 @@ function isReasoningCapable(model: string): boolean {
 // The gateway forwards Anthropic-shape `thinking.budget_tokens` and
 // Google-shape `thinking_config.thinking_budget` literally to the underlying
 // provider. Match the budgets opencode-dev's own variants() function uses
-// so a Tau "high" feels the same as opencode's "high".
+// so a OIO "high" feels the same as opencode's "high".
 function anthropicBudgetFor(effort: OpencodeEffort): number {
   switch (effort) {
     case 'low': return 4000
@@ -414,7 +414,7 @@ export function buildOpencodeHeaders(
   ctx?: HeaderContext,
   version = OPENCODE_UA_VERSION,
 ): Record<string, string> {
-  // Keep Tau attribution and the user's overrides. The session drives
+  // Keep OIO attribution and the user's overrides. The session drives
   // gateway affinity; the request/project headers are telemetry hints.
   const sessionId = ctx?.sessionId ?? getProcessSessionId()
   const headers: Record<string, string> = {

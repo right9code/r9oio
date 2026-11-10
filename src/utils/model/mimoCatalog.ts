@@ -93,7 +93,7 @@ export interface MimoCatalogRow {
  * Fold a live `/v1/models` response into the metadata map. MiMo's catalog
  * endpoint returns a plain OpenAI list, so unknown rows inherit conservative
  * defaults rather than being dropped — a new MiMo model stays usable without
- * a Tau release.
+ * a OIO release.
  */
 export function recordMimoCatalog(rows: readonly MimoCatalogRow[]): void {
   for (const row of rows) {

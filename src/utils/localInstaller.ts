@@ -151,7 +151,7 @@ export async function ensureLocalPackageEnvironment(): Promise<boolean> {
     // Create installation directory (recursive, idempotent)
     await getFsImplementation().mkdir(localInstallDir)
 
-    // Create or migrate the managed package policy before npm installs Tau.
+    // Create or migrate the managed package policy before npm installs OIO.
     const manifestPath = join(localInstallDir, 'package.json')
     const initialManifest = {
       name: 'tau-local',
@@ -168,7 +168,7 @@ export async function ensureLocalPackageEnvironment(): Promise<boolean> {
         await readFile(manifestPath, 'utf8'),
       ) as Record<string, unknown>
       const currentPolicy = currentManifest.allowScripts
-      // This directory is Tau-managed, so keep the policy exact. Retaining
+      // This directory is OIO-managed, so keep the policy exact. Retaining
       // arbitrary old approvals would let a future dependency reuse them.
       const nextPolicy = LOCAL_ALLOW_SCRIPTS_POLICY
       if (
@@ -188,7 +188,7 @@ export async function ensureLocalPackageEnvironment(): Promise<boolean> {
       }
     }
 
-    // Keep both wrappers so old local aliases still land on the Tau binary.
+    // Keep both wrappers so old local aliases still land on the OIO binary.
     const wrapperContents = buildManagedLocalWrapper(localInstallDir)
     for (const wrapperName of ['tau', 'claude']) {
       const wrapperPath = join(localInstallDir, wrapperName)
@@ -209,7 +209,7 @@ export async function ensureLocalPackageEnvironment(): Promise<boolean> {
 }
 
 /**
- * Install or update Tau CLI package in the local directory
+ * Install or update OIO CLI package in the local directory
  * @param channel - Release channel to use (latest or stable)
  * @param specificVersion - Optional specific version to install (overrides channel)
  */
@@ -278,7 +278,7 @@ export async function installOrUpdateTauPackage(
 
       if (result.code !== 0) {
         const error = new Error(
-          `Failed to install Tau CLI package: ${result.stderr}`,
+          `Failed to install OIO CLI package: ${result.stderr}`,
         )
         logError(error)
         return result.code === 190 ? 'in_progress' : 'install_failed'
@@ -293,7 +293,7 @@ export async function installOrUpdateTauPackage(
       )
       if (!(await verifyInstalledPackage(installedRoot, { env: npmEnv }))) {
         logError(
-          new Error('Local Tau install has an incomplete dependency tree'),
+          new Error('Local OIO install has an incomplete dependency tree'),
         )
         return 'install_failed'
       }

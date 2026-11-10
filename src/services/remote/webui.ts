@@ -25,7 +25,7 @@ export const REMOTE_HTML = `<!doctype html>
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="color-scheme" content="light dark">
 <meta name="mobile-web-app-capable" content="yes">
-<title>Tau Remote</title>
+<title>OIO Remote</title>
 <style>
   *{box-sizing:border-box}
   :root{
@@ -299,7 +299,7 @@ export const REMOTE_HTML = `<!doctype html>
     </g>
   </svg>
   <span class="hmeta">
-    <div class="hname" id="cwd">Tau</div>
+    <div class="hname" id="cwd">OIO</div>
     <div class="hsub" id="sub">connecting…</div>
   </span>
   <span class="dot" id="dot"></span>
@@ -308,7 +308,7 @@ export const REMOTE_HTML = `<!doctype html>
 <div id="asks"></div>
 <footer style="position:relative">
   <div id="palette"></div>
-  <textarea id="box" rows="1" placeholder="Reply to Tau…" autocapitalize="sentences"></textarea>
+  <textarea id="box" rows="1" placeholder="Reply to OIO…" autocapitalize="sentences"></textarea>
   <button id="send">Send</button>
 </footer>
 <script>
@@ -617,7 +617,7 @@ export const REMOTE_HTML = `<!doctype html>
     log.innerHTML=''; asksEl.innerHTML='';
     cards={}; asks={}; busy=false;
     var base=String(m.cwd||'').split(/[\\\\/]/).filter(Boolean).pop();
-    cwdEl.textContent=base||'Tau';
+    cwdEl.textContent=base||'OIO';
     model=m.model||'';
     subEl.textContent=[model, m.cwd].filter(Boolean).join('  \\u00b7  ');
     commands=Array.isArray(m.commands)?m.commands:[];

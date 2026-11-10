@@ -112,7 +112,7 @@ export function LspRecommendationMenu(props: Props): React.ReactNode {
           <Text> {fileExtension} files</Text>
         </Box>
         <Box marginTop={1}>
-          <Text>Would you like Tau to configure this LSP?</Text>
+          <Text>Would you like OIO to configure this LSP?</Text>
         </Box>
         <Box>
           <Select

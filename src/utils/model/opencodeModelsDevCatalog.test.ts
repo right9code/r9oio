@@ -61,7 +61,7 @@ test('records the SDK override and image input that pick the gateway route', () 
       'claude-opus-5-5': { reasoning: false, provider: { npm: '@ai-sdk/anthropic' }, modalities: { input: ['text', 'image', 'pdf'] } },
       'gpt-5.5': { reasoning: false, provider: { npm: '@ai-sdk/openai' } },
       'gemini-3.7-flash': { reasoning: false, provider: { npm: '@ai-sdk/google' }, modalities: { input: ['text'] } },
-      // An SDK Tau has no route for is left to /chat/completions.
+      // An SDK OIO has no route for is left to /chat/completions.
       'jev-1.13': { reasoning: false, provider: { npm: '@ai-sdk/unknown' } },
     },
   })

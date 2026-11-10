@@ -19,7 +19,7 @@
  * Prompt cache: the relay does not accept Anthropic `cache_control` markers,
  * so those are stripped (`cacheControlMode: 'none'`) and cache hits ride on
  * prefix stability instead -- identical system + tools + message prefix across
- * turns. `prompt_cache_key`/`user` carry the stable Tau session id so a relay
+ * turns. `prompt_cache_key`/`user` carry the stable OIO session id so a relay
  * that load-balances across upstream replicas pins this conversation to one
  * of them; without that pin every turn lands on a cold KV cache. LXD is
  * registered in cacheAffinity's STABLE_REQUEST_SESSION_PROVIDERS so the id

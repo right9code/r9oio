@@ -86,7 +86,7 @@ export function postLiveOffer(body: string, headers: Record<string, string>, sig
  * refusing the request, so 404 is an entitlement answer, not a missing path. */
 export function describeSignalingFailure(status: number, detail: string): string {
   if (status === 404) {
-    return 'Codex voice is not available on this ChatGPT account (404). The realtime voice route is part of a paid Codex plan; a free Codex session cannot open a call, and OpenAI hides the route rather than refusing it. Check your plan with /usage. Nothing in Tau can work around this.'
+    return 'Codex voice is not available on this ChatGPT account (404). The realtime voice route is part of a paid Codex plan; a free Codex session cannot open a call, and OpenAI hides the route rather than refusing it. Check your plan with /usage. Nothing in OIO can work around this.'
   }
   if ([401, 403].includes(status)) {
     return `Codex voice access was refused (${status}). Sign in with ChatGPT OAuth in /login; your account must have access to Codex voice.`

@@ -58,7 +58,7 @@ Queries: "select:Read,Edit,Grep" for exact names; "notebook jupyter" for keyword
  */
 export function isDeferredTool(tool: Tool): boolean {
   // Provider gate. Deferral is enabled only for Anthropic's native discovery
-  // transport or a Tau lane with a verified client-side implementation. Every
+  // transport or a OIO lane with a verified client-side implementation. Every
   // other/dedicated provider receives eager schemas. The central policy also
   // keeps cheap client-native lanes eager for prefix-cache stability while
   // retaining server-native deferral, whose physical tool block stays fixed.

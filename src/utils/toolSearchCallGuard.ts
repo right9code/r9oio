@@ -48,7 +48,7 @@ export function getProviderFilteredToolCallDecision(
  * hidden. Such a call is not refused outright — that cost a turn and surfaced
  * an internal recovery error even when the arguments were correct. It is
  * reported as `execute_unverified` instead, and the caller checks those
- * arguments against the schema Tau already holds locally before running it.
+ * arguments against the schema OIO already holds locally before running it.
  *
  * Definitive request gates are recomputed here. If discovery was disabled,
  * unsupported, below an auto threshold, or missing ToolSearch, eager schemas

@@ -63,7 +63,7 @@ const seconds = (date: string): number => Math.floor(Date.parse(date) / 1000)
 /**
  * Text models that can drive an agent. Left out: the Imagine image/video
  * rows (no text output) and grok-4.20-multi-agent-0309, which models.dev
- * lists without client-side tool calling — every Tau turn needs it.
+ * lists without client-side tool calling — every OIO turn needs it.
  */
 const SNAPSHOT: readonly XaiModelMeta[] = [
   {
@@ -172,7 +172,7 @@ const SNAPSHOT: readonly XaiModelMeta[] = [
 
 const SNAPSHOT_BY_ID = new Map(SNAPSHOT.map(model => [model.id, model]))
 
-/** One row of `GET /v1/models`, as far as Tau relies on it. */
+/** One row of `GET /v1/models`, as far as OIO relies on it. */
 export interface XaiApiModel {
   id?: string
   aliases?: string[]
@@ -205,7 +205,7 @@ function positive(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : undefined
 }
 
-/** xAI quotes USD cents per 100 million tokens; Tau prices per million. */
+/** xAI quotes USD cents per 100 million tokens; OIO prices per million. */
 function perMillion(centsPer100M: unknown): number | undefined {
   const value = positive(centsPer100M)
   return value === undefined ? undefined : value / 10_000

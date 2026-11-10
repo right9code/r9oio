@@ -16,7 +16,7 @@ type ParsedOpenRouterAlias = {
 }
 
 /**
- * Resolves Tau/OpenRouter virtual selectors such as `openrouter/free` or
+ * Resolves OIO/OpenRouter virtual selectors such as `openrouter/free` or
  * `openrouter/pro/opus` to a concrete OpenRouter model id. Literal
  * OpenRouter model ids, including `openrouter/auto`, are left unchanged.
  */

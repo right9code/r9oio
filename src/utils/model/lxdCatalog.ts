@@ -2,7 +2,7 @@
  * LXD API model catalog.
  *
  * LXD (api.lxds.org) publishes an OpenRouter-shaped `/v1/models` document
- * that already carries everything Tau needs to drive the picker:
+ * that already carries everything OIO needs to drive the picker:
  *
  *   capabilities.reasoning_efforts  -> the effort ladder for THIS model
  *   capabilities.reasoning          -> whether the effort chip shows at all
@@ -15,7 +15,7 @@
  * and several rows expose only high. So the picker reads the ladder from here
  * instead of hardcoding one, and `recordLxdCatalog` refreshes it from every
  * live `/v1/models` response: a model LXD adds tomorrow gets a correct chip
- * without a Tau release.
+ * without a OIO release.
  *
  * The static seed below is the catalog as published on 2026-08-23; it is the
  * synchronous fallback for the very first paint (and for offline use) before
@@ -31,7 +31,7 @@ import type { ModelInfo } from '../../services/api/providers/base_provider.js'
  */
 export type LxdReasoningType = 'native' | 'tags' | 'auto' | 'none'
 
-/** Effort stops LXD accepts. 'default' is Tau-side: send no field at all. */
+/** Effort stops LXD accepts. 'default' is OIO-side: send no field at all. */
 export type LxdEffort = 'default' | 'none' | 'low' | 'medium' | 'high' | 'max'
 
 /** Every effort LXD has been observed to accept, for validating stored picks. */
@@ -50,7 +50,7 @@ export interface LxdModelMeta {
   contextWindow: number
   maxOutputTokens: number
   reasoningType: LxdReasoningType
-  /** Ladder as published by the API, WITHOUT the Tau-side 'default' stop. */
+  /** Ladder as published by the API, WITHOUT the OIO-side 'default' stop. */
   reasoningEfforts: readonly LxdEffort[]
   vision: boolean
   tools: boolean

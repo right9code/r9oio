@@ -4,7 +4,7 @@
  *
  * `tools/list`, `resources/list` and `prompts/list` are paginated in the MCP
  * protocol: a result may carry `nextCursor`, and the caller is expected to ask
- * again until it does not. Tau read one page, so a server publishing more
+ * again until it does not. OIO read one page, so a server publishing more
  * tools than its page size had the rest silently missing — the model then saw
  * a catalog that did not match what the server offered.
  *

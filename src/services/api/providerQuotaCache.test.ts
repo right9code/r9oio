@@ -266,7 +266,7 @@ test('matches model ids to labels across punctuation and case', () => {
 })
 
 // Antigravity labels its rows with Google's own displayName, which is neither
-// the id a request is made with nor Tau's to keep stable. These pools carry
+// the id a request is made with nor OIO's to keep stable. These pools carry
 // the ids alongside, which is what makes the match survive a rename.
 const ANTIGRAVITY_RENAMED_POOLS = report('ok', [
   { label: 'Fast', usedPercent: 25, modelKeys: ['gemini-3.8-flash-high'] },

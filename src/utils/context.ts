@@ -142,7 +142,7 @@ export function getSonnet1mExpTreatmentEnabled(model: string): boolean {
 /**
  * Tokens a request's prompt occupied: fresh input plus cache writes and reads.
  *
- * Tau's usage buckets are additive, so this is the whole prompt the provider
+ * OIO's usage buckets are additive, so this is the whole prompt the provider
  * metered — system prompt, tools, memory and conversation alike. Output is not
  * included, matching how `context_window.used_percentage` has always been
  * defined for statusLine scripts.

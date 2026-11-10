@@ -248,7 +248,7 @@ export function AUTO_REJECT_MESSAGE(toolName: string): string {
   return `Permission to use ${toolName} has been denied. ${DENIAL_WORKAROUND_GUIDANCE}`
 }
 export function DONT_ASK_REJECT_MESSAGE(toolName: string): string {
-  return `Permission to use ${toolName} has been denied because Tau is running in don't ask mode. ${DENIAL_WORKAROUND_GUIDANCE}`
+  return `Permission to use ${toolName} has been denied because OIO is running in don't ask mode. ${DENIAL_WORKAROUND_GUIDANCE}`
 }
 export const NO_RESPONSE_REQUESTED = 'No response requested.'
 
@@ -3856,7 +3856,7 @@ Read the team config to discover your teammates' names. Check the task list peri
           content = `Mode is now 'full': all optional tools are enabled. Follow the current tool list and standard dedicated-tool boundaries.`
           break
         case 'normal':
-          content = `Mode is now 'normal': standard Tau tool routing applies. Follow the current tool list.`
+          content = `Mode is now 'normal': standard OIO tool routing applies. Follow the current tool list.`
           break
       }
       return wrapMessagesInSystemReminder([

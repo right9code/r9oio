@@ -14,7 +14,7 @@ const desktop = {
   type: 'local-jsx',
   name: 'desktop',
   aliases: ['app'],
-  description: 'Continue the current session in Tau Desktop',
+  description: 'Continue the current session in OIO Desktop',
   availability: ['claude-ai'],
   isEnabled: isSupportedPlatform,
   get isHidden() {

@@ -84,9 +84,9 @@ export function normalizePowerMode(value: string): PowerMode | null {
  * The power mode THIS process (session) is running in, pinned in memory.
  *
  * Why a pin exists: powerMode is persisted in the shared user settings.json,
- * and Tau's settings file-watcher (utils/settings/changeDetector.ts) applies
+ * and OIO's settings file-watcher (utils/settings/changeDetector.ts) applies
  * external edits to that file LIVE. Without a pin, a second concurrently
- * running Tau session that runs `/mode` writes powerMode to the shared file,
+ * running OIO session that runs `/mode` writes powerMode to the shared file,
  * this session's watcher fires, resetSettingsCache() + applySettingsChange()
  * run, and this session silently switches mode mid-conversation — the
  * cross-session leak users hit ("switch mode in session B, session A inherits

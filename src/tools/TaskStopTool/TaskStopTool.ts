@@ -64,10 +64,10 @@ async function notRunningOutput(
   if (!ended) return null
   if (ended.kind === 'recorded') return alreadyFinished(ended.outcome)
   return {
-    message: `Task ${id} is not running in this Tau process (it ran before a restart or in another session); nothing to stop here. Output file: ${ended.outputFile}`,
+    message: `Task ${id} is not running in this OIO process (it ran before a restart or in another session); nothing to stop here. Output file: ${ended.outputFile}`,
     task_id: id,
     task_type: 'unknown',
-    not_stopped: 'not running in this Tau process',
+    not_stopped: 'not running in this OIO process',
   }
 }
 

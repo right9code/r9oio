@@ -2814,7 +2814,7 @@ class BrowserSessionService {
       .send("Page.addScriptToEvaluateOnNewDocument", { source }, sessionId)
       .catch(() => undefined);
     // The new-document hook covers future navigations; this covers the page
-    // already loaded when Tau attaches to an existing browser.
+    // already loaded when OIO attaches to an existing browser.
     await client
       .send(
         "Runtime.evaluate",

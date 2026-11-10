@@ -4,7 +4,7 @@
  * OCR answers "what text is in this picture". It cannot answer "what does this
  * picture show", so a screenshot of a broken layout, a chart, or a mockup comes
  * back empty and the model receives a marker. A vision model answers the second
- * question, and Tau is unusually well placed to ask it: it already holds
+ * question, and OIO is unusually well placed to ask it: it already holds
  * credentials for several providers at once, so it can borrow sight from one
  * while coding on another.
  *
@@ -17,7 +17,7 @@
  * run standalone.
  */
 
-/** The three request shapes that cover every vision-capable provider Tau speaks. */
+/** The three request shapes that cover every vision-capable provider OIO speaks. */
 export type VisionFamily = 'anthropic' | 'openai' | 'gemini'
 
 export type VisionModelChoice = {
@@ -54,7 +54,7 @@ export function visionFamilyFor(provider: string | undefined): VisionFamily | nu
   return FAMILY_BY_PROVIDER[provider] ?? null
 }
 
-/** Providers Tau can shape a describe request for, in display order. */
+/** Providers OIO can shape a describe request for, in display order. */
 export function describerCapableProviders(
   configured: readonly string[],
 ): string[] {

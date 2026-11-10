@@ -1,6 +1,6 @@
 import { getGlobalConfig, saveGlobalConfig } from 'src/utils/config.js'
 
-// Tau does not import claude.ai account connectors. These helpers only retain
+// OIO does not import claude.ai account connectors. These helpers only retain
 // compatibility with existing connection-status records.
 
 /**

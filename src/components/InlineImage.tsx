@@ -77,7 +77,7 @@ const GRAPHICS_RETRY_MS = 120
 
 /**
  * Shown under a block render that an old Windows ConPTY forced. Without it the
- * downgrade is silent, and the fix is outside Tau: the terminal has to ship a
+ * downgrade is silent, and the fix is outside OIO: the terminal has to ship a
  * ConPTY that passes image data through.
  */
 const LEGACY_CONSOLE_HOST_HINT =

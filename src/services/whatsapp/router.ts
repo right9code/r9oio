@@ -1,9 +1,9 @@
 /**
- * Routes WhatsApp inbound messages into the Tau command queue, and tracks
+ * Routes WhatsApp inbound messages into the OIO command queue, and tracks
  * which chat to reply into when the assistant responds.
  *
  * The "current chat" is the JID of the most-recent inbound message. While
- * Tau is processing a turn driven by WhatsApp, the assistant's text reply
+ * OIO is processing a turn driven by WhatsApp, the assistant's text reply
  * is mirrored to that chat. Manual terminal-typed turns clear the active
  * chat so the assistant doesn't accidentally reply on WhatsApp.
  */
@@ -41,7 +41,7 @@ export function startInboundRouter(): void {
     activeChatJid = e.jid
     activeMsgId = e.msgId
 
-    // React with a small ack so the user knows Tau picked up the message.
+    // React with a small ack so the user knows OIO picked up the message.
     void client.react(e.jid, e.msgId, '👀').catch(() => {})
 
     if (tryConsumeWhatsAppPermissionReply(e.jid, text)) {

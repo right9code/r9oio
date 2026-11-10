@@ -12,7 +12,7 @@ const MAX_NATIVE_HIGHLIGHT_CHARS = 200_000
 const MAX_INFLIGHT_HIGHLIGHTS = 3
 
 // The native helper currently ships one Chroma style. Keep it opt-in so a
-// later cache fill cannot replace a custom Tau palette with github-dark ANSI.
+// later cache fill cannot replace a custom OIO palette with github-dark ANSI.
 const NATIVE_SYNTAX_STYLES: Partial<Record<ThemeName, string>> = {
   dark: 'github-dark',
 }

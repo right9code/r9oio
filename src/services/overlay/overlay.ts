@@ -376,7 +376,7 @@ class SandboxFsOperations implements FsOperations {
   // ----- Renames: copy-through into overlay + tombstone source -----
 
   /**
-   * Tau's atomic writer renames `<target>.tmp.<pid>.<timestamp>` onto the
+   * OIO's atomic writer renames `<target>.tmp.<pid>.<timestamp>` onto the
    * target. That rename is a CONTENT-PLACEMENT, not a project-file move:
    * tombstoning the temp path would record a bogus deletion. Only tombstone
    * a source that is not an atomic-write temp.

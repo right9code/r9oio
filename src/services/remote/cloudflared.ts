@@ -135,7 +135,7 @@ export function installHint(): string {
     return 'Install it with:  brew install cloudflared'
   }
   if (getPlatform() === 'wsl') {
-    // Tau is a Linux process here and looks for `cloudflared`, so a winget
+    // OIO is a Linux process here and looks for `cloudflared`, so a winget
     // install on the Windows side (`cloudflared.exe`) is never found.
     return 'Install the Linux build inside WSL (a Windows install is not visible here):  https://pkg.cloudflare.com'
   }

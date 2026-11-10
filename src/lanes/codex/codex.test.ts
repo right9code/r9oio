@@ -234,7 +234,7 @@ async function main(): Promise<void> {
   })
 
   await test('Codex rules name no tool the request does not declare', () => {
-    // Tau's own names go through the same renaming a real session's tools get.
+    // OIO's own names go through the same renaming a real session's tools get.
     const tauTools = ['Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep', 'WebSearch', 'Eval']
       .map(name => ({ name, description: name, input_schema: { type: 'object', properties: {} } }))
     const declared = new Set((buildCodexToolsFromRequest(tauTools as any) ?? []).map(tool => tool.name))
@@ -499,7 +499,7 @@ async function main(): Promise<void> {
     // conversation sent before it dropped.
     const back = freezeCodexToolOrder(key, [reworded, changed, fn('mcp__claude_ai_Docs__read'), fn('mcp__playwright__click')])
     assert(back.map(t => t.name).join() === 'Bash,Read,mcp__playwright__click,mcp__claude_ai_Docs__read', `order after return ${back.map(t => t.name).join()}`)
-    // A helper forked from the conversation lists the tools in Tau's sorted
+    // A helper forked from the conversation lists the tools in OIO's sorted
     // order; it still sends the conversation's block byte for byte.
     const forked = freezeCodexToolOrder(key, [fn('Bash'), changed, fn('mcp__claude_ai_Docs__read'), fn('mcp__playwright__click')])
     assert(JSON.stringify(forked) === JSON.stringify(back), 'a forked helper resends the conversation tool block')
@@ -796,7 +796,7 @@ async function main(): Promise<void> {
   await test('session cache key isolates and restores volatile anchors across side requests', () => {
     codexApi.clearChain()
     codexApi.setSessionCacheKey('tau-session-a')
-    assert(codexApi.sessionCacheKey === 'tau-session-a', 'expected Tau session id as cache key')
+    assert(codexApi.sessionCacheKey === 'tau-session-a', 'expected OIO session id as cache key')
     codexApi.getOrSeedFrozenVolatile('gpt-5.4', 'env-A')
     codexApi.setSessionCacheKey('tau-session-b')
     assert(codexApi.sessionCacheKey === 'tau-session-b', 'expected cache key switch')

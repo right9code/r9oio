@@ -125,7 +125,7 @@ function toolResultText(content: unknown, imagesSentSeparately: boolean): string
     .join('\n')
 }
 
-/** Tau's Anthropic-shaped history as Responses input items. */
+/** OIO's Anthropic-shaped history as Responses input items. */
 export function convertMessagesToResponsesInput(
   messages: readonly ProviderMessage[],
   canSeeImages: boolean,
@@ -205,7 +205,7 @@ type OpenBlock =
   | { kind: 'tool'; callId: string; name: string; args: string }
 
 /**
- * Turns Responses stream events into the Anthropic stream Tau consumes. Feed
+ * Turns Responses stream events into the Anthropic stream OIO consumes. Feed
  * each parsed `data:` payload to push(); finish() closes the message.
  */
 export class OpenCodeResponsesStream {
@@ -417,7 +417,7 @@ export class OpenCodeResponsesStream {
     const out: AnthropicStreamEvent[] = []
     this.start(out)
     for (const outputIndex of [...this.open.keys()]) this.closeBlock(out, outputIndex)
-    // Responses reports the whole prompt; Tau's buckets are additive.
+    // Responses reports the whole prompt; OIO's buckets are additive.
     const fresh = Math.max(0, this.inputTokens - this.cachedTokens)
     out.push({
       type: 'message_delta',

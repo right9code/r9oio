@@ -222,7 +222,7 @@ export function isRequestTooLargeBody(raw: string): boolean {
   return REQUEST_TOO_LARGE_BODY_PATTERN.test(raw)
 }
 export const OAUTH_ORG_NOT_ALLOWED_ERROR_MESSAGE =
-  'Your account does not have access to Tau. Please run /login.'
+  'Your account does not have access to OIO. Please run /login.'
 
 export function getTokenRevokedErrorMessage(): string {
   return getIsNonInteractiveSession()
@@ -237,7 +237,7 @@ export function getOauthOrgNotAllowedErrorMessage(): string {
 }
 
 /**
- * Check if we're in CCR (Tau Remote) mode.
+ * Check if we're in CCR (OIO Remote) mode.
  * In CCR mode, auth is handled via JWTs provided by the infrastructure,
  * not via /login. Transient auth errors should suggest retrying, not logging in.
  */
@@ -785,7 +785,7 @@ export function getAssistantMessageFromError(
     })
   }
 
-  // Check for invalid model name error for Ant users. Tau may be
+  // Check for invalid model name error for Ant users. OIO may be
   // defaulting to a custom internal-only model for Ants, and there might be
   // Ants using new or unknown org IDs that haven't been gated in.
   if (
@@ -1236,8 +1236,8 @@ export function getErrorMessageIfRefusal(
   logEvent('tengu_refusal_api_response', {})
 
   const baseMessage = getIsNonInteractiveSession()
-    ? `${API_ERROR_MESSAGE_PREFIX}: Tau is unable to respond to this request, which appears to violate our Usage Policy (https://www.anthropic.com/legal/aup). Try rephrasing the request or attempting a different approach.`
-    : `${API_ERROR_MESSAGE_PREFIX}: Tau is unable to respond to this request, which appears to violate our Usage Policy (https://www.anthropic.com/legal/aup). Please double press esc to edit your last message or start a new session for Tau to assist with a different task.`
+    ? `${API_ERROR_MESSAGE_PREFIX}: OIO is unable to respond to this request, which appears to violate our Usage Policy (https://www.anthropic.com/legal/aup). Try rephrasing the request or attempting a different approach.`
+    : `${API_ERROR_MESSAGE_PREFIX}: OIO is unable to respond to this request, which appears to violate our Usage Policy (https://www.anthropic.com/legal/aup). Please double press esc to edit your last message or start a new session for OIO to assist with a different task.`
 
   // Antigravity has no claude-sonnet-4-20250514. Its Claude refusals reach here
   // from the lane, which reports a SAFETY finish as stop_reason 'refusal'.

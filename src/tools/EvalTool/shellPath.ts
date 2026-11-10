@@ -3,7 +3,7 @@
  *
  * On Windows the Bash tool runs Git Bash, whose PATH starts with directories
  * that exist only inside its MSYS layer (/mingw64/bin, /usr/bin, ~/bin). The
- * kernel inherits Tau's own PATH, which has none of them, so a program the
+ * kernel inherits OIO's own PATH, which has none of them, so a program the
  * model had just found with `which` in Bash — pdftotext here — raised
  * FileNotFoundError from `subprocess` in a cell. The model's next guess, the
  * MSYS path `/mingw64/bin/pdftotext`, is not a path Windows Python can open.
@@ -41,7 +41,7 @@ function bashToolShell(): string | null {
  * Directories on the Bash tool's PATH, as native paths. Empty where the two
  * PATHs already agree, and whenever the shell cannot be asked. Asked once per
  * session: the answer only changes when the user edits their environment,
- * which needs a restart to reach Tau anyway.
+ * which needs a restart to reach OIO anyway.
  */
 export function bashToolPathEntries(): Promise<string[]> {
   if (getPlatform() !== 'windows') return Promise.resolve([])

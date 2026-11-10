@@ -9,8 +9,8 @@ import type { QuerySource } from './querySource.js'
 import { getWorkload } from '../utils/workloadContext.js'
 import { providerReadsAttributionHeader } from './attributionProviders.js'
 
-const DEFAULT_PREFIX = `You are Tau, a multi-provider AI coding CLI.`
-const AGENT_SDK_CLAUDE_CODE_PRESET_PREFIX = `You are Tau, a multi-provider AI coding CLI, running within the Claude Agent SDK.`
+const DEFAULT_PREFIX = `You are OIO, a multi-provider AI coding CLI.`
+const AGENT_SDK_CLAUDE_CODE_PRESET_PREFIX = `You are OIO, a multi-provider AI coding CLI, running within the Claude Agent SDK.`
 const AGENT_SDK_PREFIX = `You are a Claude agent, built on Anthropic's Claude Agent SDK.`
 
 const CLI_SYSPROMPT_PREFIX_VALUES = [

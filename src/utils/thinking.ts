@@ -158,7 +158,7 @@ export function shouldEnableThinkingByDefault(): boolean {
 
   const { settings } = getSettingsWithErrors()
   // Respect explicit settings.alwaysThinkingEnabled in both directions.
-  // Tau default is OFF: thinking is an opt-in feature via `/thinking on`
+  // OIO default is OFF: thinking is an opt-in feature via `/thinking on`
   // or settings, so we don't silently spend extra latency/tokens for users
   // who haven't asked for it.
   if (settings.alwaysThinkingEnabled === true) {

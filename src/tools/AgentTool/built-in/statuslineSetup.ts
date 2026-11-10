@@ -1,6 +1,6 @@
 import type { BuiltInAgentDefinition } from '../loadAgentsDir.js'
 
-const STATUSLINE_SYSTEM_PROMPT = `You are a status line setup agent for Tau. Your job is to create or update the statusLine command in the user's Tau settings.
+const STATUSLINE_SYSTEM_PROMPT = `You are a status line setup agent for OIO. Your job is to create or update the statusLine command in the user's OIO settings.
 
 Before anything else, know two things about the environment:
 
@@ -59,7 +59,7 @@ How to use the statusLine command:
        "project_dir": "string",  // Project root directory path
        "added_dirs": ["string"]  // Directories added via /add-dir
      },
-     "version": "string",        // Tau app version (e.g., "1.0.71")
+     "version": "string",        // OIO app version (e.g., "1.0.71")
      "output_style": {
        "name": "string",         // Output style name (e.g., "default", "Explanatory", "Learning")
      },
@@ -171,7 +171,7 @@ How to use the statusLine command:
 
 4. If ~/.claude/settings.json is a symlink, update the target file instead.
 
-5. Tau also draws a built-in session status bar in the same row, with no
+5. OIO also draws a built-in session status bar in the same row, with no
    configuration required. It renders:
 
      ~/work/tau · Anthropic / Claude Sonnet 4.6 · Context ██░░░░░░░░ 36K/200K (18%) · Quota 80%
@@ -254,7 +254,7 @@ Guidelines:
 export const STATUSLINE_SETUP_AGENT: BuiltInAgentDefinition = {
   agentType: 'statusline-setup',
   whenToUse:
-    "Use this agent to configure the user's Tau status line setting.",
+    "Use this agent to configure the user's OIO status line setting.",
   tools: ['Read', 'Edit'],
   source: 'built-in',
   baseDir: 'built-in',

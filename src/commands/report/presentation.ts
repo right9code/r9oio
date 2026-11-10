@@ -126,7 +126,7 @@ export function assertValidGeneratedReport(
  *
  * The provider's raw text is often a JSON error body, so quoting its first
  * line alone produced `Report generation did not return report content. API
- * Error: Gemini API error 429: {` — which reads like a Tau defect. `/report`
+ * Error: Gemini API error 429: {` — which reads like a OIO defect. `/report`
  * already sends a bounded, tool-free request, so a quota refusal is upstream
  * and the message should say so instead of dumping the body.
  */

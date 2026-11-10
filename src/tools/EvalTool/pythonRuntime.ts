@@ -138,7 +138,7 @@ export function __resetEvalRuntimeCacheForTests(): void {
 
 /**
  * Materialize the kernel to a hashed path under the OS temp dir. Hashing the
- * source means a Tau upgrade writes a new file instead of racing a running
+ * source means a OIO upgrade writes a new file instead of racing a running
  * kernel that still has the old one mapped.
  */
 export function ensureRunnerOnDisk(): string {
@@ -159,7 +159,7 @@ export function ensureRunnerOnDisk(): string {
 
 /**
  * Names that must never reach the kernel even if they pass the allowlist.
- * The kernel runs model-authored code; Tau holds credentials for more than
+ * The kernel runs model-authored code; OIO holds credentials for more than
  * twenty providers, and there is no working filesystem sandbox on Windows to
  * fall back on (`lanes/shared/sandbox.ts` degrades to an env-scoped spawn).
  * Keeping secrets out of `os.environ` is the control that actually holds.

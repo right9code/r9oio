@@ -1,5 +1,5 @@
 /**
- * Tau startup screen: ember red and brown glow rendered as a watermark
+ * OIO startup screen: ember red and brown glow rendered as a watermark
  * over the terminal's own background (no opaque fill behind glyphs).
  * Called once at CLI startup before the Ink UI renders.
  */

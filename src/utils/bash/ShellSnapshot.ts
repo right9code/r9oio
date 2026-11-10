@@ -251,7 +251,7 @@ function getUserSnapshotContent(configFile: string): string {
 }
 
 /**
- * Generates Tau specific snapshot content
+ * Generates OIO specific snapshot content
  * This content is always included regardless of user configuration
  */
 async function getClaudeCodeSnapshotContent(shellPath: string): Promise<string> {
@@ -260,7 +260,7 @@ async function getClaudeCodeSnapshotContent(shellPath: string): Promise<string> 
   if (getPlatform() === 'windows') {
     // On Windows with Git Bash, read the MSYS PATH through bash itself.
     // Do not use shell:true here: that goes through cmd.exe and can trigger
-    // Command Processor AutoRun hooks such as Clink before Tau even starts a
+    // Command Processor AutoRun hooks such as Clink before OIO even starts a
     // user command.
     const cygwinResult = await execa(shellPath, ['-c', 'printf %s "$PATH"'], {
       reject: false,
@@ -341,7 +341,7 @@ async function getSnapshotScript(
   const configFile = getConfigFile(shellPath)
   const isZsh = configFile.endsWith('.zshrc')
 
-  // Generate the user content and Tau content
+  // Generate the user content and OIO content
   const userContent = configFileExists
     ? getUserSnapshotContent(configFile)
     : !isZsh
@@ -420,7 +420,7 @@ export const createAndSaveSnapshot = async (
 
       if (!configFileExists) {
         logForDebugging(
-          `Shell config file not found: ${configFile}, creating snapshot with Tau defaults only`,
+          `Shell config file not found: ${configFile}, creating snapshot with OIO defaults only`,
         )
       }
 

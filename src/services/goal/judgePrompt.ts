@@ -6,7 +6,7 @@
  * leaf module and the checks in judgePrompt.test.ts run standalone.
  *
  * The rubric follows the shape used by the Strands agent SDK's goal judge
- * (Apache-2.0, Amazon.com Inc.), reworked for Tau's fork-based delivery: the
+ * (Apache-2.0, Amazon.com Inc.), reworked for OIO's fork-based delivery: the
  * verifier reads the live conversation rather than a serialized transcript, so
  * the prompt carries only the rubric and the goal.
  */

@@ -1,8 +1,8 @@
 /**
- * Session Tracing for Tau using OpenTelemetry (BETA)
+ * Session Tracing for OIO using OpenTelemetry (BETA)
  *
  * This module provides a high-level API for creating and managing spans
- * to trace Tau workflows. Each user interaction creates a root
+ * to trace OIO workflows. Each user interaction creates a root
  * interaction span, which contains operation spans (LLM requests, tool calls, etc.).
  *
  * Requirements:

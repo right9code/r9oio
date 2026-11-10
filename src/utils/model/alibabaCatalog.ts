@@ -19,7 +19,7 @@
  *
  * No model's ladder is written down here: `reasoning_options` from that
  * document IS the ladder, verbatim. A Qwen model released tomorrow gets a
- * correct chip on the next catalogue refresh, with no Tau release.
+ * correct chip on the next catalogue refresh, with no OIO release.
  *
  * The two surfaces compose: live `/models` says which ids THIS key may call,
  * models.dev says what each id can do. A live id models.dev has never heard of

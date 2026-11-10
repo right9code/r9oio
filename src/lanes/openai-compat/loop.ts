@@ -1946,7 +1946,7 @@ function openCodeRouteCanSeeImages(provider: string, model: string): boolean {
  * History as the /messages route sends it, the way @ai-sdk/anthropic builds
  * it: a thinking block without a signature is left out (another provider's
  * reasoning carries none, and Anthropic rejects one it cannot verify), a
- * redacted block needs its data, and Tau's own `_`-prefixed bookkeeping
+ * redacted block needs its data, and OIO's own `_`-prefixed bookkeeping
  * (Gemini thought signatures, OpenRouter state, decode status) stays home.
  * Images go as images only where the model takes them.
  */
@@ -2510,7 +2510,7 @@ function formatProviderHttpError(
  * When every endpoint for a model is filtered out by the ACCOUNT's guardrail
  * and data-policy settings, OpenRouter answers 404 with a machine-readable
  * `metadata.ineligibility_reasons` list, each carrying a `configure_url`. It
- * is not a request problem — nothing Tau can send changes the outcome — but
+ * is not a request problem — nothing OIO can send changes the outcome — but
  * raw it reaches the user as a wall of escaped JSON, usually truncated before
  * the URL that would tell them what to change.
  *
@@ -2713,7 +2713,7 @@ async function getLmStudioContextPreflightMessage(
     ? ` Reload it with a larger context, for example: lms unload "${model}"; lms load "${model}" -c ${suggestedContextWindow} -y --identifier "${model}".`
     : ''
 
-  return `LM Studio has "${model}" loaded with ${formatTokenCount(loadedContextWindow)} context tokens, but Tau's agent request is about ${formatTokenCount(estimatedInputTokens)} tokens before generation. LM Studio can return an empty response in that state.${maxContextWindow ? ` This model reports up to ${formatTokenCount(maxContextWindow)} tokens available.` : ''}${reloadHint}`
+  return `LM Studio has "${model}" loaded with ${formatTokenCount(loadedContextWindow)} context tokens, but OIO's agent request is about ${formatTokenCount(estimatedInputTokens)} tokens before generation. LM Studio can return an empty response in that state.${maxContextWindow ? ` This model reports up to ${formatTokenCount(maxContextWindow)} tokens available.` : ''}${reloadHint}`
 }
 
 async function getLmStudioModelInfo(

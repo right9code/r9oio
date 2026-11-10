@@ -11,13 +11,13 @@
  *   deepseek/deepseek-v3.2  Default / Off / On          (reasons, no ladder)
  *   openai/gpt-5.5-chat     (no chip — the row does not reason)
  *
- * So the ladder cannot be the fixed low/medium/high set Tau's own thinking
+ * So the ladder cannot be the fixed low/medium/high set OIO's own thinking
  * budget speaks. `["max","high","low"]` has no `medium` at all, and `minimal`,
  * `xhigh` and `max` were unreachable before this module existed. Every stop
  * below `default` comes straight out of OpenRouter's catalogue, in ascending
  * effort order, and nothing else is ever put on the wire.
  *
- * `Default` is a Tau-side stop meaning "no per-model override": the session's
+ * `Default` is a OIO-side stop meaning "no per-model override": the session's
  * own /thinking setting drives the row, mapped onto a value the model actually
  * published. It is where every row starts, so a model nobody has configured
  * behaves exactly as it did before — OpenRouter applies its own
@@ -37,7 +37,7 @@ import { getOpenRouterReasoningMeta } from './openrouterReasoningCatalog.js'
 import { selectInheritedEffort, type EffortFallback } from './effortInheritance.js'
 
 /**
- * One stop on a model's ladder. Either a Tau-side stop (`default`, `off`,
+ * One stop on a model's ladder. Either a OIO-side stop (`default`, `off`,
  * `on`) or an effort value the model itself published — which is why this is a
  * string rather than a closed union: the values come from OpenRouter at
  * runtime and differ per row.
@@ -198,7 +198,7 @@ export function getOpenRouterEffortLabel(effort: OpenRouterEffort): string {
 }
 
 /**
- * The whole picker chip. The two Tau-side toggle stops name what they do
+ * The whole picker chip. The two OIO-side toggle stops name what they do
  * ("Thinking On") rather than pretending to be a rung on an effort ladder,
  * which is what "On effort" would read as.
  */

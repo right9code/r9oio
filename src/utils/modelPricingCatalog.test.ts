@@ -77,7 +77,7 @@ test('keeps the two Alibaba regions on separate price tables', () => {
   )
 })
 
-test('maps Tau provider ids onto models.dev ids', () => {
+test('maps OIO provider ids onto models.dev ids', () => {
   const cases: [string, string][] = [
     ['deepseek', 'deepseek'],
     ['openrouter', 'openrouter'],

@@ -460,7 +460,7 @@ describe('fitMermaidArt', () => {
     const source = [
       'flowchart TB',
       `    subgraph "${text(0x1f3ae)} INPUT"`,
-      '        A["Tau CLI<br/>User task"]',
+      '        A["OIO CLI<br/>User task"]',
       '    end',
       `    subgraph "${text(0x1f9e0)} CORE"`,
       '        B["Agent<br/>agent/index.ts"]',
@@ -478,7 +478,7 @@ describe('fitMermaidArt', () => {
     expect(fit.art).not.toBeNull()
     const drawn = lines(fit.art!).join('\n')
     expect(drawn).toContain('INPUT')
-    expect(drawn).toContain('Tau CLI User task')
+    expect(drawn).toContain('OIO CLI User task')
   })
 })
 

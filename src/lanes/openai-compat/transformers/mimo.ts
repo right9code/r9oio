@@ -63,7 +63,7 @@ export const mimoTransformer: Transformer = {
   filterModelCatalog(models) {
     // `/v1/models` is auth-gated, so this only runs once the user is logged
     // in. Fold the response in so a newly released MiMo model picks up its
-    // real context window and output cap without a Tau release.
+    // real context window and output cap without a OIO release.
     recordMimoCatalog(models as unknown as readonly MimoCatalogRow[])
     return models
   },

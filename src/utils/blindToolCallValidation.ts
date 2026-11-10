@@ -6,7 +6,7 @@ import { zodToJsonSchema } from './zodToJsonSchema.js'
  * A "blind" call is a tool_use produced by a request that did not carry the
  * tool's parameter schema. Blocking those calls outright cost a full turn and
  * surfaced an internal recovery error, so instead they are checked against the
- * schema Tau already holds locally: a call that matches the real schema is
+ * schema OIO already holds locally: a call that matches the real schema is
  * indistinguishable from an informed one and runs immediately, while a call
  * carrying invented parameters is rejected the same way any malformed call is.
  *

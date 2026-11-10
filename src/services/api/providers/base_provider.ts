@@ -58,7 +58,7 @@ export interface AnthropicMessage {
     /**
      * Optional cache accounting fields. Third-party providers that
      * support prompt caching (currently Gemini 2.5+ via cachedContents)
-     * populate these so Tau's existing cost tracker treats them
+     * populate these so OIO's existing cost tracker treats them
      * like Anthropic cache hits.
      */
     cache_read_input_tokens?: number
@@ -219,13 +219,13 @@ export interface ProviderTool {
   description?: string
   input_schema: Record<string, unknown>
   /**
-   * Tau-internal, non-enumerable marker added while building provider tool
+   * OIO-internal, non-enumerable marker added while building provider tool
    * schemas. Native lanes can use it for provider-specific lazy-loading
    * decisions without serializing the marker onto the wire.
    */
   __tau_should_defer?: boolean
   /**
-   * Tau-internal, non-enumerable: the tool's advisory input fields
+   * OIO-internal, non-enumerable: the tool's advisory input fields
    * (Tool.advisoryInputFields). Shared tool execution drops a malformed one
    * instead of rejecting the call, so lane-side argument checks must ignore
    * them too.

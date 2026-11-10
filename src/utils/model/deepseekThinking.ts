@@ -1,7 +1,7 @@
 /**
  * DeepSeek V4 per-model thinking-effort store.
  *
- * V4 exposes two separate controls in the OpenAI-format body, and Tau folds
+ * V4 exposes two separate controls in the OpenAI-format body, and OIO folds
  * both onto one picker chip:
  *
  *   {"thinking": {"type": "enabled" | "disabled"}}   -- the toggle
@@ -14,7 +14,7 @@
  * max -> max -- so only the three distinct stops are offered here; medium and
  * xhigh would be indistinguishable from High on the wire.
  *
- * The default stop is None, which is byte-for-byte what Tau sent before the
+ * The default stop is None, which is byte-for-byte what OIO sent before the
  * chip existed. DeepSeek's own server-side default is thinking-on at high
  * effort, so one press of the right arrow hands the model back to its
  * documented default.

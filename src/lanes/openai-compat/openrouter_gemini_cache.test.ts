@@ -26,7 +26,7 @@ import {
 
 const MODEL = 'google/gemini-3-flash-preview'
 const MARKER = '__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__'
-const STABLE = 'You are Tau. Keep the stable system prefix cacheable.'
+const STABLE = 'You are OIO. Keep the stable system prefix cacheable.'
 const SYSTEM_WITH_VOLATILE = `${STABLE}\n${MARKER}\ngitStatus: dirty\nToday is 2026-07-02`
 
 let passed = 0

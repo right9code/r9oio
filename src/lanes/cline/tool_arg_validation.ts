@@ -268,7 +268,7 @@ export function buildClineToolArgRepairMessage(
     role: 'user',
     content: [
       '<tool_call_validation_error>',
-      `Attempt ${attempt}: the previous tool call(s) were rejected before Tau executed anything because they were invalid for the current Cline tool schema set.`,
+      `Attempt ${attempt}: the previous tool call(s) were rejected before OIO executed anything because they were invalid for the current Cline tool schema set.`,
       details,
       'For any call whose schema was not declared, do not retry that tool directly. Load it with ToolSearch first if ToolSearch is available, or use one of the currently declared tools.',
       'Re-issue every call now with all required fields filled, parameter names copied exactly (case-sensitive), and values using the declared types. Do not send empty {}.',
@@ -293,7 +293,7 @@ export function buildClineBlockedInvalidToolCallText(
     .join('\n')
 
   return [
-    'Cline emitted invalid tool calls after internal repair attempts, so Tau blocked them before local execution.',
+    'Cline emitted invalid tool calls after internal repair attempts, so OIO blocked them before local execution.',
     details,
     'No local tool was run with empty arguments.',
   ].join('\n')

@@ -228,19 +228,19 @@ export function isPdftoppmAvailable(): Promise<boolean> {
 }
 
 /**
- * How to get Poppler's command-line tools here. A running Tau keeps the PATH
+ * How to get Poppler's command-line tools here. A running OIO keeps the PATH
  * it started with, so the tools appear only after a restart.
  */
 export function getPopplerInstallHint(
   platform: NodeJS.Platform = process.platform,
 ): string {
   if (platform === 'win32') {
-    return 'Install Poppler for Windows (for example `winget install oschwartz10612.Poppler`), make sure its bin folder is on PATH, and restart Tau.'
+    return 'Install Poppler for Windows (for example `winget install oschwartz10612.Poppler`), make sure its bin folder is on PATH, and restart OIO.'
   }
   if (platform === 'darwin') {
-    return 'Install Poppler with `brew install poppler` and restart Tau.'
+    return 'Install Poppler with `brew install poppler` and restart OIO.'
   }
-  return 'Install poppler-utils (`sudo apt-get install poppler-utils` on Debian/Ubuntu, `sudo dnf install poppler-utils` on Fedora) and restart Tau.'
+  return 'Install poppler-utils (`sudo apt-get install poppler-utils` on Debian/Ubuntu, `sudo dnf install poppler-utils` on Fedora) and restart OIO.'
 }
 
 /** A page range as the Python reader takes it: 0 for "to the end". */

@@ -529,7 +529,7 @@ export function getModelCosts(model: string, usage: Usage): ModelCosts | null {
   // entries by provider and by the provider's own model id, so a hit here is
   // an exact match for what this session is actually running.
   // Which long-context tier applies is decided by the whole prompt the
-  // provider metered. Tau's buckets are additive - input_tokens excludes the
+  // provider metered. OIO's buckets are additive - input_tokens excludes the
   // cached ones - so the context this request occupied is their sum.
   const contextTokens =
     (usage.input_tokens ?? 0) +

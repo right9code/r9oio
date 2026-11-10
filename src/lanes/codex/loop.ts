@@ -1158,7 +1158,7 @@ export interface RepairedCodexToolCall {
  * identity function rather than being deleted: the seam is where a future
  * native-name mismatch would be fixed, and removing it would only move that
  * work to whoever hits the next one. It is NOT a validation or safety net --
- * schema conformance comes from Tau's validation of every call against the
+ * schema conformance comes from OIO's validation of every call against the
  * tool's full schema and from the STRICT PARAMETERS hint, not from here.
  */
 export function repairCodexToolCall(
@@ -1207,7 +1207,7 @@ export function buildCodexToolsFromRequest(
 
 // Every function tool goes out the way native Codex sends all of its tools:
 // the tool's own schema with `strict: false`, so optional fields stay
-// optional and nothing is guessed (see tool_schema.ts). Tau validates every
+// optional and nothing is guessed (see tool_schema.ts). OIO validates every
 // call against the tool's full schema before running it.
 function buildCodexToolDeclarations(
   tools: import('../../services/api/providers/base_provider.js').ProviderTool[],
@@ -1239,7 +1239,7 @@ function buildCodexToolDeclarations(
       continue
     }
 
-    // Unknown tool (MCP / custom / Tau tools outside the registry).
+    // Unknown tool (MCP / custom / OIO tools outside the registry).
     const parameters = toCodexToolParameters(tool.input_schema ?? { type: 'object', properties: {} })
     const spec: CodexToolSpec = {
       type: 'function',
@@ -1257,7 +1257,7 @@ function buildCodexToolDeclarations(
 
 // ─── Stable tool order per conversation ──────────────────────────
 //
-// The tool block sits in the cached prompt prefix. Tau lists tools in sorted
+// The tool block sits in the cached prompt prefix. OIO lists tools in sorted
 // order, so an MCP server that connects mid-conversation (claude.ai
 // connectors often do) had its tools inserted in the middle of the list, and
 // every later tool and the whole conversation after the block went uncached.
@@ -1306,7 +1306,7 @@ export function freezeCodexToolOrder(key: string, tools: CodexToolSpec[]): Codex
 // Keyed by the exact declaration bytes, so a server that changes its schema
 // is offered again. Process-lifetime and only ever grows, so the tool block
 // changes once per rejection and then stays byte-stable for the prompt cache.
-// Native registry tools are never left out: a rejection there is a Tau bug and
+// Native registry tools are never left out: a rejection there is a OIO bug and
 // must surface.
 
 /** Tool name → hash of the declaration left out of requests. */

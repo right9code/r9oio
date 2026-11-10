@@ -170,7 +170,7 @@ function enqueueShellNotification(taskId: string, description: string, status: '
 <${SUMMARY_TAG}>${escapeXml(summary)}</${SUMMARY_TAG}>
 </${TASK_NOTIFICATION_TAG}>`;
   // 'next': handed to the model at its next tool round, as the Bash prompt
-  // promises ("Tau reports completion"). With 'later' it waited for the whole
+  // promises ("OIO reports completion"). With 'later' it waited for the whole
   // turn to end — the model kept acting on a command that had already exited
   // — and a sub-agent never got it at all.
   enqueuePendingNotification({

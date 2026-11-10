@@ -181,7 +181,7 @@ export type CatalogPrice = {
 }
 
 /**
- * Tau provider id to models.dev provider id, where they differ.
+ * OIO provider id to models.dev provider id, where they differ.
  *
  * Providers absent from the catalogue entirely - antigravity, kiro, cursor,
  * lxd, commandcode, modelrouter - simply find nothing and stay unpriced.
@@ -227,7 +227,7 @@ const PROVIDER_ALIASES: Readonly<Record<string, string>> = {
 const NEVER_PRICED: ReadonlySet<string> = new Set(['ollama', 'lmstudio'])
 
 /**
- * The models.dev provider id for a Tau provider, or null when it must not be
+ * The models.dev provider id for a OIO provider, or null when it must not be
  * priced from the catalogue.
  */
 export function resolveCatalogProvider(tauProvider: string): string | null {

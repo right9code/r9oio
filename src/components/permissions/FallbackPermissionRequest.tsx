@@ -220,7 +220,7 @@ export function FallbackPermissionRequest(t0) {
     result.push({
       label: 'Yes, dangerously skip permissions for this session',
       value: 'yes-bypass-permissions',
-      description: bypassPermissionsDisabled ? 'Disabled by settings or policy.' : 'Tau will stop asking before running tools.',
+      description: bypassPermissionsDisabled ? 'Disabled by settings or policy.' : 'OIO will stop asking before running tools.',
       disabled: bypassPermissionsDisabled
     });
     let t8;

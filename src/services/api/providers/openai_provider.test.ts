@@ -81,7 +81,7 @@ async function main(): Promise<void> {
       assert(!models.some(model => model.id === 'gpt-4.1'), 'unscoped live API model must not be shown')
     })
 
-    await test('uses Tau session id as OpenAI prompt cache key', async () => {
+    await test('uses OIO session id as OpenAI prompt cache key', async () => {
       let capturedUrl = ''
       let capturedBody: any = null
       globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -278,7 +278,7 @@ async function main(): Promise<void> {
         await provider.create({
           model: 'deepseek/deepseek-v4-flash',
           system: [
-            'Stable Tau instructions that should remain cacheable.',
+            'Stable OIO instructions that should remain cacheable.',
             '# Environment',
             'Working directory: C:\\Users\\ok\\Desktop\\claudex',
             "Today's date is 2026-06-29.",
@@ -322,7 +322,7 @@ async function main(): Promise<void> {
 
         const systemMessage = capturedBody.messages.find((message: any) => message.role === 'system')
         const systemText = JSON.stringify(systemMessage?.content)
-        assert(systemText.includes('Stable Tau instructions'), `system=${systemText}`)
+        assert(systemText.includes('Stable OIO instructions'), `system=${systemText}`)
         assert(!systemText.includes('Working directory:'), `volatile tail leaked into system: ${systemText}`)
         const systemPart = systemMessage?.content?.[systemMessage.content.length - 1]
         assert(systemPart?.cache_control?.type === 'ephemeral',

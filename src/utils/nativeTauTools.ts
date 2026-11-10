@@ -55,7 +55,7 @@ export async function runNativeTauTool(
   const binary = getNativeTauToolsPath()
   if (!binary) {
     throw new Error(
-      'Native Tau tools are not available. Run `npm run build:native-tools` from the Tau repository, or reinstall with Go 1.25.8+ available.',
+      'Native OIO tools are not available. Run `npm run build:native-tools` from the OIO repository, or reinstall with Go 1.25.8+ available.',
     )
   }
 

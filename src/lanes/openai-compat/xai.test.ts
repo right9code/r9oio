@@ -66,7 +66,7 @@ function eq(actual: unknown, expected: unknown, hint: string): void {
 }
 
 const SYSTEM = [
-  'You are Tau, a coding agent.',
+  'You are OIO, a coding agent.',
   '__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__',
   '# Environment\nWorking directory: /repo\nToday: 2026-10-17',
 ].join('\n\n')
@@ -284,7 +284,7 @@ await test('stable system as instructions, frozen environment as the first input
   const first = request([{ role: 'user', content: 'fix the bug' }])
   const instructions = String(first.body.instructions)
   assert(instructions.startsWith('<tool_usage_rules>'), 'tool rules lead')
-  assert(instructions.includes('You are Tau, a coding agent.'), 'stable prompt present')
+  assert(instructions.includes('You are OIO, a coding agent.'), 'stable prompt present')
   assert(!instructions.includes('Working directory'), 'volatile text kept out of instructions')
   const input = first.body.input as Event[]
   eq(input[0], { type: 'message', role: 'system', content: '# Environment\nWorking directory: /repo\nToday: 2026-10-17' }, 'frozen block')

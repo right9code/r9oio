@@ -167,7 +167,7 @@ export async function createDefaultEnvironment(): Promise<boolean> {
   }
 }
 
-/** Returns true when the user has valid Tau OAuth credentials. */
+/** Returns true when the user has valid OIO OAuth credentials. */
 export async function isSignedIn(): Promise<boolean> {
   try {
     await prepareApiRequest()

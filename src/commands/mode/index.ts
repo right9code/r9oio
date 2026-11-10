@@ -5,7 +5,7 @@ const mode = {
   name: 'mode',
   aliases: ['power', 'powermode'],
   description:
-    'Switch Tau mode: cheap or normal',
+    'Switch OIO mode: cheap or normal',
   argumentHint: '[cheap|normal]',
   isEnabled: () => true,
   isHidden: false,

@@ -80,7 +80,7 @@ export function SpinnerVerbsPicker({
 
   return (
     <Box flexDirection="column" gap={1}>
-      <Text>Choose what the spinner says while Tau works:</Text>
+      <Text>Choose what the spinner says while OIO works:</Text>
       {current.kind === 'list' && (
         <Text dimColor>
           Your settings.json has its own list of verbs; picking here replaces

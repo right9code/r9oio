@@ -200,10 +200,10 @@ function PowerModePicker({
       <Box flexDirection="column" gap={1}>
         <Box flexDirection="column">
           <Text bold color="permission">
-            Tau mode
+            OIO mode
           </Text>
           <Text dimColor>
-            Choose how Tau operates — the identity and accent color preview as
+            Choose how OIO operates — the identity and accent color preview as
             you move
           </Text>
         </Box>

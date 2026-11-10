@@ -225,7 +225,7 @@ export const KeybindingsSchema = lazySchema(() =>
         .describe('Array of keybinding blocks by context'),
     })
     .describe(
-      'Tau keybindings configuration. Customize keyboard shortcuts by context.',
+      'OIO keybindings configuration. Customize keyboard shortcuts by context.',
     ),
 )
 

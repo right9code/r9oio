@@ -31,7 +31,7 @@ function assert(cond: unknown, hint: string): void {
 
 console.log('tool result storage:')
 
-await test('allows Tau task output files under project temp sessions', async () => {
+await test('allows OIO task output files under project temp sessions', async () => {
   const originalCwd = process.cwd()
   const projectTempDir = getProjectTempDirForTauOutputPaths(originalCwd)
   const path = join(projectTempDir, 'test-session', 'tasks', 'task-1.output')

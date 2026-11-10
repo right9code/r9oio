@@ -51,13 +51,13 @@ export function killProcessTree(
       ['/PID', String(pid), '/T', '/F'],
       {
         stdio: 'ignore',
-        // Node ends attached children when it exits; the kill must outlive Tau.
+        // Node ends attached children when it exits; the kill must outlive OIO.
         detached: true,
         windowsHide: true,
       },
     )
     // A failed spawn (e.g. ENOENT) emits 'error' asynchronously. Unhandled,
-    // it would crash Tau.
+    // it would crash OIO.
     taskkill.once('error', () => {})
   } catch {
     // Like tree-kill, a failed kill stays silent.

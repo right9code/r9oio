@@ -42,7 +42,7 @@ type LoadingStateProps = {
  * <LoadingState
  *   message="Loading sessions"
  *   bold
- *   subtitle="Fetching your Tau sessions..."
+ *   subtitle="Fetching your OIO sessions..."
  * />
  */
 export function LoadingState(t0) {

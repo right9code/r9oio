@@ -820,7 +820,7 @@ async function main(): Promise<void> {
 
   await test('openrouter moves volatile system tail behind the cacheable prefix', async () => {
     const volatileSystem = [
-      'Stable Tau instructions that should remain cacheable.',
+      'Stable OIO instructions that should remain cacheable.',
       '# Environment',
       'Working directory: C:\\Users\\ok\\Desktop\\claudex',
       "Today's date is 2026-06-28.",
@@ -837,7 +837,7 @@ async function main(): Promise<void> {
     const systemText = Array.isArray(systemMessage?.content)
       ? systemMessage.content.map((part: any) => part?.text ?? '').join('\n')
       : String(systemMessage?.content ?? '')
-    assert(systemText.includes('Stable Tau instructions'),
+    assert(systemText.includes('Stable OIO instructions'),
       `system content=${JSON.stringify(systemMessage?.content)}`)
     assert(!systemText.includes('Working directory:'),
       `volatile context leaked into system prefix: ${JSON.stringify(systemMessage?.content)}`)

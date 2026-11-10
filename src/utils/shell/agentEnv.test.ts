@@ -86,7 +86,7 @@ test('sets no model variable when provider or model is empty', () => {
   }
 })
 
-test('replaces every value inherited from a parent Tau', () => {
+test('replaces every value inherited from a parent OIO', () => {
   const parent = {
     AI_AGENT: 'other-agent',
     TAU_SESSION_ID: 'parent-session',

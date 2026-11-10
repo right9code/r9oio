@@ -1,5 +1,5 @@
 /**
- * Who holds the OAuth callback port, and whether Tau may reclaim it.
+ * Who holds the OAuth callback port, and whether OIO may reclaim it.
  *
  * The previous implementation shelled out to `netstat -ano | findstr ":1455"`,
  * which is a substring match: ports 14550-14559 matched too, and every matching
@@ -16,7 +16,7 @@ import { resolveWindowsSystemExecutable } from '../../../../scripts/platform-sup
 
 export interface PortOwner { pid: string; image: string }
 
-/** Images that plausibly host a stale Tau/Codex callback server. Anything else
+/** Images that plausibly host a stale OIO/Codex callback server. Anything else
  * is reported to the user rather than killed: it is not ours to terminate. */
 const RECLAIMABLE_IMAGES = new Set([
   'node', 'node.exe', 'bun', 'bun.exe',
@@ -97,7 +97,7 @@ export interface ReclaimResult {
   /** The port is held by this process; the caller must close its own handle. */
   ownedBySelf: boolean
   killed: PortOwner[]
-  /** Held by something Tau will not kill. Name these to the user instead. */
+  /** Held by something OIO will not kill. Name these to the user instead. */
   refused: PortOwner[]
 }
 

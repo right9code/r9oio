@@ -182,15 +182,15 @@ function formatSource(source: E2BSecurityAuth['source']): string {
     case 'environment':
       return 'environment variables'
     case 'stored':
-      return 'Tau stored credential'
+      return 'OIO stored credential'
     case 'e2b-cli-config':
       return 'E2B CLI config'
     case 'environment+stored':
-      return 'environment variables + Tau stored credential'
+      return 'environment variables + OIO stored credential'
     case 'environment+e2b-cli-config':
       return 'environment variables + E2B CLI config'
     case 'stored+e2b-cli-config':
-      return 'Tau stored credential + E2B CLI config'
+      return 'OIO stored credential + E2B CLI config'
     case 'mixed':
       return 'mixed sources'
   }

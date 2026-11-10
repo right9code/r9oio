@@ -8,7 +8,7 @@
  *
  * Everything the lane needs to know about a model (Cline Pass membership,
  * context window, prompt-cache support, API price) is read from these feeds
- * instead of from id lists compiled into Tau. The Cline Pass normalization
+ * instead of from id lists compiled into OIO. The Cline Pass normalization
  * mirrors sdk/packages/llms/src/catalog/catalog-cline-recommended.ts in
  * Cline's SDK.
  */
@@ -233,13 +233,13 @@ export function clineModelDisplayName(name: string | null | undefined): string |
  * The live Cline Pass list: the feed's `clinePass` bucket, in feed order,
  * named and tool-flagged from the catalog row of the upstream model. The
  * feed's `free` bucket is deliberately left out: Cline refuses those models
- * outside its own apps, so listing them in Tau would only offer entries that
+ * outside its own apps, so listing them in OIO would only offer entries that
  * always fail.
  *
  * The context window is only ever the one Cline Pass serves, which `describe`
  * reads from models.dev's `cline-pass` block. The upstream row overstates it
  * (glm-5.3 lists 1,310,720 upstream where Pass serves 1,000,000), so without
- * a description the model states no window and Tau's other window sources
+ * a description the model states no window and OIO's other window sources
  * decide.
  */
 export function buildClinePassModels(

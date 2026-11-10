@@ -46,7 +46,7 @@ export const CODEX_TOOL_REGISTRY: LaneToolRegistration[] = [
         },
         run_in_background: {
           type: 'boolean',
-          description: 'Set true for long-running servers/watchers, port-forwards, tunnels, and foreground container runs. Tau runs the whole command as a tracked background task; remove any shell-level detaching from command.',
+          description: 'Set true for long-running servers/watchers, port-forwards, tunnels, and foreground container runs. OIO runs the whole command as a tracked background task; remove any shell-level detaching from command.',
         },
       },
       required: ['command'],
@@ -360,7 +360,7 @@ export function getCodexRegistrationByNativeName(name: string): LaneToolRegistra
 /** The registration actually declared for a session tool, in wire order. */
 export function getCodexRegistrationForTool(name: string): LaneToolRegistration | undefined {
   // Several entries can share an implementation (shell/list_directory). Only
-  // the first is declared for that Tau name; an unused registry entry is not
+  // the first is declared for that OIO name; an unused registry entry is not
   // an alias the model was offered.
   return CODEX_TOOL_REGISTRY.find(reg => reg.implId === name)
     ?? getCodexRegistrationByNativeName(name)

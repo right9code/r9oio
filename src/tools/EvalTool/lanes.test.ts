@@ -3,7 +3,7 @@
  *
  * Run via: bun run src/tools/EvalTool/lanes.test.ts
  *
- * Tau speaks 22 providers across 16 lanes, and several of them filter the tool
+ * OIO speaks 22 providers across 16 lanes, and several of them filter the tool
  * list on the way out — the Cursor exclusion set, Groq's curated small-tier
  * subset, NIM's fast subset, Gemini's deferred-tool selection. A tool can be
  * registered, enabled, and still never reach a given provider. These tests pin
@@ -94,7 +94,7 @@ test('every lane keeps Eval in its shared tool list', () => {
 
 test('Cursor does not exclude Eval', () => {
   // Cursor is the one lane with a hardcoded exclusion set. It strips the
-  // Tau-addition tools; Eval is core capability, not an addition.
+  // OIO-addition tools; Eval is core capability, not an addition.
   const tools = [{ name: EVAL_TOOL_NAME }, { name: 'ArtifactCanvas' }] as never as Parameters<
     typeof filterProviderToolsForLane
   >[1]

@@ -369,7 +369,7 @@ function _prunePaceMap(): void {
 }
 
 /**
- * Whether Tau may hold a request after a cold response. Off by default:
+ * Whether OIO may hold a request after a cold response. Off by default:
  * the 2026-09 measurements found writes readable at once (a request 0-5 s
  * after a cold one read its blocks) and held requests hitting no more often
  * than unheld ones, so a hold only added 10-15 s. TAU_ANTIGRAVITY_NO_PACING=0

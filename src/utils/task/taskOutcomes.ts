@@ -147,7 +147,7 @@ function finalTextOf(task: TaskState): string | undefined {
   return text ? text.slice(0, MAX_RESULT_CHARS) : undefined
 }
 
-// Synchronous so the record survives an exit right after the task ends (Tau
+// Synchronous so the record survives an exit right after the task ends (OIO
 // stops running tasks on exit). Written to a fresh file and renamed into
 // place: never through a symlink someone left in the folder, and a task that
 // finishes again after a resume replaces its old record.

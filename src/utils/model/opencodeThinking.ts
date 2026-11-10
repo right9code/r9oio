@@ -215,7 +215,7 @@ export function isOpencodeThinkingModel(model: string): boolean {
 }
 
 /**
- * Whether Tau should expose a user-selectable thinking effort for a model.
+ * Whether OIO should expose a user-selectable thinking effort for a model.
  *
  * OpenCode Go marks GLM-5.2 and Qwen3.7 Max as reasoning-capable. Qwen3.7 Max
  * publishes no usable request control, so its selector stays hidden. GLM-5.2,

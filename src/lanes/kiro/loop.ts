@@ -466,7 +466,7 @@ export class KiroLane implements Lane {
     const preferredShellToolName = resolvePreferredKiroShellToolName(
       tools.map(tool => tool.name),
     )
-    // Reverse map so tool calls Kiro returns map back to Tau names even when the
+    // Reverse map so tool calls Kiro returns map back to OIO names even when the
     // outgoing name was sanitized to Kiro's allowed shape.
     const toolNameReverseMap = buildKiroToolNameReverseMap(
       tools.map(tool => tool.name),

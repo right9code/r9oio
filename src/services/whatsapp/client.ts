@@ -1,5 +1,5 @@
 /**
- * Native WhatsApp client for Tau.
+ * Native WhatsApp client for OIO.
  *
  * Ported from the claude-code-whatsapp reference MCP server (server.cjs).
  * Connection lifecycle uses the same OpenClaw-derived patterns:
@@ -22,7 +22,7 @@ import { isAllowed } from './access.js'
 
 // Baileys is dynamically imported so the WhatsApp module pays its load cost
 // only when actually used. A direct top-level import would pull ~30 transitive
-// modules into Tau's startup path even when WhatsApp is off.
+// modules into OIO's startup path even when WhatsApp is off.
 type AnyMessage = Record<string, any>
 type Sock = any
 
@@ -73,7 +73,7 @@ class WhatsAppClient {
   private credsSaveQueue: Promise<unknown> = Promise.resolve()
   private rawMessages = new Map<string, AnyMessage>()
   private seenMessages = new Map<string, number>()
-  // IDs of messages Tau itself sent. Used to suppress the echo from
+  // IDs of messages OIO itself sent. Used to suppress the echo from
   // `messages.upsert` when fromMe=true so that user-authored fromMe
   // messages (the "Message yourself" chat) still drive the agent loop.
   private ourSentIds = new Set<string>()
@@ -486,7 +486,7 @@ class WhatsAppClient {
           if (!jid) continue
           if (jid.endsWith('@broadcast') || jid.endsWith('@status')) continue
 
-          // Drive Tau ONLY from the "Message yourself" chat. WhatsApp can
+          // Drive OIO ONLY from the "Message yourself" chat. WhatsApp can
           // address the connected account by either its phone-number JID
           // or its LID, so we accept a match against any of the bare IDs
           // captured at connect time. Groups, friends, and side chats
@@ -500,7 +500,7 @@ class WhatsAppClient {
           }
 
           // fromMe messages in the self-chat come from two sources:
-          // (1) Tau's own replies echoed back — skip by tracked id, or
+          // (1) OIO's own replies echoed back — skip by tracked id, or
           //     by content match if the id guard didn't catch it.
           // (2) you typing in "Message yourself" — process as a prompt.
           if (fromMe) {

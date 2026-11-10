@@ -10,7 +10,7 @@ import { isAutoMemoryEnabled } from '../../memdir/paths.js'
 const learned = {
   type: 'local-jsx',
   name: 'learned',
-  description: 'Review and manage what Tau learns automatically',
+  description: 'Review and manage what OIO learns automatically',
   argumentHint: '[view|learn|edit|delete|toggle]',
   // Visible whenever auto-memory is on, so the user can also toggle
   // self-learning on/off from the menu.

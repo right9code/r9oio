@@ -1059,13 +1059,13 @@ export function getMcpConfigByName(name: string): ScopedMcpServerConfig | null {
 }
 
 /**
- * Get Tau MCP configurations (excludes claude.ai servers from the
+ * Get OIO MCP configurations (excludes claude.ai servers from the
  * returned set — they're fetched separately and merged by callers).
  * This is fast: only local file reads; no awaited network calls on the
  * critical path. The optional extraDedupTargets promise (e.g. the in-flight
  * claude.ai connector fetch) is awaited only after loadAllPluginsCacheOnly() completes,
  * so the two overlap rather than serialize.
- * @returns Tau server configurations with appropriate scopes
+ * @returns OIO server configurations with appropriate scopes
  */
 export async function getClaudeCodeMcpConfigs(
   dynamicServers: Record<string, ScopedMcpServerConfig> = {},
@@ -1257,7 +1257,7 @@ export async function getClaudeCodeMcpConfigs(
 
 /**
  * Get configured MCP servers from user, project, enterprise and plugin scopes.
- * Claude.ai account connectors are not imported into Tau.
+ * Claude.ai account connectors are not imported into OIO.
  */
 export async function getAllMcpConfigs(): Promise<{
   servers: Record<string, ScopedMcpServerConfig>

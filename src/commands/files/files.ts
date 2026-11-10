@@ -36,6 +36,6 @@ export async function call(
     .join('\n')
   return {
     type: 'text' as const,
-    value: `Files Tau counts as read (${files.length}):\n${fileList}`,
+    value: `Files OIO counts as read (${files.length}):\n${fileList}`,
   }
 }

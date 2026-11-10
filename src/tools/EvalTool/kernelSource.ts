@@ -14,7 +14,7 @@
  * neither appears, and `evalTool.test.ts` asserts it stays that way.
  */
 export const PYTHON_KERNEL_SOURCE: string = String.raw`
-"""Persistent Python kernel for Tau's Eval tool.
+"""Persistent Python kernel for OIO's Eval tool.
 
 Protocol: NDJSON over stdin/stdout, one JSON object per line, UTF-8.
 

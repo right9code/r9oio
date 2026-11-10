@@ -191,7 +191,7 @@ function formatStatistics({
 
   lines.push(
     metricLine('Cache', [
-      'provider cache_hit numbers can differ; Tau keeps provider cache optimization automatic',
+      'provider cache_hit numbers can differ; OIO keeps provider cache optimization automatic',
     ]),
   )
 

@@ -599,7 +599,7 @@ export function E2BSecurityLogin({
     if (!hasE2BSecurityAuth()) {
       setState({
         step: 'input',
-        error: 'Saved, but Tau could not read the credential back. Check your settings file.',
+        error: 'Saved, but OIO could not read the credential back. Check your settings file.',
       })
       return
     }

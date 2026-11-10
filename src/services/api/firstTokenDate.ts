@@ -6,8 +6,8 @@ import { logError } from '../../utils/log.js'
 import { getClaudeCodeUserAgent } from '../../utils/userAgent.js'
 
 /**
- * Fetch the user's first Tau token date and store in config.
- * This is called after successful login to cache when they started using Tau.
+ * Fetch the user's first OIO token date and store in config.
+ * This is called after successful login to cache when they started using OIO.
  */
 export async function fetchAndStoreClaudeCodeFirstTokenDate(): Promise<void> {
   try {

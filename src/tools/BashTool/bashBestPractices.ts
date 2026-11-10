@@ -8,7 +8,7 @@ export function getBashPlatformBestPractices(
       return [
         'Git Bash: use `/c/path` or `C:/path`, `/dev/null`, and `$TMPDIR`; never backslash paths or reserved null names like `NUL`.',
         'For `\\r` errors, normalize CRLF to LF. Check `command --help` before assuming GNU flags.',
-        'MSYS may rewrite remote POSIX paths for native processes. Tau protects common static container/SSH/Kubernetes arguments; dynamic paths need narrow `MSYS2_ARG_CONV_EXCL`. Put remote globs/pipes/redirections in one quoted remote `sh -c` command.',
+        'MSYS may rewrite remote POSIX paths for native processes. OIO protects common static container/SSH/Kubernetes arguments; dynamic paths need narrow `MSYS2_ARG_CONV_EXCL`. Put remote globs/pipes/redirections in one quoted remote `sh -c` command.',
       ]
     case 'wsl':
       return [

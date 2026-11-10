@@ -1,14 +1,14 @@
 import type { StopReason, ToolKind } from '@agentclientprotocol/sdk'
 
 /**
- * Backend seam between the ACP protocol layer and Tau's agent engine.
+ * Backend seam between the ACP protocol layer and OIO's agent engine.
  *
  * The ACP layer (agent.ts / index.ts) is fully self-contained: it speaks the
  * wire protocol, manages sessions, and bridges permissions. It knows nothing
  * about how a turn is actually run. A `TauAcpBackend` plugs in the "brain".
  *
  * This keeps the protocol correct and testable on its own (see EchoBackend)
- * and isolates the heavy integration — standing up a real Tau session with a
+ * and isolates the heavy integration — standing up a real OIO session with a
  * full ToolUseContext (tool pool, MCP clients, app state, permission system),
  * the same bootstrap `tau server` / headless print mode perform — to a single
  * implementation that can be swapped in without touching the protocol code.
@@ -84,7 +84,7 @@ export interface TurnContext {
   requestPermission(call: BackendToolCall): Promise<PermissionOutcome>
 }
 
-/** Pluggable agent engine. One implementation hosts the real Tau loop. */
+/** Pluggable agent engine. One implementation hosts the real OIO loop. */
 export interface TauAcpBackend {
   /** Called once per `session/new`. `cwd` is the editor's workspace root. */
   newSession(opts: { sessionId: string; cwd: string }): Promise<void> | void
@@ -118,7 +118,7 @@ export interface TauAcpBackend {
  * A minimal, dependency-free backend that proves the full protocol path
  * (handshake → session → streamed text → tool call → tool result) end-to-end
  * inside a real editor. It does not run the model; it echoes the prompt and
- * demonstrates a read-only tool call. Swap this for the real Tau engine
+ * demonstrates a read-only tool call. Swap this for the real OIO engine
  * backend in src/acp/index.ts's default wiring.
  */
 export class EchoBackend implements TauAcpBackend {
@@ -135,9 +135,9 @@ export class EchoBackend implements TauAcpBackend {
     if (ctx.signal.aborted) return 'cancelled'
 
     await ctx.agentText(
-      `Tau ACP backend is connected. You said:\n\n> ${prompt}\n\n` +
+      `OIO ACP backend is connected. You said:\n\n> ${prompt}\n\n` +
         `The protocol path (streaming, tool calls, permissions) is live; ` +
-        `the Tau agent engine is not yet wired into this backend.`,
+        `the OIO agent engine is not yet wired into this backend.`,
     )
 
     // Demonstrate a tool call so the editor's tool-rendering path is exercised.

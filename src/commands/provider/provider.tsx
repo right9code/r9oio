@@ -71,7 +71,7 @@ import {
  * Providers the user can connect via /provider.
  *
  * Anthropic (firstParty) delegates to /login so the OAuth choices stay
- * Tau-compatible.
+ * OIO-compatible.
  *
  * Excluded on purpose:
  *   - bedrock/vertex/foundry  → env/IAM-based, no credentials to manage here
@@ -88,7 +88,7 @@ const MANAGEABLE_PROVIDERS = [
   // Anthropic surfaces here alongside the third-party providers. The
   // configure view hands Anthropic off to the shared /login OAuth flow
   // (subscription / console / 3rd-party platform) instead of a deactivate
-  // prompt, so the credentials path stays Tau-compatible.
+  // prompt, so the credentials path stays OIO-compatible.
   'firstParty',
   'omniroute',
   'openai',
@@ -1436,7 +1436,7 @@ function ProviderManager({
       <Box flexDirection="column" paddingLeft={1}>
         {header}
         <Text dimColor>
-          Connect the AI accounts you want Tau to use. Multiple providers
+          Connect the AI accounts you want OIO to use. Multiple providers
           can be active at once.
         </Text>
         <Box marginTop={1} flexDirection="column">

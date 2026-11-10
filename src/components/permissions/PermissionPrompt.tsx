@@ -28,8 +28,8 @@ export type PermissionPromptProps<T extends string> = {
   toolAnalyticsContext?: ToolAnalyticsContext;
 };
 const DEFAULT_PLACEHOLDERS: Record<FeedbackType, string> = {
-  accept: 'tell Tau what to do next',
-  reject: 'tell Tau what to do differently'
+  accept: 'tell OIO what to do next',
+  reject: 'tell OIO what to do differently'
 };
 
 /**

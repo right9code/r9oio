@@ -3,7 +3,7 @@ export type LazyToolCallDecision =
   /**
    * The producing request did not carry this tool's schema. The call is still
    * allowed to run, but only after its arguments are checked against the
-   * schema Tau holds locally (see checkBlindDeferredCallInput). This replaces
+   * schema OIO holds locally (see checkBlindDeferredCallInput). This replaces
    * an unconditional block, which cost a turn and surfaced an internal
    * recovery error for calls that were in fact correct.
    */

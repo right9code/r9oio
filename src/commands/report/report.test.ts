@@ -79,7 +79,7 @@ assert.doesNotThrow(() => assertValidGeneratedReport(
   '# Provider retry repair\n\nThe failure now reaches the retry controller.',
 ))
 
-// A quota refusal must not read like a Tau defect: /report already sends a
+// A quota refusal must not read like a OIO defect: /report already sends a
 // bounded, tool-free request, so there is no payload left to blame.
 assert.throws(
   () => assertValidGeneratedReport(

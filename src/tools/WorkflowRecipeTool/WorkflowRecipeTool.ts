@@ -28,9 +28,9 @@ const RECIPE_VALUES = [
 type Recipe = (typeof RECIPE_VALUES)[number]
 
 const DESCRIPTION =
-  'Return a plug-and-play Tau workflow recipe for coding or agentic work. Read-only.'
+  'Return a plug-and-play OIO workflow recipe for coding or agentic work. Read-only.'
 
-const PROMPT = `Choose a concise Tau-native workflow recipe. This tool is read-only: it does not edit files, run commands, spawn agents, or contact services.
+const PROMPT = `Choose a concise OIO-native workflow recipe. This tool is read-only: it does not edit files, run commands, spawn agents, or contact services.
 
 Use when a task needs orchestration but not a custom plan from scratch. Recipes should keep context bounded, prefer native tools, and scale review/verification only when risk justifies it.`
 

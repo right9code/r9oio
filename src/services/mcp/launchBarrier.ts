@@ -1,7 +1,7 @@
 /**
  * The MCP launch barrier.
  *
- * Interactive Tau has never waited for MCP servers before the first request,
+ * Interactive OIO has never waited for MCP servers before the first request,
  * so late-connecting servers change the tool list mid-session. On lanes with
  * eager tool declarations that voids the implicit prompt cache, and on any
  * lane it means the first turn ran without tools the user has configured.

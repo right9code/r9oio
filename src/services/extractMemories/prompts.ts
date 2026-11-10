@@ -62,7 +62,7 @@ export function buildExtractAutoOnlyPrompt(
   const howToSave = [
     '## How to save proposals',
     '',
-    'What you save here are PROPOSALS for the user to review — they are staged and will NOT affect Tau until the user approves them. Write each proposed memory to its own file inside the `learned/` subdirectory of the memory directory (e.g., `learned/user_prefers_terse.md`). You may ONLY write inside `learned/`.',
+    'What you save here are PROPOSALS for the user to review — they are staged and will NOT affect OIO until the user approves them. Write each proposed memory to its own file inside the `learned/` subdirectory of the memory directory (e.g., `learned/user_prefers_terse.md`). You may ONLY write inside `learned/`.',
     '',
     'Use this frontmatter format:',
     '',

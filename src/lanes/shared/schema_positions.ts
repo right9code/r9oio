@@ -1,7 +1,7 @@
 /**
  * Where a key in a JSON Schema is a keyword, and where it is a user's name.
  *
- * Every provider projection in Tau walks a tool's schema deleting keywords the
+ * Every provider projection in OIO walks a tool's schema deleting keywords the
  * provider rejects. Several of those walks recursed into every object and
  * applied the deletion to every key, including inside `properties`, `$defs`
  * and `patternProperties` — maps whose keys are names the MCP server chose. A

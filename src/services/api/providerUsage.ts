@@ -1819,7 +1819,7 @@ async function reportMeta(): Promise<ProviderUsageReport> {
  *
  * Model Studio bills through Alibaba Cloud itself, and the billing surface —
  * BSS OpenAPI — authenticates with an account AccessKey pair, not the
- * DashScope key Tau holds. There is no balance or quota endpoint the API key
+ * DashScope key OIO holds. There is no balance or quota endpoint the API key
  * can read, so inventing a number here would be inventing it.
  *
  * What the key CAN answer is `/models`, which is auth-gated. That makes this a

@@ -4,7 +4,7 @@ const mobile = {
   type: 'local-jsx',
   name: 'mobile',
   aliases: ['ios', 'android'],
-  description: 'Show QR code to download the Tau mobile app',
+  description: 'Show QR code to download the OIO mobile app',
   load: () => import('./mobile.js'),
 } satisfies Command
 

@@ -18,7 +18,7 @@
  *
  * `reasoning_options` is the thinking ladder, taken verbatim. Nothing here
  * names a model, so a model released tomorrow is described on the next
- * refresh without a Tau release.
+ * refresh without a OIO release.
  *
  * Same discipline as alibabaCatalog.ts: lookups are synchronous and read only
  * memory or the file on disk, the Cline lane refreshes that file (once a day,
@@ -90,7 +90,7 @@ export interface CacheFile {
 }
 
 // Order only. Which values a model has always comes from the catalogue; a
-// value outside this list is not one Tau can send, so it is left out.
+// value outside this list is not one OIO can send, so it is left out.
 const EFFORT_RANK: Readonly<Record<string, number>> = {
   minimal: 1,
   low: 2,

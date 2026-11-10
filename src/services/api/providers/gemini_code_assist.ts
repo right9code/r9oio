@@ -880,7 +880,7 @@ async function _ensureCodeAssistReady(
     throw new Error(
       executor === 'antigravity'
         ? `Antigravity accepted onboarding for tier "${tierId}" but did not expose the assigned project after retrying loadCodeAssist. ` +
-            'Tau did not cache an empty project; retry the request once to resume project discovery.'
+            'OIO did not cache an empty project; retry the request once to resume project discovery.'
         : 'Gemini Code Assist onboarding completed without a project id.',
     )
   }
@@ -1082,7 +1082,7 @@ export function codeAssistEligibilityErrorMessage(
 function _userDefinedProjectMessage(tierId: string): string {
   return `Gemini Code Assist did not return a managed project for tier "${tierId}". ` +
     'Set GOOGLE_CLOUD_PROJECT (or GEMINI_CLOUD_PROJECT) to a Google Cloud project ' +
-    'where Gemini for Google Cloud is enabled, then retry. Tau skipped legacy ' +
+    'where Gemini for Google Cloud is enabled, then retry. OIO skipped legacy ' +
     'onboardUser provisioning because this tier requires a user-defined project.'
 }
 

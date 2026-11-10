@@ -109,7 +109,7 @@ async function getEndedTaskOutputData(ended: EndedTask): Promise<TaskOutput> {
       task_id: ended.id,
       task_type: taskType,
       status: 'unknown',
-      description: `Output of task ${ended.id}, which is not tracked by this Tau process (it ran before a restart or in another session), so its final status is unknown`,
+      description: `Output of task ${ended.id}, which is not tracked by this OIO process (it ran before a restart or in another session), so its final status is unknown`,
       output: await readTaskOutputFile(ended.outputFile),
       ...(taskType === 'local_bash' ? {
         exitCode: null
@@ -160,7 +160,7 @@ const lastChecks = new Map<string, {
   at: number;
 }>();
 const lastCheckKey = (taskId: string, agentId: string | undefined) => `${agentId ?? ''}\0${taskId}`;
-const MAIN_THREAD_RUNNING_NOTE = `Still running. Tau sends you a <${TASK_NOTIFICATION_TAG}> when it finishes, so there is no need to check it again. If this request has other work left, do that; otherwise tell the user it is still running and end your turn.`;
+const MAIN_THREAD_RUNNING_NOTE = `Still running. OIO sends you a <${TASK_NOTIFICATION_TAG}> when it finishes, so there is no need to check it again. If this request has other work left, do that; otherwise tell the user it is still running and end your turn.`;
 const SUBAGENT_RUNNING_NOTE = `Still running. Do not poll it with repeated short checks: if you need its result, wait once with block: true and a long timeout (up to ${TASK_OUTPUT_MAX_TIMEOUT_MS} ms); otherwise report that it is still running.`;
 
 // For a task still running: how long it has run, how much output it has,

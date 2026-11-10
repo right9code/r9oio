@@ -8,9 +8,9 @@ import { retrievePersistedToolResult } from '../../utils/toolResultStorage.js'
 import { TOOL_OUTPUT_RETRIEVE_TOOL_NAME } from './constants.js'
 
 const DESCRIPTION =
-  'Recover a bounded range from a persisted Tau tool output, background task output, or artifact. Read-only.'
+  'Recover a bounded range from a persisted OIO tool output, background task output, or artifact. Read-only.'
 
-const PROMPT = `Read a bounded range from persisted Tau tool/background output or a project .tau artifact. For ordinary files use Read. Use only a path or id an earlier result reported (e.g. a "Full output saved to:" line); never build one from a tool_use id in history. Supply path or toolUseId; when both are set, path is tried first and the id is fallback. Prefer the smallest byte/line range. Cheap mode caps each returned page/search at 8000 bytes; continue from the reported range when needed. To find a known string, use query: it is literal and case-insensitive, searches the whole output, returns matching numbered lines, and overrides range fields. After zero matches, use the reported line count to choose one range instead of probing repeatedly.`
+const PROMPT = `Read a bounded range from persisted OIO tool/background output or a project .tau artifact. For ordinary files use Read. Use only a path or id an earlier result reported (e.g. a "Full output saved to:" line); never build one from a tool_use id in history. Supply path or toolUseId; when both are set, path is tried first and the id is fallback. Prefer the smallest byte/line range. Cheap mode caps each returned page/search at 8000 bytes; continue from the reported range when needed. To find a known string, use query: it is literal and case-insensitive, searches the whole output, returns matching numbered lines, and overrides range fields. After zero matches, use the reported line count to choose one range instead of probing repeatedly.`
 
 function renderText(message: string): React.ReactNode {
   return createElement(Text, null, message)

@@ -157,7 +157,7 @@ function inlineData(block: unknown): { mimeType: string; data: string } | null {
   return null
 }
 
-/** Tau's Anthropic-shaped history as Gemini contents. */
+/** OIO's Anthropic-shaped history as Gemini contents. */
 export function convertMessagesToGeminiContents(
   messages: readonly ProviderMessage[],
   options: { canSeeImages: boolean; functionResponseParts: boolean },
@@ -232,7 +232,7 @@ export function convertMessagesToGeminiContents(
 // ─── Stream ──────────────────────────────────────────────────────────
 
 /**
- * Turns Gemini stream chunks into the Anthropic stream Tau consumes. Feed
+ * Turns Gemini stream chunks into the Anthropic stream OIO consumes. Feed
  * each parsed `data:` payload to push(); finish() closes the message.
  */
 export class OpenCodeGeminiStream {
@@ -363,7 +363,7 @@ export class OpenCodeGeminiStream {
     const out: AnthropicStreamEvent[] = []
     this.start(out)
     this.closeOpen(out)
-    // promptTokenCount includes the cached part; Tau's buckets are additive.
+    // promptTokenCount includes the cached part; OIO's buckets are additive.
     const fresh = Math.max(0, this.promptTokens - this.cachedTokens)
     out.push({
       type: 'message_delta',

@@ -2,7 +2,7 @@
  * Gemini Lane — Native Tool Registry
  *
  * Maps Gemini CLI's native tool names (what the model was post-trained on)
- * to Tau's shared tool implementations.
+ * to OIO's shared tool implementations.
  *
  * The model sees these exact names and schemas. They come from:
  *   google-gemini/gemini-cli packages/core/src/tools/definitions/
@@ -317,7 +317,7 @@ export const GEMINI_TOOL_REGISTRY: LaneToolRegistration[] = [
         },
         is_background: {
           type: 'boolean',
-          description: 'Set true for long-running servers/watchers, port-forwards, tunnels, and foreground container runs. Tau tracks and can stop the background task; remove shell-level detaching from command.',
+          description: 'Set true for long-running servers/watchers, port-forwards, tunnels, and foreground container runs. OIO tracks and can stop the background task; remove shell-level detaching from command.',
         },
       },
       required: ['command'],
@@ -481,7 +481,7 @@ export const GEMINI_TOOL_REGISTRY: LaneToolRegistration[] = [
   },
 
   // ── list_directory ─────────────────────────────────────────────
-  // Gemini-specific tool — no direct Tau equivalent. Maps to Bash ls.
+  // Gemini-specific tool — no direct OIO equivalent. Maps to Bash ls.
   {
     nativeName: 'list_directory',
     implId: 'Bash',

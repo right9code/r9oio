@@ -232,7 +232,7 @@ export function resolveProviderRequestSessionId({
     }
   }
 
-  // Other cache-aware providers use the root Tau session as their stable
+  // Other cache-aware providers use the root OIO session as their stable
   // affinity/cache key. Antigravity, like openai above, is the exception:
   // fresh subagents need distinct derived sessions. Root-policy calls
   // returned above already reuse the live conversation even if their context

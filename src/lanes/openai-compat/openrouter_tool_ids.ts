@@ -16,7 +16,7 @@ export function openRouterToolIdMap(messages: ProviderMessage[]): Map<string, st
   return ids
 }
 
-/** Older native transcripts saved only Tau's wrapped ID. Migrate an outbound
+/** Older native transcripts saved only OIO's wrapped ID. Migrate an outbound
  * copy at the record boundary, where the native message ID establishes its
  * origin. New explicit metadata wins even if a provider ID itself starts with
  * the wrapper. Do not strip arbitrary IDs in ordinary provider messages. */

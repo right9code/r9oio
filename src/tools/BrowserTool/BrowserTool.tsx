@@ -79,7 +79,7 @@ READ / SEE
 - read { selector?, maxChars?, offset? }: rendered markdown with [text](url) links; defaults to the main content; selector scopes it (e.g. "#docs"). Long pages report their total length: page on with the offset each reply gives. Pages end at a sentence or paragraph. If the page shifted, the reply re-finds your place; if your text is gone it says stale_read instead of stitching two versions.
 - measure: what actually painted: viewport, background/text colors by area, fonts that fell back, WCAG contrast failures with real ratios, broken/oversized images, overflow, running animations, landmark boxes. Check a UI with it instead of inventing.
 - extract { fields, container?, limit? }: e.g. { "container":"article.product", "fields":{ "name":".title", "price":".price", "link":"a@href" } }. Every value comes with the selector that produced it; warnings flag selectors matching nothing or several elements, the same value in every row (the selector escaped the row), and login/redirect/wishlist links posing as item URLs. An unmatched container returns the page's actual repeating structures. Nothing outside that table came from the page. Never fill missing data from memory.
-- pick { text? }: only for a genuinely ambiguous target or the user's "this one", never to explore; visible browser only. The user's pointer outlines elements; their click returns the enclosing link/button/heading as the first @N, marked (picked), with tag, selector and text. Tell them to click once the "Tau:" bar shows; an earlier click reaches the page. Esc cancels; waits up to 2 minutes. The page ignores the pointer while picking: hover-open menus first.
+- pick { text? }: only for a genuinely ambiguous target or the user's "this one", never to explore; visible browser only. The user's pointer outlines elements; their click returns the enclosing link/button/heading as the first @N, marked (picked), with tag, selector and text. Tell them to click once the "OIO:" bar shows; an earlier click reaches the page. Esc cancels; waits up to 2 minutes. The page ignores the pointer while picking: hover-open menus first.
 - screenshot { full?, ref?, annotate?, path? }: viewport by default; full:true whole page; ref one element; annotate:true overlays the latest @N badges. path saves instead of sending an image (use when the user wants the file, not you).
 - console { level?, filter?, limit?, clear? }: this tab's messages and uncaught exceptions; level error|warn|info|log|all.
 - network { filter?, failed?, limit?, clear?, bodies? }: this tab's requests as METHOD status url [type]; failed:true only errors/4xx/5xx; bodies:true adds request and response bodies of the newest listed requests (up to 3; narrow with filter), truncated, credentials masked. Debug the app you are building with console + network.
@@ -1548,7 +1548,7 @@ export const BrowserTool = buildTool({
     if (risk) {
       return {
         behavior: 'ask',
-        message: `This browser action looks like a ${risk.kind} action ("${risk.label}"). Confirm before Tau runs it.`,
+        message: `This browser action looks like a ${risk.kind} action ("${risk.label}"). Confirm before OIO runs it.`,
       }
     }
     return { behavior: 'allow', updatedInput: input }

@@ -49,7 +49,7 @@ type SessionState = {
 }
 
 /**
- * Tau's agent-side ACP implementation. One instance per connection; an editor
+ * OIO's agent-side ACP implementation. One instance per connection; an editor
  * may create multiple sessions over it. Implements the methods an ACP client
  * (Zed, JetBrains, the VS Code ACP Client extension, …) calls, and turns the
  * backend's turn output into `session/update` notifications.
@@ -77,7 +77,7 @@ export class TauAcpAgent {
           embeddedContext: true,
         },
       },
-      // No auth gate: auth is handled by Tau's own `tau /login`, out of band.
+      // No auth gate: auth is handled by OIO's own `tau /login`, out of band.
       authMethods: [],
     }
   }
@@ -95,7 +95,7 @@ export class TauAcpAgent {
     const configOptions = this.backend
       .configOptions?.(sessionId)
       ?.map(toWireConfigOption)
-    // Push Tau's slash commands into the editor's command menu. Deferred to a
+    // Push OIO's slash commands into the editor's command menu. Deferred to a
     // macrotask so the new-session response is written first — the notification
     // must reference an already-established session.
     this.scheduleAvailableCommands(sessionId)

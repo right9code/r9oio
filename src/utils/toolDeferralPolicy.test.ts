@@ -5,7 +5,7 @@
  *
  * Client-side tool discovery rewrites the front of the request every time
  * ToolSearch loads a schema. On providers whose prompt cache is an exact
- * prefix cache Tau cannot re-anchor, that voids the whole conversation cache.
+ * prefix cache OIO cannot re-anchor, that voids the whole conversation cache.
  * These tests pin which providers are excluded, and -- more importantly --
  * that BOTH deferral gates agree, since the Antigravity opt-out drifted apart
  * once already (see the comment in utils/toolSearch.ts).

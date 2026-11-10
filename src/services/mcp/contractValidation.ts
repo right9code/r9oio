@@ -1,7 +1,7 @@
 /**
  * Validate MCP tool arguments against the server's own input schema.
  *
- * An MCP tool carries a JSON Schema from its server. Tau's `MCPTool` stands in
+ * An MCP tool carries a JSON Schema from its server. OIO's `MCPTool` stands in
  * for all of them with `z.object({}).passthrough()`, which accepts anything —
  * so until now the only MCP call that was ever checked against a real schema
  * was a blind deferred one. Every other MCP call was dispatched with whatever
@@ -339,7 +339,7 @@ export function checkMcpArguments(
           reason: 'schema_not_exposed',
           message:
             `${tool.name}'s schema was not declared on the request that produced this call, ` +
-            `and Tau holds no local copy to verify it against, so it was not run.`,
+            `and OIO holds no local copy to verify it against, so it was not run.`,
         }
       : { ok: true }
   }

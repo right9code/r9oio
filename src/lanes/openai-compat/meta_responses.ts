@@ -29,10 +29,10 @@
  * `reasoning.effort: "none"`, and sampling overrides ("the model performs
  * best at the defaults").
  *
- * Tools: every tool Tau offers, built-in and MCP, goes out with its whole
+ * Tools: every tool OIO offers, built-in and MCP, goes out with its whole
  * contract — the Codex lane's deterministic schema sanitizer, a STRICT
  * PARAMETERS summary in each description, and `strict: false` so optional
- * fields stay optional. Tau validates every call against the full schema
+ * fields stay optional. OIO validates every call against the full schema
  * before it runs.
  */
 
@@ -85,12 +85,12 @@ const DYNAMIC_BOUNDARY = '__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__'
 const VOLATILE_SECTION = /# Session-specific guidance\b|<env>|# Environment\b|# currentDate\n|# gitStatus\b/
 
 /**
- * The reasoning state Tau keeps on a block (the Codex lane's, scoped by model
+ * The reasoning state OIO keeps on a block (the Codex lane's, scoped by model
  * id), plus the phase Meta streamed for a text block's message item.
  */
 type MetaBlockState = CodexReasoningState & { phase?: 'commentary' }
 
-/** The model id Meta's API takes: Tau may carry a `meta/` vendor prefix. */
+/** The model id Meta's API takes: OIO may carry a `meta/` vendor prefix. */
 export function metaApiModelId(model: string): string {
   return model.trim().replace(/^meta\//i, '')
 }
@@ -147,7 +147,7 @@ const TOOL_ORDER_LIMIT = 256
 const toolOrders = new Map<string, Map<string, MetaFunctionTool>>()
 
 /**
- * Per-conversation tool order. Tau lists tools sorted, so an MCP server that
+ * Per-conversation tool order. OIO lists tools sorted, so an MCP server that
  * connects mid-conversation would insert its tools in the middle of the block
  * and void the cache behind them ("tool definitions are computed once and
  * reused across turns"). A conversation keeps the order its tools were first
@@ -188,7 +188,7 @@ function isQuarantined(tool: MetaFunctionTool): boolean {
 
 /**
  * The MCP tool a 400 points at, by `param` (`tools[3]...`) or by name.
- * Built-in tools are never left out: a rejection there is a Tau bug and must
+ * Built-in tools are never left out: a rejection there is a OIO bug and must
  * surface.
  */
 export function findRejectedMetaTool(body: string, tools: readonly MetaFunctionTool[]): MetaFunctionTool | undefined {
@@ -212,7 +212,7 @@ const ENCODED_PREFIX = 'b64_'
 /** Meta: "Every call_id must be 1 to 64 characters." */
 const SENDABLE_CALL_ID = /^[A-Za-z0-9_-]{1,64}$/
 
-/** A Tau tool_use id for a Meta call id. Reversible, deterministic. */
+/** A OIO tool_use id for a Meta call id. Reversible, deterministic. */
 export function tauToolUseIdForMetaCall(callId: string): string {
   return /^[A-Za-z0-9_-]+$/.test(callId) && !callId.startsWith(ENCODED_PREFIX)
     ? `${TOOL_USE_PREFIX}${callId}`
@@ -220,7 +220,7 @@ export function tauToolUseIdForMetaCall(callId: string): string {
 }
 
 /**
- * The call id to send for a Tau tool_use id: the one Meta issued, or — for a
+ * The call id to send for a OIO tool_use id: the one Meta issued, or — for a
  * call another model made — that id when Meta accepts it, else a stable hash.
  * The call and its output map the same way, so they always match.
  */
@@ -247,7 +247,7 @@ type InputPart = Record<string, unknown>
 const SENDABLE_IMAGE_TYPES = new Set(['image/jpeg', 'image/jpg', 'image/png', 'image/gif', 'image/webp', 'image/x-icon'])
 /**
  * "Up to 50 images per request ... more than 50 returns HTTP 400." A PDF's
- * page-images draw on the same budget; Tau cannot see a PDF's page count
+ * page-images draw on the same budget; OIO cannot see a PDF's page count
  * without parsing it, so each PDF counts once.
  */
 const MAX_IMAGES_PER_REQUEST = 50
@@ -411,7 +411,7 @@ function capImages(items: readonly InputPart[]): void {
 }
 
 /**
- * Tau's history as Responses input items. Assistant turns replay their
+ * OIO's history as Responses input items. Assistant turns replay their
  * encrypted reasoning where it sat on the wire — before the message or call
  * that followed it — and only for the model that produced it. Each text block
  * is one message item, as Meta streamed it, with its phase.
@@ -635,7 +635,7 @@ interface PendingCall {
 }
 
 /**
- * Responses stream events → the Anthropic IR Tau consumes. Encrypted
+ * Responses stream events → the Anthropic IR OIO consumes. Encrypted
  * reasoning rides on the blocks as `_codex_reasoning`: on the thinking block
  * that showed it, and on the next text or tool block, so it survives a
  * transcript that drops thinking blocks. A commentary message's text block
@@ -739,7 +739,7 @@ export class MetaResponsesStream {
     const decoded = decodeToolArguments(call.args || '{}')
     const index = this.nextIndex++
     // One start, one complete argument delta, one stop: input inline on the
-    // start would leave Tau's accumulator empty.
+    // start would leave OIO's accumulator empty.
     out.push({
       type: 'content_block_start',
       index,
@@ -948,7 +948,7 @@ export class MetaResponsesStream {
     const out: AnthropicStreamEvent[] = []
     this.start(out)
     for (const outputIndex of [...this.open.keys()]) this.close(out, outputIndex)
-    // Responses reports the whole prompt; Tau's buckets are additive.
+    // Responses reports the whole prompt; OIO's buckets are additive.
     const fresh = Math.max(0, this.inputTokens - this.cachedTokens)
     out.push({
       type: 'message_delta',

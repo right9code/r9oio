@@ -139,7 +139,7 @@ describe('power mode', () => {
 
   // The session pin is the fix for the cross-session mode leak: a running
   // session must keep its own mode even when the shared settings.json changes
-  // under it (another Tau session's /mode, surfaced live by the file watcher).
+  // under it (another OIO session's /mode, surfaced live by the file watcher).
   test('a pinned session ignores external settings changes', () => {
     setSessionPowerMode('normal')
     // The watcher hands us fresh settings that say cheap — must NOT switch us.

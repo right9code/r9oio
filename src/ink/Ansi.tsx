@@ -2,7 +2,7 @@ import { c as _c } from "react/compiler-runtime";
 import React from 'react';
 import stripAnsi from 'strip-ansi';
 import Link from './components/Link.js';
-// Keep ANSI output aligned with the active Tau palette when a span uses the
+// Keep ANSI output aligned with the active OIO palette when a span uses the
 // terminal default foreground (which is especially important on light themes).
 import Text from '../components/design-system/ThemedText.js';
 import type { Color } from './styles.js';

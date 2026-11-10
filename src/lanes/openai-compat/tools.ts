@@ -40,7 +40,7 @@ export const OPENAI_COMPAT_TOOL_REGISTRY: LaneToolRegistration[] = [
         description: { type: 'string', description: 'Brief description of what the command does.' },
         run_in_background: {
           type: 'boolean',
-          description: 'Set true for long-running servers/watchers, port-forwards, tunnels, and foreground container runs. Tau runs the whole command as a tracked background task; remove any shell-level detaching from command.',
+          description: 'Set true for long-running servers/watchers, port-forwards, tunnels, and foreground container runs. OIO runs the whole command as a tracked background task; remove any shell-level detaching from command.',
         },
       },
       required: ['command'],
