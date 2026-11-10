@@ -99,7 +99,7 @@ function ResumeCommand({
   const [worktreePaths, setWorktreePaths] = React.useState<string[]>([]);
   const [loading, setLoading] = React.useState(true);
   const [resuming, setResuming] = React.useState(false);
-  const [showAllProjects, setShowAllProjects] = React.useState(false);
+  const [showAllProjects, setShowAllProjects] = React.useState(true);
   const {
     rows
   } = useTerminalSize();
