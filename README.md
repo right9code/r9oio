@@ -14,28 +14,22 @@ OIO is an adaptive coding harness that is simple to use. It costs less to run, g
 
 ## Install
 
-From GitHub (no npm registry):
+From GitHub (no npm registry). Requires Node.js 20.19+ or 22.12+:
 
 ```bash
 git clone https://github.com/right9code/r9oio.git
 cd r9oio
-npm install
-npm run build
-# then link the binary:
+npm install --ignore-scripts   # devDeps + skips native sharp build
+npm run build                  # builds dist/cli.mjs + dist/tau.mjs
+# link the binary:
 ln -s "$(pwd)/dist/cli.mjs" ~/.local/bin/oio
 ```
 
-Or install directly with npm from GitHub:
+Then run `oio`. On first launch it creates `~/.claude.json` only when you `/login`.
 
-```bash
-npm install -g github:right9code/r9oio
-```
-
-With bun (faster, e.g. on Omarchy):
-
-```bash
-bun add -g github:right9code/r9oio
-```
+### Tooling recommendation
+- Use **mise** to pin the Node version (`mise use node@22`) — the build needs Node 20.19+/22.12+.
+- Use **npm** for install/build (it pulls devDependencies like esbuild). bun is faster for running but does not run `prepare`/build scripts by default, so prefer npm for the install step.
 
 **Requirements:** Node.js 20.19+ or 22.12+ (require(esm) support), Git, Bash, `gh` for GitHub automation, and Go 1.25.8+ to build the optional native OIO helpers from source.
 
